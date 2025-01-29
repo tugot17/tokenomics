@@ -7,28 +7,6 @@ from typing import List, Dict, Any
 import torch
 import statistics
 
-
-def warmup_gpu_cache(model_path: str, tensor_parallel_size: int = 8) -> None:
-    """Warm up GPU L2 cache similar to Triton's do_bench approach."""
-    # Create a dummy input of similar size to actual workload
-    dummy_llm = LLM(
-        model=model_path,
-        tensor_parallel_size=tensor_parallel_size,
-    )
-    dummy_params = SamplingParams(temperature=0.5, max_tokens=200)
-    dummy_conversation = [[
-        {"role": "system", "content": "You are a helpful assistant"},
-        {"role": "user", "content": "Hello"}
-    ]]
-    
-    # Run multiple warmup iterations
-    for _ in range(3):
-        dummy_llm.chat(dummy_conversation, sampling_params=dummy_params)
-    
-    # Clear memory
-    del dummy_llm
-    torch.cuda.empty_cache()
-
 def create_sample_conversations(dataset_name: str, num_samples: int, seed: int = 42) -> List[List[Dict[str, str]]]:
     """Create conversation samples from the dataset."""
     ds = load_dataset(dataset_name)
@@ -40,6 +18,14 @@ def create_sample_conversations(dataset_name: str, num_samples: int, seed: int =
             {"role": "user", "content": question["Question"]}
         ] for question in sampled_dataset
     ]
+
+def clear_cuda_cache():
+    """Clear CUDA cache and ensure garbage collection."""
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    # Optional: wait for all CUDA operations to complete
+    torch.cuda.synchronize()
 
 def run_single_benchmark(
     llm: LLM,
@@ -76,36 +62,88 @@ def run_single_benchmark(
         "tokens_per_second_per_request": tokens_per_second_per_request
     }
 
+def run_benchmarks(
+    model_path: str,
+    dataset_name: str,
+    batch_sizes: List[int],
+    num_runs: int = 5,
+    tensor_parallel_size: int = 8,
+    max_tokens: int = 2000,
+    temperature: float = 0.5,
+    seed: int = 42,
+    num_warmup_steps: int = 5
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Run benchmarks for different batch sizes and multiple iterations.
+    Returns statistics for each batch size.
+    """
+    # Initialize model
+    llm = LLM(
+        model=model_path,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    sampling_params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
+    
+    results = {}
 
-# Initialize the model from local path with tensor parallelism
-model_path = "/nfs/checkpoint-tuning/deepseek/DeepSeek-R1-Distill-Llama-8B"
-llm = LLM(
-    model=model_path,
-    tensor_parallel_size=8,
-)
+    #we do a small warmup run before running the proper benchmark
+    for step in range(num_warmup_steps):
+        run_single_benchmark(llm, create_sample_conversations(dataset_name, num_samples=batch_sizes[-1]), SamplingParams(temperature=temperature, max_tokens=100))
+    clear_cuda_cache()
 
-# Define sampling parameters
-sampling_params = SamplingParams(temperature=0.5, max_tokens=2000)
+    
+    for batch_size in tqdm(batch_sizes):
+        print(f"\nRunning benchmarks for batch size {batch_size}")
+        batch_metrics = []
+        conversations = create_sample_conversations(dataset_name, batch_size, seed)
+        
+        for run in range(num_runs):
+            print(f"Run {run + 1}/{num_runs}")
+            metrics = run_single_benchmark(llm, conversations, sampling_params)
+            batch_metrics.append(metrics)
+            clear_cuda_cache()
+        
+        results[batch_size] = {
+            metric: {
+                "mean": statistics.mean(m[metric] for m in batch_metrics),
+                "std": statistics.stdev(m[metric] for m in batch_metrics) if num_runs > 1 else 0,
+                "min": min(m[metric] for m in batch_metrics),
+                "max": max(m[metric] for m in batch_metrics)
+            }
+            for metric in batch_metrics[0].keys()
+        }
+    
+    return results
 
-def print_outputs(outputs):
-    for output in outputs:
-        prompt = output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt: {prompt!r}")
-        print(f"Generated text: {generated_text!r}")
+def print_benchmark_results(results: Dict[int, Dict[str, Any]]) -> None:
+    """Print formatted benchmark results."""
+    for batch_size, metrics in results.items():
+        print(f"\nBatch Size: {batch_size}")
         print("-" * 80)
+        
+        for metric_name, stats in metrics.items():
+            print(f"\n{metric_name}:")
+            print(f"  Mean: {stats['mean']:.2f}")
+            print(f"  Std:  {stats['std']:.2f}")
+            print(f"  Min:  {stats['min']:.2f}")
+            print(f"  Max:  {stats['max']:.2f}")
+        
         print("=" * 80)
 
-
-k = 8
-conversations = create_sample_conversations("gneubig/aime-1983-2024", k)
-
-stats = run_single_benchmark(llm, conversations, sampling_params)
-
-print("\nPerformance Metrics:")
-print("-" * 80)
-print(f"Total output tokens: {stats['total_output_tokens']}")
-print(f"Total time (seconds): {stats['total_time_seconds']:.2f}")
-print(f"Tokens per second: {stats['tokens_per_second']:.2f}")
-print(f"Tokens per sercond per request: {stats['tokens_per_second_per_request']:.2f}")
-print("-" * 80)
+# Example usage
+if __name__ == "__main__":
+    MODEL_PATH = "/nfs/checkpoint-tuning/deepseek/DeepSeek-R1-Distill-Llama-70B"
+    DATASET_NAME = "gneubig/aime-1983-2024"
+    BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+    
+    results = run_benchmarks(
+        model_path=MODEL_PATH,
+        dataset_name=DATASET_NAME,
+        batch_sizes=BATCH_SIZES,
+        num_runs=2,
+        tensor_parallel_size=8,
+        max_tokens=2000,
+        temperature=0.5
+    )
+    
+    print_benchmark_results(results)
