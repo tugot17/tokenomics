@@ -31,10 +31,10 @@ To run the SGLang server run:
 
 ### How to run performance measuring part?
 
-Running t
+Running the benchmark is fairly straightforward. You need to specify the model name (tag for vllm/sglang), the dataset on which you intend to test and some other options:
 
 ```bash
-python benchmark.py --model MODEL_NAME --dataset_key aime [OPTIONS]
+python oai_server_benchmark.py --model MODEL_NAME --dataset_key DATASET_NAME [OPTIONS]
 ```
 
 ### Key Options
@@ -45,10 +45,10 @@ python benchmark.py --model MODEL_NAME --dataset_key aime [OPTIONS]
 - `--dataset_key`: Dataset to use (default: aime)
 - `--results_file`: Output JSON file path
 
-E.g. config.
+E.g. config for VLLM server
 
 ```bash
-python ./oai_server_benchmark.py --model distill-llama-8b --dataset_key aime --api_base http://localhost:8000/v1 --batch_sizes 1,2,4,8 --num_runs 3 --max_tokens 100 --temperature 0.5 --description "LLama 8B TP8 A100s" --results_file my_server_benchmark.json
+python oai_server_benchmark.py --model distill-llama-8b --dataset_key aime --api_base http://localhost:8000/v1 --batch_sizes 1,2,4,8 --num_runs 3 --max_tokens 100 --temperature 0.5 --description "Deepseek R1 distill 8B TP8 A100s" --results_file my_server_benchmark.json
 ```
 
 We measure the performance against different batch sizes. Note you need to guarantee that no other tenants are using the API at the same time as you do; otherwise, you will get flawed performance numbers. 
