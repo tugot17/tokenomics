@@ -1,86 +1,106 @@
-#!/usr/bin/env python3
 import argparse
 import concurrent.futures
 import time
 import statistics
 import json
 from datetime import datetime
-
 from datasets import load_dataset
-import openai
 from openai import OpenAI
 
-def create_sample_conversations(dataset_name: str, num_samples: int, seed: int = 42):
-    """
-    Load a dataset and create a list of conversation samples.
-    Each sample is a list of messages (in OpenAI Chat Completion format).
-    Assumes that each item in the dataset has a key "Question".
-    """
-    ds = load_dataset(dataset_name)
-    # Shuffle and select the first num_samples examples from the train split.
-    sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
-    conversations = []
-    for item in sampled_dataset:
-        conversation = [
-            {"role": "system", "content": "You are a helpful assistant."},
+class DatasetHandler:
+    @staticmethod
+    def aime_handler(client, model, item):
+        messages = [
+            {"role": "system", "content": "You are a assistant that helps students solve challenging problems."},
             {"role": "user", "content": item["Question"]}
         ]
-        conversations.append(conversation)
-    return conversations
+        prompt_tokens = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=1
+        ).usage.prompt_tokens
+        return messages, prompt_tokens
+
+def get_dataset_config(dataset_key: str):
+    """Return dataset configuration based on key."""
+    configs = {
+        "aime": {
+            "dataset": "gneubig/aime-1983-2024",
+            "handler": DatasetHandler.aime_handler
+        }
+    }
+    return configs.get(dataset_key)
+
+def create_sample_conversations(client, model: str, dataset_key: str, num_samples: int, seed: int = 42):
+    """Create conversation samples based on dataset key."""
+    dataset_config = get_dataset_config(dataset_key)
+    if not dataset_config:
+        raise ValueError(f"Unknown dataset key: {dataset_key}")
+    
+    ds = load_dataset(dataset_config["dataset"])
+    sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
+    
+    conversations = []
+    total_input_tokens = 0
+    
+    for item in sampled_dataset:
+        messages, prompt_tokens = dataset_config["handler"](client, model, item)
+        conversations.append(messages)
+        total_input_tokens += prompt_tokens
+    
+    avg_input_tokens = total_input_tokens / len(conversations) if conversations else 0
+    return conversations, avg_input_tokens
 
 def call_server_completion(client, model: str, messages, temperature: float, max_tokens: int):
-    """
-    Call the vLLM server (using the OpenAI ChatCompletion API) for a single conversation.
-    Returns the number of completion tokens generated or 0 on error.
-    """
+    """Call the vLLM server for a single conversation and measure time."""
     try:
+        start_time = time.perf_counter()
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens
         )
-        # Try to get the token count from the response.
-        if hasattr(response, 'usage') and response.usage:
-            return response.usage.completion_tokens
-        elif isinstance(response, dict) and "usage" in response:
-            return response["usage"].get("completion_tokens", 0)
-        else:
-            return 0
+        end_time = time.perf_counter()
+        elapsed = end_time - start_time
+        completion_tokens = response.usage.completion_tokens
+        tokens_per_second = completion_tokens / elapsed if elapsed > 0 else 0
+        return completion_tokens, tokens_per_second
     except Exception as e:
         print(f"Error during API call: {e}")
-        return 0
+        return 0, 0
 
-def run_benchmark(client, model: str, conversations, temperature: float, max_tokens: int):
-    """
-    Run a benchmark for one batch of conversations concurrently.
-    Returns a dictionary with metrics for the run:
-      - total_output_tokens: total tokens generated across requests
-      - elapsed_time: total time taken in seconds
-      - tokens_per_second: overall tokens per second
-      - tokens_per_request_per_second: tokens per second divided by the number of requests
-    """
+def run_benchmark(client, model: str, conversations, temperature: float, max_tokens: int, avg_input_tokens: float):
+    """Run a benchmark for one batch of conversations concurrently."""
     start_time = time.perf_counter()
-    tokens_list = []
+    results = []
+    
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [
             executor.submit(call_server_completion, client, model, conv, temperature, max_tokens)
             for conv in conversations
         ]
         for future in concurrent.futures.as_completed(futures):
-            tokens_list.append(future.result())
+            tokens, tps = future.result()
+            results.append((tokens, tps))
+    
     end_time = time.perf_counter()
-
-    total_tokens = sum(tokens_list)
     elapsed = end_time - start_time
-    tokens_per_second = total_tokens / elapsed if elapsed > 0 else 0
-    tokens_per_request_per_second = tokens_per_second / len(conversations) if conversations else 0
+    
+    tokens_list = [r[0] for r in results]
+    tps_list = [r[1] for r in results]
+    
+    total_tokens = sum(tokens_list)
+    avg_output_tokens = total_tokens / len(conversations) if conversations else 0
+    tokens_per_second_in_batch = total_tokens / elapsed if elapsed > 0 else 0
+    avg_tokens_per_second = statistics.mean(tps_list) if tps_list else 0
 
     return {
-        "total_output_tokens": total_tokens,
+        "avg_input_tokens": avg_input_tokens,
+        "avg_output_tokens": avg_output_tokens,
         "elapsed_time": elapsed,
-        "tokens_per_second": tokens_per_second,
-        "tokens_per_request_per_second": tokens_per_request_per_second
+        "tokens_per_second_in_batch": tokens_per_second_in_batch,
+        "avg_tokens_per_second": avg_tokens_per_second
     }
 
 def save_results(results: dict, filename: str):
@@ -94,8 +114,8 @@ def main():
     )
     parser.add_argument("--model", type=str, required=True,
                         help="Model tag to use (e.g., 'distill-llama-8b').")
-    parser.add_argument("--dataset", type=str, default="gneubig/aime-1983-2024",
-                        help="Hugging Face dataset name (assumes items have 'Question').")
+    parser.add_argument("--dataset_key", type=str, default="aime",
+                        help="Dataset key (e.g., 'aime', 'conversation')")
     parser.add_argument("--api_base", type=str, default="http://localhost:8000/v1",
                         help="Base URL of the vLLM server API.")
     parser.add_argument("--batch_sizes", type=str, default="1,2,4,8",
@@ -114,18 +134,14 @@ def main():
                         help="Path to JSON file for saving results.")
     args = parser.parse_args()
 
-    # Convert batch_sizes string into a list of integers.
     batch_sizes = [int(bs.strip()) for bs in args.batch_sizes.split(",") if bs.strip()]
-
-    # Configure the OpenAI API client to use the vLLM server.
     client = OpenAI(api_key="sk-dummy", base_url=args.api_base)
 
-    # Initialize a results dictionary with metadata.
     results = {
         "metadata": {
             "timestamp": datetime.now().isoformat(),
             "model": args.model,
-            "dataset": args.dataset,
+            "dataset_key": args.dataset_key,
             "api_base": args.api_base,
             "batch_sizes": batch_sizes,
             "num_runs": args.num_runs,
@@ -140,38 +156,36 @@ def main():
     print(f"Starting benchmark for model: {args.model}")
     for batch_size in batch_sizes:
         print(f"\n=== Benchmarking Batch Size: {batch_size} ===")
-        run_metrics = []  # Collect metrics from each run
+        run_metrics = []
 
         for run in range(1, args.num_runs + 1):
             print(f" Run {run}/{args.num_runs} ... ", end="", flush=True)
-            # Generate conversation samples.
-            conversations = create_sample_conversations(args.dataset, num_samples=batch_size, seed=args.seed)
-            metrics = run_benchmark(client, args.model, conversations, args.temperature, args.max_tokens)
+            conversations, avg_input_tokens = create_sample_conversations(
+                client, args.model, args.dataset_key, num_samples=batch_size, seed=args.seed)
+                
+            metrics = run_benchmark(client, args.model, conversations, 
+                                 args.temperature, args.max_tokens, avg_input_tokens)
             run_metrics.append(metrics)
-            print(f"tokens: {metrics['total_output_tokens']}, time: {metrics['elapsed_time']:.2f}s, "
-                  f"TPS: {metrics['tokens_per_second']:.2f}, "
-                  f"TPS/Request: {metrics['tokens_per_request_per_second']:.2f}")
+            print(f"tokens: {metrics['avg_output_tokens']}, time: {metrics['elapsed_time']:.2f}s, "
+                  f"TPS: {metrics['tokens_per_second_in_batch']:.2f}, "
+                  f"TPS/Request: {metrics['avg_tokens_per_second']:.2f}")
 
-        # Compute average values for each metric across the runs.
         average_metrics = {
             key: statistics.mean([m[key] for m in run_metrics])
             for key in run_metrics[0]
         }
 
-        # Save only the aggregate average metrics for this batch size.
         results["results"][str(batch_size)] = average_metrics
 
         print(" Summary:")
-        print(f"  Average tokens: {average_metrics['total_output_tokens']:.2f}")
-        print(f"  Average time:   {average_metrics['elapsed_time']:.2f}s")
-        print(f"  Average TPS:    {average_metrics['tokens_per_second']:.2f}")
-        print(f"  Average TPS/Request: {average_metrics['tokens_per_request_per_second']:.2f}")
+        print(f"  Average input tokens/request: {average_metrics['avg_input_tokens']:.2f}")
+        print(f"  Average output tokens/request: {average_metrics['avg_output_tokens']:.2f}")
+        print(f"  Average time: {average_metrics['elapsed_time']:.2f}s")
+        print(f"  Average batch TPS: {average_metrics['tokens_per_second_in_batch']:.2f}")
+        print(f"  Average TPS/Request: {average_metrics['avg_tokens_per_second']:.2f}")
 
-    # Save final results to JSON.
     save_results(results, args.results_file)
     print(f"\nBenchmark results saved to {args.results_file}")
 
 if __name__ == "__main__":
     main()
-
-# ./server_benchmark.py --model distill-llama-8b --api_base http://localhost:8000/v1 --batch_sizes 1,2,4,8 --num_runs 3 --max_tokens 100 --temperature 0.5 --description "LLama 8B TP8 A100s" --results_file my_server_benchmark.json
