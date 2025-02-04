@@ -19,13 +19,13 @@ Both server packages have a lot of parameters, so to facilitate running them, we
 To run the VLLM server, run:
 
 ```bash
-./vllm_run_server.sh
+./server/vllm_run_server.sh
 ```
 
 To run the SGLang server run:
 
 ```bash
-./sglang_run_server.sh
+./server/sglang_run_server.sh
 ```
 
 
