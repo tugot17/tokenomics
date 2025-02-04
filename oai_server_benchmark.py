@@ -9,50 +9,40 @@ from openai import OpenAI
 
 class DatasetHandler:
     @staticmethod
-    def aime_handler(client, model, item):
-        messages = [
-            {"role": "system", "content": "You are a assistant that helps students solve challenging problems."},
-            {"role": "user", "content": item["Question"]}
-        ]
-        prompt_tokens = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=1
-        ).usage.prompt_tokens
-        return messages, prompt_tokens
+    def aime_handler(num_samples, seed):
+        ds = load_dataset("gneubig/aime-1983-2024")
+        sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
+        
+        conversations = []
+        for item in sampled_dataset:
+            messages = [
+                {"role": "system", "content": "You are an assistant that helps students solve challenging problems."},
+                {"role": "user", "content": item["Question"]}
+            ]
+            conversations.append(messages)
+        
+        return conversations
 
-def get_dataset_config(dataset_key: str):
-    """Return dataset configuration based on key."""
-    configs = {
-        "aime": {
-            "dataset": "gneubig/aime-1983-2024",
-            "handler": DatasetHandler.aime_handler
-        }
-    }
-    return configs.get(dataset_key)
+DATASET_HANDLERS = {
+    "aime": DatasetHandler.aime_handler
+}
 
 def create_sample_conversations(client, model: str, dataset_key: str, num_samples: int, seed: int = 42):
     """Create conversation samples based on dataset key."""
-    dataset_config = get_dataset_config(dataset_key)
-    if not dataset_config:
+    handler = DATASET_HANDLERS.get(dataset_key)
+    if not handler:
         raise ValueError(f"Unknown dataset key: {dataset_key}")
     
-    ds = load_dataset(dataset_config["dataset"])
-    sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
-    
-    conversations = []
-    total_input_tokens = 0
-    
-    for item in sampled_dataset:
-        messages, prompt_tokens = dataset_config["handler"](client, model, item)
-        conversations.append(messages)
-        total_input_tokens += prompt_tokens
-    
-    avg_input_tokens = total_input_tokens / len(conversations) if conversations else 0
-    return conversations, avg_input_tokens
+    return handler(num_samples, seed)
 
 def call_server_completion(client, model: str, messages, temperature: float, max_tokens: int):
-    """Call the vLLM server for a single conversation and measure time."""
+    """
+    Call the vLLM server for a single conversation and measure time.
+    Returns:
+        prompt_tokens: Number of tokens in the input.
+        completion_tokens: Number of tokens generated.
+        tokens_per_second: Generation speed based on completion tokens.
+    """
     try:
         start_time = time.perf_counter()
         response = client.chat.completions.create(
@@ -63,14 +53,15 @@ def call_server_completion(client, model: str, messages, temperature: float, max
         )
         end_time = time.perf_counter()
         elapsed = end_time - start_time
+        prompt_tokens = response.usage.prompt_tokens
         completion_tokens = response.usage.completion_tokens
         tokens_per_second = completion_tokens / elapsed if elapsed > 0 else 0
-        return completion_tokens, tokens_per_second
+        return prompt_tokens, completion_tokens, tokens_per_second
     except Exception as e:
         print(f"Error during API call: {e}")
-        return 0, 0
+        return 0, 0, 0
 
-def run_benchmark(client, model: str, conversations, temperature: float, max_tokens: int, avg_input_tokens: float):
+def run_benchmark(client, model: str, conversations, temperature: float, max_tokens: int):
     """Run a benchmark for one batch of conversations concurrently."""
     start_time = time.perf_counter()
     results = []
@@ -81,18 +72,21 @@ def run_benchmark(client, model: str, conversations, temperature: float, max_tok
             for conv in conversations
         ]
         for future in concurrent.futures.as_completed(futures):
-            tokens, tps = future.result()
-            results.append((tokens, tps))
+            prompt_tokens, completion_tokens, tps = future.result()
+            results.append((prompt_tokens, completion_tokens, tps))
     
     end_time = time.perf_counter()
     elapsed = end_time - start_time
     
-    tokens_list = [r[0] for r in results]
-    tps_list = [r[1] for r in results]
+    prompt_tokens_list = [r[0] for r in results]
+    completion_tokens_list = [r[1] for r in results]
+    tps_list = [r[2] for r in results]
     
-    total_tokens = sum(tokens_list)
-    avg_output_tokens = total_tokens / len(conversations) if conversations else 0
-    tokens_per_second_in_batch = total_tokens / elapsed if elapsed > 0 else 0
+    total_completion_tokens = sum(completion_tokens_list)
+    total_prompt_tokens = sum(prompt_tokens_list)
+    avg_input_tokens = total_prompt_tokens / len(conversations) if conversations else 0
+    avg_output_tokens = total_completion_tokens / len(conversations) if conversations else 0
+    tokens_per_second_in_batch = total_completion_tokens / elapsed if elapsed > 0 else 0
     avg_tokens_per_second = statistics.mean(tps_list) if tps_list else 0
 
     return {
@@ -122,6 +116,8 @@ def main():
                         help="Comma-separated batch sizes (e.g., '1,2,4,8').")
     parser.add_argument("--num_runs", type=int, default=3,
                         help="Number of runs per batch size.")
+    parser.add_argument("--warmup_runs", type=int, default=3,
+                        help="Number of warmup runs before each batch size.")
     parser.add_argument("--max_tokens", type=int, default=100,
                         help="Maximum tokens to generate per request.")
     parser.add_argument("--temperature", type=float, default=0.5,
@@ -148,6 +144,7 @@ def main():
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "seed": args.seed,
+            "warmup_runs": args.warmup_runs,
             "description": args.description
         },
         "results": {}
@@ -156,17 +153,25 @@ def main():
     print(f"Starting benchmark for model: {args.model}")
     for batch_size in batch_sizes:
         print(f"\n=== Benchmarking Batch Size: {batch_size} ===")
+        
+        # Warmup runs
+        print(f"Performing {args.warmup_runs} warmup runs...", end="", flush=True)
+        for _ in range(args.warmup_runs):
+            conversations = create_sample_conversations(
+                client, args.model, args.dataset_key, num_samples=1, seed=args.seed)
+            call_server_completion(client, args.model, conversations[0], args.temperature, max_tokens=30)
+        print(" done")
+        
         run_metrics = []
 
         for run in range(1, args.num_runs + 1):
             print(f" Run {run}/{args.num_runs} ... ", end="", flush=True)
-            conversations, avg_input_tokens = create_sample_conversations(
+            conversations = create_sample_conversations(
                 client, args.model, args.dataset_key, num_samples=batch_size, seed=args.seed)
                 
-            metrics = run_benchmark(client, args.model, conversations, 
-                                 args.temperature, args.max_tokens, avg_input_tokens)
+            metrics = run_benchmark(client, args.model, conversations, args.temperature, args.max_tokens)
             run_metrics.append(metrics)
-            print(f"tokens: {metrics['avg_output_tokens']}, time: {metrics['elapsed_time']:.2f}s, "
+            print(f"avg_output_tokens: {metrics['avg_output_tokens']}, time: {metrics['elapsed_time']:.2f}s, "
                   f"TPS: {metrics['tokens_per_second_in_batch']:.2f}, "
                   f"TPS/Request: {metrics['avg_tokens_per_second']:.2f}")
 
