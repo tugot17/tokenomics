@@ -153,6 +153,6 @@ pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/
 
 In the current version, the benchmark has its limitations. Among the most important ones, we would list:
 - Batches are very homogenous—similar prompt length; we don't simulate well the situation where part of the batch is still in the pre-fill phase, while another part is already decoding.
-- We don't mix the pre-fill and decoding stages that much. As above, this severely 
+- We don't mix the pre-fill and decoding stages that much. As above. This can potentially severly impact the engine performance and is not reflected in our numbers.
 - Some elements of the batch might end before others, e.g., in the batch of 2, one might end after 200 tokens and another go through another 4000. The second element of the batch will be effectively running for the majority of its decoding phase as a batch of 1. This can introduce the false sense of performance.
 - The batches are always fixed—we send a batch of 1, 2, ... k, but once they are added to the server, we don't send another request. This is substantially different than the practical server behavior when you are most likely to continuously get the new requests—impacting the available compute/memory bandwidth and resulting in potentially different performance numbers for you.
