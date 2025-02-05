@@ -1,8 +1,8 @@
-# Tokenomics
+# Tokenomics 🚀📈📊
 
 The repo enabling measruing of tokens/s performance of OpenAI compatible API. Easily figure out the throughput you get on your setup. 
 
-![Tokens go brrr](tokens.jpg)
+![Tokens go brrr](assets/tokens.jpg)
 
 ## How to run server?
 
