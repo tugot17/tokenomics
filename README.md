@@ -53,6 +53,76 @@ python oai_server_benchmark.py --model distill-llama-8b --dataset_key aime --api
 
 We measure the performance against different batch sizes. Note you need to guarantee that no other tenants are using the API at the same time as you do; otherwise, you will get flawed performance numbers. 
 
+The result is a `.json` file looks something like this:
+
+```json
+{
+  "metadata": {
+    "timestamp": "2025-02-04T21:33:32.902353",
+    "model": "distill-llama-8b",
+    ...
+  },
+  "results": {
+    ...
+    "64": {
+      "tokens": {
+        "input_per_request": {
+          "mean": 112.578125,
+          "std": 55.21709922324872
+        },
+        "output_per_request": {
+          "mean": 6211.13125,
+          "std": 3030.1517578348125
+        }
+      },
+      "timings": {
+        "batch_total_seconds": {
+          "mean": 106.69955926425754,
+          "std": 5.002876034171101
+        },
+        "fastest_seconds": {
+          "mean": 5.34426054880023,
+          "std": 1.6415655967821245
+        },
+        "slowest_seconds": {
+          "mean": 106.69714294858277,
+          "std": 5.002909157480276
+        },
+        "spread_seconds": {
+          "mean": 101.35288239978254,
+          "std": 4.984463398447948
+        }
+      },
+      "throughput": {
+        "batch_tokens_per_second": {
+          "mean": 3729.295223546461,
+          "std": 122.2431365137911
+        },
+        "request_tokens_per_second": {
+          "mean": 159.1587231541266,
+          "std": 8.273409865481359
+        }
+      }
+    }
+  }
+}
+```
+
+Post generation use the following line to plot the throghput:
+
+```bash
+python plot_throughput.py <PATH-TO-JSON-OUTPUT> <PATH-TO-IMAGE-WITH-VISUALIZATION>
+```
+
+E.g.
+
+```bash
+python plot_throughput.py my_server_benchmark.json my_output.png
+```
+
+![alt text](assets/example_visualization.png)
+
+
 ## Install requirements
 
 
@@ -77,3 +147,12 @@ pip install --upgrade pip
 pip install sgl-kernel --force-reinstall --no-deps
 pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
+
+
+## Limitations
+
+In the current version, the benchmark has its limitations. Among the most important ones, we would list:
+- Batches are very homogenous—similar prompt length; we don't simulate well the situation where part of the batch is still in the pre-fill phase, while another part is already decoding.
+- We don't mix the pre-fill and decoding stages that much. As above, this severely 
+- Some elements of the batch might end before others, e.g., in the batch of 2, one might end after 200 tokens and another go through another 4000. The second element of the batch will be effectively running for the majority of its decoding phase as a batch of 1. This can introduce the false sense of performance.
+- The batches are always fixed—we send a batch of 1, 2, ... k, but once they are added to the server, we don't send another request. This is substantially different than the practical server behavior when you are most likely to continuously get the new requests—impacting the available compute/memory bandwidth and resulting in potentially different performance numbers for you.
