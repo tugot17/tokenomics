@@ -74,8 +74,9 @@ def run_benchmark(client, model: str, conversations, temperature: float, max_tok
     """Run a benchmark for one batch of conversations concurrently."""
     start_time = time.perf_counter()
     results = []
+    batch_size = len(conversations)
     
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=batch_size) as executor:
         futures = [
             executor.submit(call_server_completion, client, model, conv, temperature, max_tokens)
             for conv in conversations
@@ -118,6 +119,8 @@ def main():
                         help="Dataset key (e.g., 'aime', 'conversation')")
     parser.add_argument("--api_base", type=str, default="http://localhost:8000/v1",
                         help="Base URL of the vLLM server API.")
+    parser.add_argument("--api_key", type=str, default="sk-dummy",
+                        help="API key for the server. Defaults to 'sk-dummy'.")
     parser.add_argument("--batch_sizes", type=str, default="1,2,4,8",
                         help="Comma-separated batch sizes (e.g., '1,2,4,8').")
     parser.add_argument("--num_runs", type=int, default=3,
@@ -135,7 +138,7 @@ def main():
     args = parser.parse_args()
 
     batch_sizes = [int(bs.strip()) for bs in args.batch_sizes.split(",") if bs.strip()]
-    client = OpenAI(api_key="sk-dummy", base_url=args.api_base)
+    client = OpenAI(api_key=args.api_key, base_url=args.api_base)
 
     results = {
         "metadata": {
