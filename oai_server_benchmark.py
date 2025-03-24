@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from datasets import load_dataset
 from openai import OpenAI
+import random
 
 class DatasetHandler:
     @staticmethod
@@ -20,9 +21,34 @@ class DatasetHandler:
             max_tokens=1
         ).usage.prompt_tokens
         return messages, prompt_tokens
+    
+    @staticmethod
+    def dummy_handler(client, model, item, num_tokens):
+        """Handler for dummy datasets that sample specified number of tokens."""
+        sampled_tokens = random.choices(["apple"], k=num_tokens)
+        messages = [
+            {"role": "user", "content": " ".join(sampled_tokens)}
+        ]
+        prompt_tokens = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=1
+        ).usage.prompt_tokens
+        return messages, prompt_tokens
 
 def get_dataset_config(dataset_key: str):
     """Return dataset configuration based on key."""
+    
+    if dataset_key.startswith("dummy_"):
+        try:
+            num_tokens = int(dataset_key.split("_")[1])
+            return {
+                "dataset": "",
+                "handler": lambda client, model, item: DatasetHandler.dummy_handler(client, model, item, num_tokens)
+            }
+        except (IndexError, ValueError):
+            assert False, "Invalid dummy dataset format. Should be dummy_<number>"
+    
     configs = {
         "aime": {
             "dataset": "gneubig/aime-1983-2024",
@@ -37,16 +63,27 @@ def create_sample_conversations(client, model: str, dataset_key: str, num_sample
     if not dataset_config:
         raise ValueError(f"Unknown dataset key: {dataset_key}")
     
-    ds = load_dataset(dataset_config["dataset"])
-    sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
-    
     conversations = []
     total_input_tokens = 0
     
-    for item in sampled_dataset:
-        messages, prompt_tokens = dataset_config["handler"](client, model, item)
-        conversations.append(messages)
-        total_input_tokens += prompt_tokens
+    # Special handling for dummy datasets
+    if dataset_key.startswith("dummy_"):
+        # For dummy datasets, create synthetic data
+        for _ in range(num_samples):
+            # Create a dummy item (can be anything, it will be handled by the dummy handler)
+            dummy_item = {"dummy": True}
+            messages, prompt_tokens = dataset_config["handler"](client, model, dummy_item)
+            conversations.append(messages)
+            total_input_tokens += prompt_tokens
+    else:
+        # For real datasets, load from HuggingFace
+        ds = load_dataset(dataset_config["dataset"])
+        sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
+        
+        for item in sampled_dataset:
+            messages, prompt_tokens = dataset_config["handler"](client, model, item)
+            conversations.append(messages)
+            total_input_tokens += prompt_tokens
     
     avg_input_tokens = total_input_tokens / len(conversations) if conversations else 0
     return conversations, avg_input_tokens
@@ -116,7 +153,7 @@ def main():
     parser.add_argument("--model", type=str, required=True,
                         help="Model tag to use (e.g., 'distill-llama-8b').")
     parser.add_argument("--dataset_key", type=str, default="aime",
-                        help="Dataset key (e.g., 'aime', 'conversation')")
+                        help="Dataset key (e.g., 'aime', 'dummy_300')")
     parser.add_argument("--api_base", type=str, default="http://localhost:8000/v1",
                         help="Base URL of the vLLM server API.")
     parser.add_argument("--api_key", type=str, default="sk-dummy",
