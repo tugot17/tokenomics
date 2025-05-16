@@ -56,7 +56,7 @@ def run_benchmark(client, model: str, conversations, temperature: float, max_tok
     batch_start_time = time.perf_counter()
     results = []
     
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(conversations)) as executor:
         futures = [
             executor.submit(call_server_completion, client, model, conv, temperature, max_tokens)
             for conv in conversations
