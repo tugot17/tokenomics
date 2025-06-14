@@ -11,7 +11,25 @@ class DatasetHandler:
     @staticmethod
     def aime_handler(num_samples, seed):
         ds = load_dataset("gneubig/aime-1983-2024")
-        sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
+        dataset_size = len(ds["train"])
+        if num_samples <= dataset_size:
+            sampled_dataset = ds["train"].shuffle(seed=seed).select(range(num_samples))
+        else:
+            print(f"Requested {num_samples} samples, dataset has {dataset_size} samples")
+            print(f"Will repeat dataset {(num_samples + dataset_size - 1) // dataset_size} times")
+            
+            shuffled_ds = ds["train"].shuffle(seed=seed)
+            
+            full_cycles = num_samples // dataset_size
+            remainder = num_samples % dataset_size
+            
+            indices = []
+            for cycle in range(full_cycles):
+                indices.extend(range(dataset_size))
+            if remainder > 0:
+                indices.extend(range(remainder))
+            
+            sampled_dataset = shuffled_ds.select(indices)
         
         conversations = []
         for item in sampled_dataset:
