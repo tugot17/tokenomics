@@ -188,7 +188,7 @@ def plot_throughput(json_files: List[str], output_image: str, title: Optional[st
             linewidth=2,
             marker=markers[i],
             markersize=8,
-            label=f"{dataset['description']} - Batch Tokens/s",
+            label=f"{dataset['description']}",
         )
         ax1.fill_between(
             x_positions,
@@ -267,7 +267,7 @@ def plot_throughput(json_files: List[str], output_image: str, title: Optional[st
             linewidth=2,
             marker=markers[i],
             markersize=8,
-            label=f"{dataset['description']} - Request Tokens/s",
+            label=f"{dataset['description']}",
         )
         ax2.fill_between(
             x_positions,
