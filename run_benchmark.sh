@@ -1,0 +1,1 @@
+uv run python oai_server_benchmark.py --api_base http://localhost:8000  --model qwen-235b-a22b --dataset_key aime --batch_sizes 1,2,4,8,16,32 --description "qwen-235b-a22b running on 8xA100" --results_file qwen-235b-a22b_8x_a100.json --max_tokens 3000 --num_runs 3 --api_key "TOKEN-HERE"
