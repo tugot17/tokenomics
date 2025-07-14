@@ -64,17 +64,26 @@ class AsyncBenchmark:
         connector = aiohttp.TCPConnector(
             limit=self.max_batch_size,  
             limit_per_host=self.max_batch_size,
-            ttl_dns_cache=300,  # DNS cache TTL
+            ttl_dns_cache=10,  # DNS cache TTL
             use_dns_cache=True,
-            keepalive_timeout=30,
+            keepalive_timeout=0,
             enable_cleanup_closed=True
         )
         
-        timeout = aiohttp.ClientTimeout(total=self.max_batch_size)
+        timeout = aiohttp.ClientTimeout(
+            total=300,  # Total request timeout
+            connect=30,  # Connection establishment timeout
+            sock_read=60,  # Individual socket read timeout
+            sock_connect=10  # Socket connection timeout
+        )
 
+        # Use large read buffer (10MB) like sglang for handling large responses
+        read_bufsize = 10 * 1024 * 1024  # 10 MB buffer
+        
         return aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
+            read_bufsize=read_bufsize,
             headers={"Authorization": "Bearer sk-dummy"}
         )
     
