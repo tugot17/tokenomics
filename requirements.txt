@@ -1,4 +1,6 @@
+-r test/requirements.txt
 datasets==3.2.0 
 openai
 matplotlib
 seaborn
+aiohttp

@@ -1,11 +1,12 @@
 import argparse
-import concurrent.futures
+import asyncio
+import aiohttp
 import time
 import statistics
 import json
 from datetime import datetime
 from datasets import load_dataset
-from openai import OpenAI
+from typing import List, Dict, Any, Tuple
 
 class DatasetHandler:
     @staticmethod
@@ -45,70 +46,118 @@ DATASET_HANDLERS = {
     "aime": DatasetHandler.aime_handler
 }
 
-def create_sample_conversations(client, model: str, dataset_key: str, num_samples: int, seed: int = 42):
+def create_sample_conversations(dataset_key: str, num_samples: int, seed: int = 42):
     handler = DATASET_HANDLERS.get(dataset_key)
     if not handler:
         raise ValueError(f"Unknown dataset key: {dataset_key}")
     return handler(num_samples, seed)
 
-def call_server_completion(client, model: str, messages, temperature: float, max_tokens: int):
-    try:
-        start_time = time.perf_counter()
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens
+class AsyncBenchmark:
+    def __init__(self, api_base: str, model: str, max_batch_size: int):
+        self.api_base = api_base
+        self.model = model
+        self.max_batch_size = max_batch_size
+        self.semaphore = asyncio.Semaphore(max_batch_size)
+        
+    def create_session(self):
+        """Create aiohttp session with optimized connection settings"""
+        connector = aiohttp.TCPConnector(
+            limit=self.max_batch_size,  
+            limit_per_host=self.max_batch_size,
+            ttl_dns_cache=300,  # DNS cache TTL
+            use_dns_cache=True,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
         )
-        end_time = time.perf_counter()
-        elapsed = end_time - start_time
-        prompt_tokens = response.usage.prompt_tokens
-        completion_tokens = response.usage.completion_tokens
-        tokens_per_second = completion_tokens / elapsed if elapsed > 0 else 0
-        return prompt_tokens, completion_tokens, tokens_per_second, start_time, end_time
-    except Exception as e:
-        print(f"Error during API call: {e}")
-        return 0, 0, 0, 0, 0
+        
+        timeout = aiohttp.ClientTimeout(total=self.max_batch_size)
 
-def run_benchmark(client, model: str, conversations, temperature: float, max_tokens: int):
-    batch_start_time = time.perf_counter()
-    results = []
+        return aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+            headers={"Authorization": "Bearer sk-dummy"}
+        )
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(conversations)) as executor:
-        futures = [
-            executor.submit(call_server_completion, client, model, conv, temperature, max_tokens)
-            for conv in conversations
-        ]
-        for future in concurrent.futures.as_completed(futures):
-            prompt_tokens, completion_tokens, tps, start_time, end_time = future.result()
-            results.append((prompt_tokens, completion_tokens, tps, start_time, end_time))
-    
-    batch_end_time = time.perf_counter()
-    
-    relative_end_times = [end_time - batch_start_time for _, _, _, _, end_time in results]
-    
-    prompt_tokens_list = [r[0] for r in results]
-    completion_tokens_list = [r[1] for r in results]
-    tps_list = [r[2] for r in results]
-    
-    metrics = {
-        "tokens": {
-            "input_per_request": prompt_tokens_list,  # Store full list
-            "output_per_request": completion_tokens_list  # Store full list
-        },
-        "timings": {
-            "batch_total_seconds": batch_end_time - batch_start_time,
-            "fastest_seconds": min(relative_end_times),
-            "slowest_seconds": max(relative_end_times),
-            "spread_seconds": max(relative_end_times) - min(relative_end_times)
-        },
-        "throughput": {
-            "batch_tokens_per_second": sum(completion_tokens_list) / (batch_end_time - batch_start_time) if batch_end_time > batch_start_time else 0,
-            "request_tokens_per_second": tps_list
+    async def call_completion(self, session: aiohttp.ClientSession, messages: List[Dict], 
+                            temperature: float, max_tokens: int, request_id: int = 0) -> Tuple[int, int, float, float, float]:
+        """Make async API call with semaphore-based concurrency control"""
+        async with self.semaphore:
+            try:
+                start_time = time.perf_counter()
+                
+                payload = {
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                }
+                
+                async with session.post(f"{self.api_base}/chat/completions", json=payload) as response:
+                    if response.status != 200:
+                        print(f"Request {request_id} failed with status {response.status}")
+                        return 0, 0, 0, 0, 0
+                    
+                    data = await response.json()
+                    end_time = time.perf_counter()
+                    
+                    elapsed = end_time - start_time
+                    prompt_tokens = data.get("usage", {}).get("prompt_tokens", 0)
+                    completion_tokens = data.get("usage", {}).get("completion_tokens", 0)
+                    tokens_per_second = completion_tokens / elapsed if elapsed > 0 else 0
+                    
+                    return prompt_tokens, completion_tokens, tokens_per_second, start_time, end_time
+                    
+            except Exception as e:
+                print(f"Error in request {request_id}: {e}")
+                return 0, 0, 0, 0, 0
+
+    async def run_benchmark(self, conversations: List[List[Dict]], temperature: float, max_tokens: int):
+        """Run benchmark with async concurrency"""
+        batch_start_time = time.perf_counter()
+        
+        async with self.create_session() as session:
+            # Create tasks for all requests
+            tasks = [
+                self.call_completion(session, conv, temperature, max_tokens, i)
+                for i, conv in enumerate(conversations)
+            ]
+            
+            # Wait for all tasks to complete
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        batch_end_time = time.perf_counter()
+        
+        # Filter out exceptions and failed requests
+        valid_results = [r for r in results if isinstance(r, tuple) and r[0] > 0]
+        
+        if not valid_results:
+            print("No valid results obtained!")
+            return None
+            
+        relative_end_times = [end_time - batch_start_time for _, _, _, _, end_time in valid_results]
+        
+        prompt_tokens_list = [r[0] for r in valid_results]
+        completion_tokens_list = [r[1] for r in valid_results]
+        tps_list = [r[2] for r in valid_results]
+        
+        metrics = {
+            "tokens": {
+                "input_per_request": prompt_tokens_list,
+                "output_per_request": completion_tokens_list
+            },
+            "timings": {
+                "batch_total_seconds": batch_end_time - batch_start_time,
+                "fastest_seconds": min(relative_end_times),
+                "slowest_seconds": max(relative_end_times),
+                "spread_seconds": max(relative_end_times) - min(relative_end_times)
+            },
+            "throughput": {
+                "batch_tokens_per_second": sum(completion_tokens_list) / (batch_end_time - batch_start_time) if batch_end_time > batch_start_time else 0,
+                "request_tokens_per_second": tps_list
+            }
         }
-    }
 
-    return metrics
+        return metrics
 
 def calculate_stats(run_metrics):
     def compute_stats(metrics_list, key_path):
@@ -140,9 +189,9 @@ def save_results(results: dict, filename: str):
     with open(filename, "w") as f:
         json.dump(results, f, indent=2)
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(
-        description="Simplified Benchmark for vLLM Server using OpenAI Chat Completion API"
+        description="Async Benchmark for vLLM Server using OpenAI Chat Completion API"
     )
     parser.add_argument("--model", type=str, required=True,
                         help="Model tag to use (e.g., 'distill-llama-8b').")
@@ -164,12 +213,17 @@ def main():
                         help="Random seed for dataset sampling.")
     parser.add_argument("--description", type=str, default="",
                         help="Optional description or notes for the experiment.")
-    parser.add_argument("--results_file", type=str, default="server_benchmark_results.json",
+    parser.add_argument("--results_file", type=str, default="async_benchmark_results.json",
                         help="Path to JSON file for saving results.")
     args = parser.parse_args()
 
     batch_sizes = [int(bs.strip()) for bs in args.batch_sizes.split(",") if bs.strip()]
-    client = OpenAI(api_key="sk-dummy", base_url=args.api_base)
+    
+    benchmark = AsyncBenchmark(
+        api_base=args.api_base,
+        model=args.model,
+        max_batch_size=max(batch_sizes)
+    )
 
     results = {
         "metadata": {
@@ -188,46 +242,56 @@ def main():
         "results": {}
     }
 
-    print(f"Starting benchmark for model: {args.model}")
+    print(f"Starting async benchmark for model: {args.model}")
+    
     for batch_size in batch_sizes:
         print(f"\n=== Benchmarking Batch Size: {batch_size} ===")
         
         print(f"Performing {args.warmup_runs} warmup runs...", end="", flush=True)
         for _ in range(args.warmup_runs):
-            conversations = create_sample_conversations(
-                client, args.model, args.dataset_key, num_samples=1, seed=args.seed)
-            call_server_completion(client, args.model, conversations[0], args.temperature, max_tokens=30)
+            conversations = create_sample_conversations(args.dataset_key, num_samples=1, seed=args.seed)
+            async with benchmark.create_session() as session:
+                await benchmark.call_completion(
+                    session,
+                    conversations[0], 
+                    args.temperature, 
+                    max_tokens=30
+                )
         print(" done")
         
         run_metrics = []
 
         for run in range(1, args.num_runs + 1):
             print(f" Run {run}/{args.num_runs} ... ", end="", flush=True)
-            conversations = create_sample_conversations(
-                client, args.model, args.dataset_key, num_samples=batch_size, seed=args.seed)
-            metrics = run_benchmark(client, args.model, conversations, args.temperature, args.max_tokens)
-            run_metrics.append(metrics)
+            conversations = create_sample_conversations(args.dataset_key, num_samples=batch_size, seed=args.seed)
+            metrics = await benchmark.run_benchmark(conversations, args.temperature, args.max_tokens)
             
-            # Calculate mean for this run's output stats
-            mean_output = statistics.mean(metrics['tokens']['output_per_request'])
-            mean_tps = statistics.mean(metrics['throughput']['request_tokens_per_second'])
-            
-            print(f" Run {run}/{args.num_runs}:")
-            print(f"  Output tokens/req: {mean_output:.2f}")
-            print(f"  Batch time: {metrics['timings']['batch_total_seconds']:.2f}s")
-            print(f"  Avg Request TPS: {mean_tps:.2f}")
+            if metrics:
+                run_metrics.append(metrics)
+                
+                # Calculate mean for this run's output stats
+                mean_output = statistics.mean(metrics['tokens']['output_per_request'])
+                mean_tps = statistics.mean(metrics['throughput']['request_tokens_per_second'])
+                
+                print(f" Run {run}/{args.num_runs}:")
+                print(f"  Output tokens/req: {mean_output:.2f}")
+                print(f"  Batch time: {metrics['timings']['batch_total_seconds']:.2f}s")
+                print(f"  Avg Request TPS: {mean_tps:.2f}")
+            else:
+                print(" FAILED")
 
-        stats = calculate_stats(run_metrics)
-        results["results"][str(batch_size)] = stats
+        if run_metrics:
+            stats = calculate_stats(run_metrics)
+            results["results"][str(batch_size)] = stats
 
-        print("\nSummary:")
-        for category, metrics in stats.items():
-            print(f"\n{category.title()}:")
-            for metric, values in metrics.items():
-                print(f"  {metric}: {values['mean']:.2f} ± {values['std']:.2f}")
+            print("\nSummary:")
+            for category, metrics in stats.items():
+                print(f"\n{category.title()}:")
+                for metric, values in metrics.items():
+                    print(f"  {metric}: {values['mean']:.2f} ± {values['std']:.2f}")
 
     save_results(results, args.results_file)
     print(f"\nBenchmark results saved to {args.results_file}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
