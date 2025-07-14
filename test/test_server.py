@@ -170,7 +170,7 @@ def main():
     
     try:
         uvicorn.run(
-            "test_server:app",
+            app,
             host=args.host,
             port=args.port,
             workers=args.workers,
