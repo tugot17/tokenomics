@@ -4,6 +4,8 @@ import aiohttp
 import time
 import statistics
 import json
+import multiprocessing
+import os
 from datetime import datetime
 from datasets import load_dataset
 from typing import List, Dict, Any, Tuple
@@ -53,20 +55,21 @@ def create_sample_conversations(dataset_key: str, num_samples: int, seed: int = 
     return handler(num_samples, seed)
 
 class AsyncBenchmark:
-    def __init__(self, api_base: str, model: str, max_batch_size: int):
+    def __init__(self, api_base: str, model: str, max_concurrent: int):
         self.api_base = api_base
         self.model = model
-        self.max_batch_size = max_batch_size
-        self.semaphore = asyncio.Semaphore(max_batch_size)
+        self.max_concurrent = max_concurrent
+        self.semaphore = asyncio.Semaphore(max_concurrent)
         
     def create_session(self):
         """Create aiohttp session with optimized connection settings"""
+        # Connection settings optimized for high-concurrency benchmarking
         connector = aiohttp.TCPConnector(
-            limit=self.max_batch_size,  
-            limit_per_host=self.max_batch_size,
-            ttl_dns_cache=10,  # DNS cache TTL
+            limit=self.max_concurrent,  
+            limit_per_host=self.max_concurrent,
+            ttl_dns_cache=300,  # DNS cache TTL - longer is better for benchmarking
             use_dns_cache=True,
-            keepalive_timeout=0,
+            keepalive_timeout=30,  # Keep connections alive for reuse
             enable_cleanup_closed=True
         )
         
@@ -168,6 +171,150 @@ class AsyncBenchmark:
 
         return metrics
 
+def worker_process(worker_id: int, conversations: List[List[Dict]], api_base: str, model: str, 
+                  temperature: float, max_tokens: int, max_concurrent: int, result_queue):
+    """Worker process that runs async benchmark for a subset of conversations"""
+    
+    async def run_worker():
+        # print(f"Worker {worker_id} starting with {len(conversations)} conversations")
+        
+        benchmark = AsyncBenchmark(api_base, model, max_concurrent)
+        metrics = await benchmark.run_benchmark(conversations, temperature, max_tokens)
+        
+        if metrics:
+            # Add worker ID to metrics for debugging
+            metrics["worker_id"] = worker_id
+            result_queue.put(metrics)
+            # print(f"Worker {worker_id} completed successfully")
+        else:
+            # print(f"Worker {worker_id} failed")
+            result_queue.put(None)
+    
+    # Run the async function in this process
+    asyncio.run(run_worker())
+
+def aggregate_metrics(worker_results: List[Dict]) -> Dict:
+    """Aggregate metrics from multiple worker processes"""
+    if not worker_results:
+        return None
+    
+    # Combine all token lists
+    all_input_tokens = []
+    all_output_tokens = []
+    all_tps = []
+    
+    # Track timing info for overall batch timing
+    earliest_start = float('inf')
+    latest_end = 0
+    all_fastest = []
+    all_slowest = []
+    
+    total_output_tokens = 0
+    
+    for metrics in worker_results:
+        all_input_tokens.extend(metrics["tokens"]["input_per_request"])
+        all_output_tokens.extend(metrics["tokens"]["output_per_request"])
+        all_tps.extend(metrics["throughput"]["request_tokens_per_second"])
+        
+        all_fastest.append(metrics["timings"]["fastest_seconds"])
+        all_slowest.append(metrics["timings"]["slowest_seconds"])
+        
+        total_output_tokens += sum(metrics["tokens"]["output_per_request"])
+        
+        # For overall batch timing, we need to consider that workers ran in parallel
+        # So we take the maximum batch time across all workers
+        latest_end = max(latest_end, metrics["timings"]["batch_total_seconds"])
+    
+    # Aggregate metrics
+    aggregated = {
+        "tokens": {
+            "input_per_request": all_input_tokens,
+            "output_per_request": all_output_tokens
+        },
+        "timings": {
+            "batch_total_seconds": latest_end,  # Max time across all workers
+            "fastest_seconds": min(all_fastest),
+            "slowest_seconds": max(all_slowest),
+            "spread_seconds": max(all_slowest) - min(all_fastest)
+        },
+        "throughput": {
+            "batch_tokens_per_second": total_output_tokens / latest_end if latest_end > 0 else 0,
+            "request_tokens_per_second": all_tps
+        }
+    }
+    
+    return aggregated
+
+def run_multiprocess_benchmark(conversations: List[List[Dict]], api_base: str, model: str,
+                             temperature: float, max_tokens: int, n_cores: int, max_asyncio_connections: int = 512) -> Dict:
+    """Run benchmark using multiple processes"""
+    
+    total_conversations = len(conversations)
+
+    # set the number of cores s.t. the asyncio semaphore has asyncio_connections connections
+    cores_for_asyncio_connections = total_conversations // max_asyncio_connections + 1
+    
+    # Handle case where we have fewer conversations than cores
+    actual_cores = min(n_cores, cores_for_asyncio_connections)
+    
+    # Split conversations across processes
+    conversations_per_process = total_conversations // actual_cores
+    remainder = total_conversations % actual_cores
+    
+    # Create conversation chunks for each process
+    conversation_chunks = []
+    start_idx = 0
+    
+    for i in range(actual_cores):
+        # Add one extra conversation to first 'remainder' processes
+        chunk_size = conversations_per_process + (1 if i < remainder else 0)
+        end_idx = start_idx + chunk_size
+        
+        conversation_chunks.append(conversations[start_idx:end_idx])
+        start_idx = end_idx
+    
+    # Calculate max concurrent connections per process
+    # Use a reasonable limit per process to avoid overwhelming the system
+    max_concurrent_per_process = max(1, conversations_per_process + 1)
+    
+    print(f"Using {actual_cores} processes, {conversations_per_process}-{conversations_per_process+1} conversations per process")
+    print(f"Max concurrent per process: {max_concurrent_per_process}")
+    
+    result_queue = multiprocessing.Queue(maxsize=actual_cores * 2)
+    
+    # Create and start processes
+    processes = []
+    for i, chunk in enumerate(conversation_chunks):
+        p = multiprocessing.Process(
+            target=worker_process,
+            args=(i, chunk, api_base, model, temperature, max_tokens, max_concurrent_per_process, result_queue)
+        )
+        processes.append(p)
+        p.start()
+    
+    worker_results = []
+    for _ in range(actual_cores):
+        try:
+            result = result_queue.get(timeout=600)  # 10 minute timeout per process
+            if result is not None:
+                worker_results.append(result)
+        except:
+            print(f"Warning: Failed to get result from a worker process")
+    
+    # Now wait for all processes to complete
+    for p in processes:
+        p.join(timeout=600)  # 10 minute timeout per process
+        if p.is_alive():
+            print(f"Warning: Process {p.pid} didn't finish in time, terminating")
+            p.terminate()
+            p.join()
+    
+    # Aggregate results
+    if worker_results:
+        return aggregate_metrics(worker_results)
+    else:
+        return None
+
 def calculate_stats(run_metrics):
     def compute_stats(metrics_list, key_path):
         if isinstance(metrics_list[0][key_path[0]][key_path[1]], list):
@@ -200,7 +347,7 @@ def save_results(results: dict, filename: str):
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Async Benchmark for vLLM Server using OpenAI Chat Completion API"
+        description="Multiprocess Async Benchmark for vLLM Server using OpenAI Chat Completion API"
     )
     parser.add_argument("--model", type=str, required=True,
                         help="Model tag to use (e.g., 'distill-llama-8b').")
@@ -220,6 +367,8 @@ async def main():
                         help="Sampling temperature for generation.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for dataset sampling.")
+    parser.add_argument("--n_cores", type=int, default=int(os.cpu_count()/2),
+                        help="Number of processes to use for parallel execution.")
     parser.add_argument("--description", type=str, default="",
                         help="Optional description or notes for the experiment.")
     parser.add_argument("--results_file", type=str, default="async_benchmark_results.json",
@@ -228,12 +377,6 @@ async def main():
 
     batch_sizes = [int(bs.strip()) for bs in args.batch_sizes.split(",") if bs.strip()]
     
-    benchmark = AsyncBenchmark(
-        api_base=args.api_base,
-        model=args.model,
-        max_batch_size=max(batch_sizes)
-    )
-
     results = {
         "metadata": {
             "timestamp": datetime.now().isoformat(),
@@ -246,12 +389,14 @@ async def main():
             "temperature": args.temperature,
             "seed": args.seed,
             "warmup_runs": args.warmup_runs,
+            "n_cores": args.n_cores,
             "description": args.description
         },
         "results": {}
     }
 
-    print(f"Starting async benchmark for model: {args.model}")
+    print(f"Starting multiprocess async benchmark for model: {args.model}")
+    print(f"Using {args.n_cores} processes")
     
     for batch_size in batch_sizes:
         print(f"\n=== Benchmarking Batch Size: {batch_size} ===")
@@ -259,6 +404,8 @@ async def main():
         print(f"Performing {args.warmup_runs} warmup runs...", end="", flush=True)
         for _ in range(args.warmup_runs):
             conversations = create_sample_conversations(args.dataset_key, num_samples=1, seed=args.seed)
+            # Simple warmup with single process
+            benchmark = AsyncBenchmark(args.api_base, args.model, max_concurrent=1)
             async with benchmark.create_session() as session:
                 await benchmark.call_completion(
                     session,
@@ -273,7 +420,15 @@ async def main():
         for run in range(1, args.num_runs + 1):
             print(f" Run {run}/{args.num_runs} ... ", end="", flush=True)
             conversations = create_sample_conversations(args.dataset_key, num_samples=batch_size, seed=args.seed)
-            metrics = await benchmark.run_benchmark(conversations, args.temperature, args.max_tokens)
+            
+            metrics = run_multiprocess_benchmark(
+                conversations, 
+                args.api_base, 
+                args.model,
+                args.temperature, 
+                args.max_tokens, 
+                args.n_cores
+            )
             
             if metrics:
                 run_metrics.append(metrics)
@@ -286,6 +441,7 @@ async def main():
                 print(f"  Output tokens/req: {mean_output:.2f}")
                 print(f"  Batch time: {metrics['timings']['batch_total_seconds']:.2f}s")
                 print(f"  Avg Request TPS: {mean_tps:.2f}")
+                print(f"  Batch TPS: {metrics['throughput']['batch_tokens_per_second']:.2f}")
             else:
                 print(" FAILED")
 
@@ -303,4 +459,6 @@ async def main():
     print(f"\nBenchmark results saved to {args.results_file}")
 
 if __name__ == "__main__":
+    # Enable multiprocessing support
+    multiprocessing.set_start_method('spawn', force=True)
     asyncio.run(main())
