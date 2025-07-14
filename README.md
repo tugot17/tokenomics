@@ -34,7 +34,7 @@ To run the SGLang server run:
 Running the benchmark is fairly straightforward. You need to specify the model name (tag for vllm/sglang), the dataset on which you intend to test and some other options:
 
 ```bash
-python oai_server_benchmark.py --model MODEL_NAME --dataset_key DATASET_NAME [OPTIONS]
+uv run oai_server_benchmark.py --model MODEL_NAME --dataset_key DATASET_NAME [OPTIONS]
 ```
 
 ### Key Options
@@ -48,7 +48,7 @@ python oai_server_benchmark.py --model MODEL_NAME --dataset_key DATASET_NAME [OP
 E.g. config for VLLM server
 
 ```bash
-python oai_server_benchmark.py --model distill-llama-8b --dataset_key aime --api_base http://localhost:8000/v1 --batch_sizes 1,2,4,8 --num_runs 3 --max_tokens 100 --temperature 0.5 --description "Deepseek R1 distill 8B TP8 A100s" --results_file my_server_benchmark.json
+uv run oai_server_benchmark.py --model distill-llama-8b --dataset_key aime --api_base http://localhost:8000/v1 --batch_sizes 1,2,4,8 --num_runs 3 --max_tokens 100 --temperature 0.5 --description "Deepseek R1 distill 8B TP8 A100s" --results_file my_server_benchmark.json
 ```
 
 We measure the performance against different batch sizes. Note you need to guarantee that no other tenants are using the API at the same time as you do; otherwise, you will get flawed performance numbers. 
@@ -110,41 +110,77 @@ The result is a `.json` file looks something like this:
 
 Post generation use the following line to plot the throghput The plot can take as many input files as wanted and optionally a title. At least one input file and the output file are required.
 ```bash
-python plot_throughput.py --title "My Custom Title" <PATH-TO-JSON-OUTPUT-0> <PATH-TO-JSON-OUTPUT-1> <PATH-TO-JSON-OUTPUT-2> <PATH-TO-IMAGE-WITH-VISUALIZATION>
+uv run python plot_throughput.py --title "My Custom Title" <PATH-TO-JSON-OUTPUT-0> <PATH-TO-JSON-OUTPUT-1> <PATH-TO-JSON-OUTPUT-2> <PATH-TO-IMAGE-WITH-VISUALIZATION>
 ```
 
 E.g.
 
 ```bash
-python plot_throughput.py --title "My Custom Title" my_server_benchmark_model0.json my_server_benchmark_model1.json my_output.png
+uv run python plot_throughput.py --title "My Custom Title" my_server_benchmark_model0.json my_server_benchmark_model1.json my_output.png
 ```
 
 ![alt text](assets/example_visualization.png)
+
+## Embedding Benchmarks
+
+In addition to LLM throughput benchmarks, this repository also supports embedding model benchmarks. The embedding benchmark tests concurrent performance by sending multiple separate requests to measure embedding throughput.
+
+### How to run embedding benchmarks?
+
+Running the embedding benchmark follows a similar pattern to the LLM benchmark:
+
+```bash
+uv run embedding_benchmark.py --model MODEL_NAME --sequence_lengths LENGTHS [OPTIONS]
+```
+
+### Key Options for Embeddings
+- `--model`: Embedding model tag (e.g., 'sentence-transformers/all-MiniLM-L6-v2')
+- `--api_base`: Server URL (default: http://localhost:8000/v1)
+- `--batch_sizes`: Comma-separated batch sizes for concurrent requests (default: 1,2,4,8,16)
+- `--sequence_lengths`: Text lengths - categories (short,medium,long,mixed) or word counts (10,25,50,200)
+- `--num_runs`: Number of runs per configuration (default: 3)
+- `--results_file`: Output JSON file path
+
+Example configuration for embedding server:
+
+```bash
+uv run embedding_benchmark.py --model Qwen/Qwen3-Embedding-4B --sequence_lengths "200" --batch_sizes "1,8,16,32,64,128,256,512" --num_runs 3 --description "Qwen3 4B Embedding TP1 A100" --results_file embedding_results.json
+```
+
+The embedding benchmark tests concurrent performance by sending separate requests simultaneously (e.g., 512 separate API calls with 1 text each) rather than single large batched requests.
+
+After running the benchmark, generate visualizations with:
+
+```bash
+uv run plot_embedding_benchmark.py embedding_results.json embedding_plot.png
+```
+
+![Embedding Performance](assets/embeddings_speed.png)
 
 
 ## Install requirements
 
 
 ```bash
-conda create --name tokenomics python=3.11
+uv venv --python 3.12 --seed
 
-conda activate tokenomics
+source .venv/bin/activate
 
-pip install -r requirements.txt 
+uv pip install -r requirements.txt
 ```
 
 To run a `vllm` server install via 
 
 ```bash
-pip install vllm
+uv pip install vllm
 ```
 
 To run a sglang server via
 
 ```bash
-pip install --upgrade pip
-pip install sgl-kernel --force-reinstall --no-deps
-pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
+uv pip install --upgrade pip
+uv pip install sgl-kernel --force-reinstall --no-deps
+uv pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
 ```
 
 
