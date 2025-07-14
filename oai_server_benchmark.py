@@ -276,9 +276,7 @@ def run_multiprocess_benchmark(conversations: List[List[Dict]], api_base: str, m
     # Calculate max concurrent connections per process
     # Use a reasonable limit per process to avoid overwhelming the system
     max_concurrent_per_process = max(1, conversations_per_process + 1)
-    
-    print(f"Using {actual_cores} processes, {conversations_per_process}-{conversations_per_process+1} conversations per process")
-    print(f"Max concurrent per process: {max_concurrent_per_process}")
+
     
     result_queue = multiprocessing.Queue(maxsize=actual_cores * 2)
     
@@ -394,9 +392,6 @@ async def main():
         },
         "results": {}
     }
-
-    print(f"Starting multiprocess async benchmark for model: {args.model}")
-    print(f"Using {args.n_cores} processes")
     
     for batch_size in batch_sizes:
         print(f"\n=== Benchmarking Batch Size: {batch_size} ===")
