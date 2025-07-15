@@ -74,9 +74,8 @@ class AsyncBenchmark:
         )
         
         timeout = aiohttp.ClientTimeout(
-            total=300,  # Total request timeout
+            total=1800,  # Total request timeout
             connect=30,  # Connection establishment timeout
-            sock_read=60,  # Individual socket read timeout
             sock_connect=10  # Socket connection timeout
         )
 
@@ -293,7 +292,7 @@ def run_multiprocess_benchmark(conversations: List[List[Dict]], api_base: str, m
     worker_results = []
     for _ in range(actual_cores):
         try:
-            result = result_queue.get(timeout=600)  # 10 minute timeout per process
+            result = result_queue.get(timeout=1800)  # 30 minute timeout per process
             if result is not None:
                 worker_results.append(result)
         except:
@@ -301,7 +300,7 @@ def run_multiprocess_benchmark(conversations: List[List[Dict]], api_base: str, m
     
     # Now wait for all processes to complete
     for p in processes:
-        p.join(timeout=600)  # 10 minute timeout per process
+        p.join(timeout=1800)  # 30 minute timeout per process
         if p.is_alive():
             print(f"Warning: Process {p.pid} didn't finish in time, terminating")
             p.terminate()
