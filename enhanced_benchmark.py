@@ -346,10 +346,10 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
         },
         # Aggregated batch-level metrics
         "batch_metrics": {
-            "combined_throughput_per_batch": all_combined_throughput,  # Sum of individual throughputs per batch
-            "batch_duration_per_batch": all_batch_duration,
-            "total_output_tokens_per_batch": all_total_output_tokens,
-            "total_requests_per_batch": all_total_requests
+            "combined_throughput": sum(all_combined_throughput),  # Sum across all workers for true batch throughput
+            "batch_duration": max(all_batch_duration) if all_batch_duration else 0,  # Max duration (parallel execution)
+            "total_output_tokens": sum(all_total_output_tokens),
+            "total_requests": sum(all_total_requests)
         },
         # Aggregated failure tracking
         "failures": {
@@ -516,6 +516,8 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
         total_requests += failures.get("total_requests", 0)
         total_successful += failures.get("successful", 0)
         total_failed += failures.get("failed", 0)
+    
+    print(f"DEBUG calculate_stats: all_combined_throughput = {all_combined_throughput}")
     
     return {
         "tokens": {
@@ -686,6 +688,7 @@ def main():
                 user_requests, args.api_base, args.model, args.temperature, 
                 args.max_tokens, multiprocessing.cpu_count(), tokenizer_name
             )
+            
             
             runs_data.append(run_data)
             
