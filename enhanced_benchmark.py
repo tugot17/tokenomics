@@ -187,8 +187,9 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
         return {
             "tokens": {"input_per_request": [], "output_per_request": []},
             "timings": {"batch_total_seconds": batch_total_seconds, "fastest_seconds": 0, "slowest_seconds": 0, "spread_seconds": 0},
-            "throughput": {"batch_tokens_per_second": 0, "request_tokens_per_second": []},
-            "ttft_metrics": {"ttft_per_request": [], "input_throughput_per_request": [], "output_throughput_per_request": [], "tpot_per_request": []},
+            "prefill_metrics": {"ttft_per_request": [], "input_throughput_per_request": []},
+            "decode_metrics": {"output_throughput_per_request": [], "tpot_per_request": []},
+            "batch_metrics": {"total_output_tokens": 0, "batch_duration": batch_total_seconds, "combined_throughput": 0, "total_requests": 0},
             "failures": {"total_requests": total_requests, "successful": success_count, "failed": failure_count}
         }
     
@@ -208,17 +209,6 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     slowest_seconds = max(relative_ends)
     spread_seconds = slowest_seconds - fastest_seconds
     
-    # Calculate throughput metrics
-    total_output_tokens = sum(output_tokens)
-    batch_tokens_per_second = total_output_tokens / batch_total_seconds if batch_total_seconds > 0 else 0
-    
-    # Calculate per-request tokens per second (legacy)
-    request_tokens_per_second = []
-    for r in successful_results:
-        request_duration = r["end_time"] - r["start_time"]
-        if request_duration > 0:
-            tps = r["output_tokens"] / request_duration
-            request_tokens_per_second.append(tps)
     
     return {
         "tokens": {
@@ -231,15 +221,22 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
             "slowest_seconds": slowest_seconds,
             "spread_seconds": spread_seconds
         },
-        "throughput": {
-            "batch_tokens_per_second": batch_tokens_per_second,
-            "request_tokens_per_second": request_tokens_per_second
+        # Prefill phase metrics (input processing)
+        "prefill_metrics": {
+            "ttft_per_request": ttft_values,  # Time to first token
+            "input_throughput_per_request": input_throughput_values,  # Prefill speed
         },
-        "ttft_metrics": {
-            "ttft_per_request": ttft_values,
-            "input_throughput_per_request": input_throughput_values,  # Prefill throughput
-            "output_throughput_per_request": output_throughput_values,  # Decode throughput  
-            "tpot_per_request": tpot_values
+        # Decode phase metrics (output generation)
+        "decode_metrics": {
+            "output_throughput_per_request": output_throughput_values,  # Decode speed per request
+            "tpot_per_request": tpot_values  # Time per output token
+        },
+        # Batch-level system metrics (combined performance)
+        "batch_metrics": {
+            "total_output_tokens": sum(output_tokens),
+            "batch_duration": batch_total_seconds,
+            "combined_throughput": sum(output_throughput_values),  # Sum of all individual decode speeds
+            "total_requests": len(successful_results)
         },
         # Request success/failure tracking
         "failures": {
@@ -275,7 +272,6 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
     # Combine all token lists
     all_input_tokens = []
     all_output_tokens = []
-    all_tps = []
     
     # Combine TTFT metrics
     all_ttft = []
@@ -292,19 +288,32 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
     total_successful = 0
     total_failed = 0
     
-    total_output_tokens = 0
+    # Track batch-level metrics
+    all_combined_throughput = []
+    all_batch_duration = []
+    all_total_output_tokens = []
+    all_total_requests = []
+    
     latest_end = 0
     
     for metrics in worker_results:
         all_input_tokens.extend(metrics["tokens"]["input_per_request"])
         all_output_tokens.extend(metrics["tokens"]["output_per_request"])
-        all_tps.extend(metrics["throughput"]["request_tokens_per_second"])
         
-        # Aggregate TTFT metrics
-        all_ttft.extend(metrics.get("ttft_metrics", {}).get("ttft_per_request", []))
-        all_input_throughput.extend(metrics.get("ttft_metrics", {}).get("input_throughput_per_request", []))
-        all_output_throughput.extend(metrics.get("ttft_metrics", {}).get("output_throughput_per_request", []))
-        all_tpot.extend(metrics.get("ttft_metrics", {}).get("tpot_per_request", []))
+        # Aggregate prefill metrics
+        all_ttft.extend(metrics.get("prefill_metrics", {}).get("ttft_per_request", []))
+        all_input_throughput.extend(metrics.get("prefill_metrics", {}).get("input_throughput_per_request", []))
+        
+        # Aggregate decode metrics
+        all_output_throughput.extend(metrics.get("decode_metrics", {}).get("output_throughput_per_request", []))
+        all_tpot.extend(metrics.get("decode_metrics", {}).get("tpot_per_request", []))
+        
+        # Aggregate batch-level metrics
+        batch_metrics = metrics.get("batch_metrics", {})
+        all_combined_throughput.append(batch_metrics.get("combined_throughput", 0))
+        all_batch_duration.append(batch_metrics.get("batch_duration", 0))
+        all_total_output_tokens.append(batch_metrics.get("total_output_tokens", 0))
+        all_total_requests.append(batch_metrics.get("total_requests", 0))
         
         # Aggregate failure counts
         failures = metrics.get("failures", {})
@@ -314,8 +323,6 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
         
         all_fastest.append(metrics["timings"]["fastest_seconds"])
         all_slowest.append(metrics["timings"]["slowest_seconds"])
-        
-        total_output_tokens += sum(metrics["tokens"]["output_per_request"])
         
         # For overall batch timing, we need to consider that workers ran in parallel
         # So we take the maximum batch time across all workers
@@ -333,16 +340,22 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
             "slowest_seconds": max(all_slowest) if all_slowest else 0,
             "spread_seconds": max(all_slowest) - min(all_fastest) if all_slowest and all_fastest else 0
         },
-        "throughput": {
-            "batch_tokens_per_second": total_output_tokens / latest_end if latest_end > 0 else 0,
-            "request_tokens_per_second": all_tps
-        },
-        # Aggregated TTFT metrics
-        "ttft_metrics": {
+        # Aggregated prefill metrics
+        "prefill_metrics": {
             "ttft_per_request": all_ttft,
-            "input_throughput_per_request": all_input_throughput,
+            "input_throughput_per_request": all_input_throughput
+        },
+        # Aggregated decode metrics  
+        "decode_metrics": {
             "output_throughput_per_request": all_output_throughput,
             "tpot_per_request": all_tpot
+        },
+        # Aggregated batch-level metrics
+        "batch_metrics": {
+            "combined_throughput_per_batch": all_combined_throughput,  # Sum of individual throughputs per batch
+            "batch_duration_per_batch": all_batch_duration,
+            "total_output_tokens_per_batch": all_total_output_tokens,
+            "total_requests_per_batch": all_total_requests
         },
         # Aggregated failure tracking
         "failures": {
@@ -433,20 +446,22 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     # For list-based metrics, flatten all values from all runs
     all_input_tokens = []
     all_output_tokens = []
-    all_request_tps = []
     
-    # TTFT metrics (flattened across runs)
+    # Individual request metrics (flattened across runs)
     all_ttft = []
     all_input_throughput = []
     all_output_throughput = []
     all_tpot = []
+    
+    # Batch-level metrics (one value per run)
+    all_combined_throughput = []
+    all_batch_duration = []
     
     # For single-value metrics, collect one value per run
     batch_total_seconds = []
     fastest_seconds = []
     slowest_seconds = []
     spread_seconds = []
-    batch_tokens_per_second = []
     
     # Failure metrics (aggregated across runs)
     total_requests = 0
@@ -456,20 +471,26 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     for run_data in runs_data:
         all_input_tokens.extend(run_data["tokens"]["input_per_request"])
         all_output_tokens.extend(run_data["tokens"]["output_per_request"])
-        all_request_tps.extend(run_data["throughput"]["request_tokens_per_second"])
         
-        # TTFT metrics
-        ttft_metrics = run_data.get("ttft_metrics", {})
-        all_ttft.extend(ttft_metrics.get("ttft_per_request", []))
-        all_input_throughput.extend(ttft_metrics.get("input_throughput_per_request", []))
-        all_output_throughput.extend(ttft_metrics.get("output_throughput_per_request", []))
-        all_tpot.extend(ttft_metrics.get("tpot_per_request", []))
+        # Prefill metrics
+        prefill_metrics = run_data.get("prefill_metrics", {})
+        all_ttft.extend(prefill_metrics.get("ttft_per_request", []))
+        all_input_throughput.extend(prefill_metrics.get("input_throughput_per_request", []))
+        
+        # Decode metrics
+        decode_metrics = run_data.get("decode_metrics", {})
+        all_output_throughput.extend(decode_metrics.get("output_throughput_per_request", []))
+        all_tpot.extend(decode_metrics.get("tpot_per_request", []))
+        
+        # Batch-level metrics (one value per run)
+        batch_metrics = run_data.get("batch_metrics", {})
+        all_combined_throughput.append(batch_metrics.get("combined_throughput", 0))
+        all_batch_duration.append(batch_metrics.get("batch_duration", 0))
         
         batch_total_seconds.append(run_data["timings"]["batch_total_seconds"])
         fastest_seconds.append(run_data["timings"]["fastest_seconds"])
         slowest_seconds.append(run_data["timings"]["slowest_seconds"])
         spread_seconds.append(run_data["timings"]["spread_seconds"])
-        batch_tokens_per_second.append(run_data["throughput"]["batch_tokens_per_second"])
         
         # Aggregate failure metrics
         failures = run_data.get("failures", {})
@@ -506,18 +527,8 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
                 "std": safe_std(spread_seconds)
             }
         },
-        "throughput": {
-            "batch_tokens_per_second": {
-                "mean": safe_mean(batch_tokens_per_second),
-                "std": safe_std(batch_tokens_per_second)
-            },
-            "request_tokens_per_second": {
-                "mean": safe_mean(all_request_tps),
-                "std": safe_std(all_request_tps)
-            }
-        },
-        # GenAI-Bench style TTFT statistics
-        "ttft_metrics": {
+        # Prefill phase statistics
+        "prefill_metrics": {
             "ttft": {
                 "mean": safe_mean(all_ttft),
                 "std": safe_std(all_ttft)
@@ -525,7 +536,10 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
             "input_throughput": {
                 "mean": safe_mean(all_input_throughput),
                 "std": safe_std(all_input_throughput)
-            },
+            }
+        },
+        # Decode phase statistics
+        "decode_metrics": {
             "output_throughput": {
                 "mean": safe_mean(all_output_throughput),
                 "std": safe_std(all_output_throughput)
@@ -533,6 +547,17 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
             "tpot": {
                 "mean": safe_mean(all_tpot),
                 "std": safe_std(all_tpot)
+            }
+        },
+        # Batch-level combined statistics
+        "batch_metrics": {
+            "combined_throughput": {
+                "mean": safe_mean(all_combined_throughput),
+                "std": safe_std(all_combined_throughput)
+            },
+            "batch_duration": {
+                "mean": safe_mean(all_batch_duration),
+                "std": safe_std(all_batch_duration)
             }
         },
         # Failure/Success metrics
@@ -652,26 +677,29 @@ def main():
                 total_output_tokens = sum(run_data["tokens"]["output_per_request"])
                 batch_time = run_data["timings"]["batch_total_seconds"]
                 
-                # Extract TTFT metrics for reporting
-                ttft_metrics = run_data.get("ttft_metrics", {})
-                ttft_values = ttft_metrics.get("ttft_per_request", [])
-                input_throughput_values = ttft_metrics.get("input_throughput_per_request", [])
-                output_throughput_values = ttft_metrics.get("output_throughput_per_request", [])
+                # Extract prefill and decode metrics for reporting
+                prefill_metrics = run_data.get("prefill_metrics", {})
+                decode_metrics = run_data.get("decode_metrics", {})
+                
+                ttft_values = prefill_metrics.get("ttft_per_request", [])
+                input_throughput_values = prefill_metrics.get("input_throughput_per_request", [])
+                output_throughput_values = decode_metrics.get("output_throughput_per_request", [])
                 
                 # Calculate averages per request
                 avg_ttft = statistics.mean(ttft_values) if ttft_values else 0
                 avg_input_throughput = statistics.mean(input_throughput_values) if input_throughput_values else 0
                 avg_output_throughput = statistics.mean(output_throughput_values) if output_throughput_values else 0
                 
-                # Calculate batch-level throughput (different from per-request averages)
-                batch_total_throughput = total_output_tokens / batch_time if batch_time > 0 else 0
+                # Extract batch-level combined throughput
+                batch_metrics = run_data.get("batch_metrics", {})
+                combined_throughput = batch_metrics.get("combined_throughput", 0)
                 
                 success_rate = (successful / total_req * 100) if total_req > 0 else 0
                 print(f"    ✅ Batch: {batch_time:.2f}s | Success: {successful}/{total_req} ({success_rate:.1f}%)")
                 if failed > 0:
                     print(f"       ❌ {failed} requests failed")
                 print(f"       Tokens - Input: {total_input_tokens:,} | Output: {total_output_tokens:,}")
-                print(f"       Batch Throughput: {batch_total_throughput:.1f} tok/s")
+                print(f"       Combined Throughput: {combined_throughput:.1f} tok/s (sum of all decode speeds)")
                 
                 if avg_ttft > 0:
                     print(f"       Per-Request Avg - TTFT: {avg_ttft:.3f}s | Prefill: {avg_input_throughput:.1f} tok/s | Decode: {avg_output_throughput:.1f} tok/s")
