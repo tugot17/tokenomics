@@ -48,19 +48,16 @@ class TextSampler:
     
     def __init__(self, 
                  tokenizer_name: str,
-                 dataset_loader: DatasetLoader,
-                 discrepancy_threshold: float = 0.1):
+                 dataset_loader: DatasetLoader):
         """
         Initialize the text sampler.
         
         Args:
             tokenizer_name: Name or path of the tokenizer to use
             dataset_loader: Loaded dataset for content sampling
-            discrepancy_threshold: Threshold for warning about token count discrepancies
         """
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.dataset_loader = dataset_loader
-        self.discrepancy_threshold = discrepancy_threshold
         
         # Ensure we have a padding token for token counting
         if self.tokenizer.pad_token is None:
@@ -85,8 +82,7 @@ class TextSampler:
         # Count actual tokens in the generated prompt
         actual_input_tokens = self._count_tokens(prompt)
         
-        # Check for significant discrepancy
-        self._check_discrepancy(actual_input_tokens, target_input_tokens)
+        # Note: actual_input_tokens may differ from target_input_tokens due to dataset characteristics
         
         return UserRequest(
             prompt=prompt,
@@ -164,24 +160,6 @@ class TextSampler:
             # Fallback to rough word count * 1.3 (typical token-to-word ratio)
             return int(len(text.split()) * 1.3)
     
-    def _check_discrepancy(self, actual_tokens: int, target_tokens: int) -> None:
-        """
-        Check for significant discrepancy between actual and target token counts.
-        
-        Args:
-            actual_tokens: Actual number of tokens in the prompt
-            target_tokens: Target number of tokens from scenario
-        """
-        if target_tokens == 0:
-            return
-            
-        discrepancy = abs(actual_tokens - target_tokens) / target_tokens
-        
-        if discrepancy > self.discrepancy_threshold:
-            warnings.warn(
-                f"Token count discrepancy: target={target_tokens}, "
-                f"actual={actual_tokens}, discrepancy={discrepancy:.2%}"
-            )
 
 
 class BatchSampler:

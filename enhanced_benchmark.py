@@ -16,7 +16,9 @@ import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-# Note: tokenizer warnings may occur with multiprocessing
+# Environment setup for clean execution (GenAI-Bench pattern)
+os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader
 
@@ -208,6 +210,10 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
 def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: str,
                              temperature: float, max_tokens: int, n_cores: int, max_asyncio_connections: int = 512) -> Dict:
     """Run benchmark using multiple processes (same format as original)."""
+    
+    # Disable HuggingFace Transformers' tokenizer parallelism in Rust
+    # to prevent conflicts with Python multiprocessing (GenAI-Bench pattern)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     total_requests = len(user_requests)
 
