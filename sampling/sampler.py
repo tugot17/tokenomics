@@ -62,6 +62,19 @@ class TextSampler:
         # Ensure we have a padding token for token counting
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Pre-tokenize all texts and cache token counts for performance
+        import time
+        print(f"Pre-tokenizing {len(dataset_loader)} dataset texts...")
+        start_time = time.time()
+        self.text_token_cache = []
+        all_texts = dataset_loader.get_all_texts()
+        for text in all_texts:
+            token_count = self._count_tokens(text)
+            self.text_token_cache.append((text, token_count))
+        end_time = time.time()
+        total_tokens = sum(count for _, count in self.text_token_cache)
+        print(f"Pre-tokenization complete. Cached {len(self.text_token_cache)} texts with {total_tokens:,} total tokens in {end_time - start_time:.2f}s")
     
     def sample(self, scenario: Scenario) -> UserRequest:
         """
@@ -76,11 +89,8 @@ class TextSampler:
         # Sample target token counts from scenario
         target_input_tokens, target_output_tokens = scenario.sample()
         
-        # Generate prompt with approximately target_input_tokens
-        prompt = self._sample_text(target_input_tokens)
-        
-        # Count actual tokens in the generated prompt
-        actual_input_tokens = self._count_tokens(prompt)
+        # Generate prompt with approximately target_input_tokens (using cached token counts!)
+        prompt, actual_input_tokens = self._sample_text_with_count(target_input_tokens)
         
         # Note: actual_input_tokens may differ from target_input_tokens due to dataset characteristics
         
@@ -92,7 +102,7 @@ class TextSampler:
             target_output_tokens=target_output_tokens
         )
     
-    def _sample_text(self, target_tokens: int) -> str:
+    def _sample_text_with_count(self, target_tokens: int) -> tuple[str, int]:
         """
         Sample text from dataset to approximately match target token count.
         
@@ -100,33 +110,29 @@ class TextSampler:
             target_tokens: Target number of input tokens
             
         Returns:
-            Concatenated text approximately matching target token count
+            Tuple of (concatenated text, actual token count)
         """
-        if len(self.dataset_loader) == 0:
+        if len(self.text_token_cache) == 0:
             raise ValueError("Dataset is empty")
         
-        # For very large token counts, we need a smarter strategy
-        all_texts = self.dataset_loader.get_all_texts()
-        
-        # Start with a random text from the dataset
+        # Start with a random text from the cached dataset
         texts = []
         current_tokens = 0
         cycles = 0
         
         # Keep adding texts until we reach approximately the target
         while current_tokens < target_tokens:
-            # Get a random text sample
-            sample_text = random.choice(all_texts)
-            texts.append(sample_text)
+            # Get a random text sample with its cached token count (FAST!)
+            sample_text, sample_tokens = random.choice(self.text_token_cache)
             
-            # Count tokens in the concatenated text so far
-            combined_text = " ".join(texts)
-            current_tokens = self._count_tokens(combined_text)
+            # Add the sample and its token count (no tokenizer call needed!)
+            texts.append(sample_text)
+            current_tokens += sample_tokens
             
             # Safety check to avoid infinite loops
             # Allow more samples for very large target token counts
             # Calculate based on average tokens per text in the dataset
-            avg_tokens_per_text = target_tokens / len(all_texts) if len(all_texts) > 0 else 100
+            avg_tokens_per_text = target_tokens / len(self.text_token_cache) if len(self.text_token_cache) > 0 else 100
             max_samples = max(100, int(target_tokens / max(10, avg_tokens_per_text * 0.5)))
             
             if len(texts) > max_samples:
@@ -134,13 +140,13 @@ class TextSampler:
                 break
             
             # Track cycles through the dataset
-            if len(texts) % len(all_texts) == 0:
+            if len(texts) % len(self.text_token_cache) == 0:
                 cycles += 1
                 if cycles > 10:  # Prevent excessive cycling
                     warnings.warn(f"Cycled through dataset {cycles} times trying to reach {target_tokens} tokens. Got {current_tokens} tokens.")
                     break
         
-        return " ".join(texts)
+        return " ".join(texts), current_tokens
     
     def _count_tokens(self, text: str) -> int:
         """
