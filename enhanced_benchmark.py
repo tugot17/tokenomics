@@ -16,8 +16,7 @@ import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-# Fix tokenizer parallelism warning
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# Note: tokenizer warnings may occur with multiprocessing
 
 from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader
 
@@ -379,26 +378,9 @@ def main():
     # Initialize tokenizer (default to model name if not specified)
     tokenizer_name = args.tokenizer if args.tokenizer else args.model
     
-    # Pre-generate all requests to avoid tokenizer in worker processes
-    print("🔄 Pre-generating requests for all batch sizes...")
-    all_requests = {}
+    # Create samplers for on-demand generation
     text_sampler = TextSampler(tokenizer_name, dataset_loader)
     batch_sampler = BatchSampler(text_sampler)
-    
-    # Generate all requests upfront
-    for batch_size in batch_sizes:
-        all_requests[batch_size] = []
-        for run_idx in range(args.num_runs):
-            sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
-            user_requests = []
-            for request in sampled_requests:
-                user_requests.append({
-                    "prompt": request.prompt,
-                    "max_tokens": args.max_tokens,
-                    "target_input_tokens": request.target_input_tokens,
-                    "target_output_tokens": request.target_output_tokens
-                })
-            all_requests[batch_size].append(user_requests)
     
     print(f"📊 Initialized benchmark with scenario: {args.scenario}")
     print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
@@ -429,8 +411,22 @@ def main():
         for run_idx in range(args.num_runs):
             print(f"  Run {run_idx + 1}/{args.num_runs}")
             
-            # Use pre-generated requests (avoids tokenizer in worker process)
-            user_requests = all_requests[batch_size][run_idx]
+            # Generate batch of requests using scenario (on-demand)
+            sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
+            user_requests = []
+            for request in sampled_requests:
+                # Use scenario's output tokens unless overridden by --max-tokens
+                max_tokens = args.max_tokens if args.max_tokens is not None else request.target_output_tokens
+                
+                # Ensure max_tokens is reasonable (at least 1, at most 4096)
+                max_tokens = max(1, min(4096, int(max_tokens)))
+                
+                user_requests.append({
+                    "prompt": request.prompt,
+                    "max_tokens": max_tokens,
+                    "target_input_tokens": request.target_input_tokens,
+                    "target_output_tokens": request.target_output_tokens
+                })
             
             # Run the batch (using multiprocessing like original)
             run_data = run_multiprocess_benchmark(
