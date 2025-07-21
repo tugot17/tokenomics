@@ -25,10 +25,12 @@ from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, Dataset
 
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float, max_tokens: int,
-                        semaphore: asyncio.Semaphore, start_time: float) -> Dict:
-    """Make a single API request with timing."""
+                        semaphore: asyncio.Semaphore, start_time: float, tokenizer=None) -> Dict:
+    """Make a single API request with TTFT timing (streaming enabled)."""
     async with semaphore:
         request_start = time.time()
+        time_at_first_token = None
+        generated_text = ""
         
         headers = {
             "Content-Type": "application/json",
@@ -39,7 +41,9 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
             "model": model,
             "messages": [{"role": "user", "content": request_data["prompt"]}],
             "max_tokens": max_tokens,
-            "temperature": temperature
+            "temperature": temperature,
+            "stream": True,  # Enable streaming for TTFT measurement
+            "stream_options": {"include_usage": True}
         }
         
         try:
@@ -49,19 +53,87 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=120)
             ) as response:
-                request_end = time.time()
                 
                 if response.status == 200:
-                    data = await response.json()
-                    usage = data.get("usage", {})
+                    # Process streaming response to capture TTFT and exact usage
+                    api_usage = None
+                    
+                    async for line in response.content:
+                        line_text = line.decode('utf-8').strip()
+                        
+                        if line_text.startswith('data: '):
+                            data_text = line_text[6:]  # Remove 'data: ' prefix
+                            
+                            if data_text == '[DONE]':
+                                break
+                            
+                            try:
+                                chunk_data = json.loads(data_text)
+                                choices = chunk_data.get('choices', [])
+                                
+                                # Extract usage info (GenAI-Bench pattern)
+                                if 'usage' in chunk_data:
+                                    api_usage = chunk_data['usage']
+                                
+                                # Process content from choices
+                                if choices:
+                                    delta = choices[0].get('delta', {})
+                                    content = delta.get('content', '')
+                                    
+                                    if content and time_at_first_token is None:
+                                        time_at_first_token = time.time()
+                                    
+                                    if content:
+                                        generated_text += content
+                                        
+                            except json.JSONDecodeError:
+                                continue  # Skip invalid JSON chunks
+                    
+                    request_end = time.time()
+                    
+                    # Calculate TTFT-based metrics
+                    ttft = time_at_first_token - request_start if time_at_first_token else 0
+                    e2e_latency = request_end - request_start
+                    output_latency = e2e_latency - ttft if ttft > 0 else e2e_latency
+                    
+                    # Get exact token counts from API usage (GenAI-Bench approach)
+                    if api_usage:
+                        input_tokens = api_usage.get("prompt_tokens", 0)
+                        output_tokens = api_usage.get("completion_tokens", 0)
+                    else:
+                        # Fallback: use target for input, tokenize output with actual tokenizer
+                        input_tokens = request_data.get("target_input_tokens", 0)
+                        if tokenizer and generated_text:
+                            try:
+                                output_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
+                            except Exception as e:
+                                output_tokens = int(len(generated_text.split()) * 1.3)
+                                print(f"⚠️  Tokenizer failed ({e}), using word estimation")
+                        else:
+                            output_tokens = int(len(generated_text.split()) * 1.3) if generated_text else 0
+                        print(f"⚠️  No API usage info - using tokenizer fallback for output tokens")
+                    
+                    # Calculate throughput metrics like GenAI-Bench
+                    input_throughput = input_tokens / ttft if ttft > 0 else 0
+                    output_throughput = (output_tokens - 1) / output_latency if output_latency > 0 and output_tokens > 1 else 0
+                    tpot = output_latency / (output_tokens - 1) if output_tokens > 1 else 0
                     
                     return {
-                        "input_tokens": usage.get("prompt_tokens", 0),
-                        "output_tokens": usage.get("completion_tokens", 0),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
                         "start_time": request_start,
                         "end_time": request_end,
+                        "time_at_first_token": time_at_first_token,
                         "relative_start": request_start - start_time,
                         "relative_end": request_end - start_time,
+                        # GenAI-Bench style metrics
+                        "ttft": ttft,
+                        "e2e_latency": e2e_latency,
+                        "output_latency": output_latency,
+                        "tpot": tpot,
+                        "input_throughput": input_throughput,  # tokens/sec for prefill
+                        "output_throughput": output_throughput,  # tokens/sec for decode
+                        "generated_text": generated_text,
                         "success": True
                     }
                 else:
@@ -79,7 +151,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 
 
 async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
-                         temperature: float, max_tokens: int, max_concurrent: int) -> Dict:
+                         temperature: float, max_tokens: int, max_concurrent: int, tokenizer=None) -> Dict:
     """Run batch of requests asynchronously."""
     
     start_time = time.time()
@@ -88,7 +160,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     async with aiohttp.ClientSession() as session:
         tasks = []
         for request_data in user_requests:
-            task = single_request(session, api_base, model, request_data, temperature, max_tokens, semaphore, start_time)
+            task = single_request(session, api_base, model, request_data, temperature, max_tokens, semaphore, start_time, tokenizer)
             tasks.append(task)
         
         results = await asyncio.gather(*tasks)
@@ -96,19 +168,39 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     end_time = time.time()
     batch_total_seconds = end_time - start_time
     
-    # Process results
+    # Process results and track failures
     successful_results = [r for r in results if r.get("success", False)]
+    failed_results = [r for r in results if not r.get("success", False)]
+    
+    total_requests = len(user_requests)
+    success_count = len(successful_results)
+    failure_count = len(failed_results)
+    
+    print(f"    📊 Request Results: {success_count}/{total_requests} successful, {failure_count} failed")
+    
+    if failure_count > 0:
+        # Log some failure reasons
+        error_samples = [r.get("error", "Unknown error") for r in failed_results[:3]]  # Show first 3 errors
+        print(f"    ❌ Sample errors: {error_samples}")
     
     if not successful_results:
         return {
             "tokens": {"input_per_request": [], "output_per_request": []},
             "timings": {"batch_total_seconds": batch_total_seconds, "fastest_seconds": 0, "slowest_seconds": 0, "spread_seconds": 0},
-            "throughput": {"batch_tokens_per_second": 0, "request_tokens_per_second": []}
+            "throughput": {"batch_tokens_per_second": 0, "request_tokens_per_second": []},
+            "ttft_metrics": {"ttft_per_request": [], "input_throughput_per_request": [], "output_throughput_per_request": [], "tpot_per_request": []},
+            "failures": {"total_requests": total_requests, "successful": success_count, "failed": failure_count}
         }
     
-    # Extract metrics
+    # Extract original metrics
     input_tokens = [r["input_tokens"] for r in successful_results]
     output_tokens = [r["output_tokens"] for r in successful_results]
+    
+    # Extract TTFT-based metrics (GenAI-Bench style)
+    ttft_values = [r.get("ttft", 0) for r in successful_results if r.get("ttft", 0) > 0]
+    input_throughput_values = [r.get("input_throughput", 0) for r in successful_results if r.get("input_throughput", 0) > 0]
+    output_throughput_values = [r.get("output_throughput", 0) for r in successful_results if r.get("output_throughput", 0) > 0]
+    tpot_values = [r.get("tpot", 0) for r in successful_results if r.get("tpot", 0) > 0]
     
     # Calculate timing metrics (relative to batch start)
     relative_ends = [r["relative_end"] for r in successful_results]
@@ -120,7 +212,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     total_output_tokens = sum(output_tokens)
     batch_tokens_per_second = total_output_tokens / batch_total_seconds if batch_total_seconds > 0 else 0
     
-    # Calculate per-request tokens per second
+    # Calculate per-request tokens per second (legacy)
     request_tokens_per_second = []
     for r in successful_results:
         request_duration = r["end_time"] - r["start_time"]
@@ -142,15 +234,35 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
         "throughput": {
             "batch_tokens_per_second": batch_tokens_per_second,
             "request_tokens_per_second": request_tokens_per_second
+        },
+        "ttft_metrics": {
+            "ttft_per_request": ttft_values,
+            "input_throughput_per_request": input_throughput_values,  # Prefill throughput
+            "output_throughput_per_request": output_throughput_values,  # Decode throughput  
+            "tpot_per_request": tpot_values
+        },
+        # Request success/failure tracking
+        "failures": {
+            "total_requests": total_requests,
+            "successful": success_count,
+            "failed": failure_count
         }
     }
 
 
 def worker_process(worker_id: int, user_requests: List[Dict], api_base: str, model: str,
-                   temperature: float, max_tokens: int, max_concurrent: int, result_queue: multiprocessing.Queue):
+                   temperature: float, max_tokens: int, max_concurrent: int, result_queue: multiprocessing.Queue, tokenizer_name: str = None):
     """Worker process for multiprocessing."""
     try:
-        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_tokens, max_concurrent))
+        # Load tokenizer in worker process if needed
+        tokenizer = None
+        if tokenizer_name:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_tokens, max_concurrent, tokenizer))
         result_queue.put(result)
     except Exception as e:
         print(f"Worker {worker_id} failed: {e}")
@@ -158,16 +270,27 @@ def worker_process(worker_id: int, user_requests: List[Dict], api_base: str, mod
 
 
 def aggregate_metrics(worker_results: List[Dict]) -> Dict:
-    """Aggregate metrics from multiple workers (same format as original)."""
+    """Aggregate metrics from multiple workers (enhanced with TTFT)."""
     
     # Combine all token lists
     all_input_tokens = []
     all_output_tokens = []
     all_tps = []
     
+    # Combine TTFT metrics
+    all_ttft = []
+    all_input_throughput = []
+    all_output_throughput = []
+    all_tpot = []
+    
     # Track timing info for overall batch timing
     all_fastest = []
     all_slowest = []
+    
+    # Track failure counts
+    total_requests = 0
+    total_successful = 0
+    total_failed = 0
     
     total_output_tokens = 0
     latest_end = 0
@@ -176,6 +299,18 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
         all_input_tokens.extend(metrics["tokens"]["input_per_request"])
         all_output_tokens.extend(metrics["tokens"]["output_per_request"])
         all_tps.extend(metrics["throughput"]["request_tokens_per_second"])
+        
+        # Aggregate TTFT metrics
+        all_ttft.extend(metrics.get("ttft_metrics", {}).get("ttft_per_request", []))
+        all_input_throughput.extend(metrics.get("ttft_metrics", {}).get("input_throughput_per_request", []))
+        all_output_throughput.extend(metrics.get("ttft_metrics", {}).get("output_throughput_per_request", []))
+        all_tpot.extend(metrics.get("ttft_metrics", {}).get("tpot_per_request", []))
+        
+        # Aggregate failure counts
+        failures = metrics.get("failures", {})
+        total_requests += failures.get("total_requests", 0)
+        total_successful += failures.get("successful", 0)
+        total_failed += failures.get("failed", 0)
         
         all_fastest.append(metrics["timings"]["fastest_seconds"])
         all_slowest.append(metrics["timings"]["slowest_seconds"])
@@ -201,6 +336,19 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
         "throughput": {
             "batch_tokens_per_second": total_output_tokens / latest_end if latest_end > 0 else 0,
             "request_tokens_per_second": all_tps
+        },
+        # Aggregated TTFT metrics
+        "ttft_metrics": {
+            "ttft_per_request": all_ttft,
+            "input_throughput_per_request": all_input_throughput,
+            "output_throughput_per_request": all_output_throughput,
+            "tpot_per_request": all_tpot
+        },
+        # Aggregated failure tracking
+        "failures": {
+            "total_requests": total_requests,
+            "successful": total_successful,
+            "failed": total_failed
         }
     }
     
@@ -208,7 +356,7 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
 
 
 def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: str,
-                             temperature: float, max_tokens: int, n_cores: int, max_asyncio_connections: int = 512) -> Dict:
+                             temperature: float, max_tokens: int, n_cores: int, tokenizer_name: str = None, max_asyncio_connections: int = 512) -> Dict:
     """Run benchmark using multiple processes (same format as original)."""
     
     # Disable HuggingFace Transformers' tokenizer parallelism in Rust
@@ -249,7 +397,7 @@ def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: 
     for i, chunk in enumerate(request_chunks):
         p = multiprocessing.Process(
             target=worker_process,
-            args=(i, chunk, api_base, model, temperature, max_tokens, max_concurrent_per_process, result_queue)
+            args=(i, chunk, api_base, model, temperature, max_tokens, max_concurrent_per_process, result_queue, tokenizer_name)
         )
         processes.append(p)
         p.start()
@@ -274,7 +422,7 @@ def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: 
 
 
 def calculate_stats(runs_data: List[Dict]) -> Dict:
-    """Calculate statistics across multiple runs (same format as original)."""
+    """Calculate statistics across multiple runs (enhanced with TTFT metrics)."""
     
     def safe_mean(values):
         return statistics.mean(values) if values else 0
@@ -287,6 +435,12 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     all_output_tokens = []
     all_request_tps = []
     
+    # TTFT metrics (flattened across runs)
+    all_ttft = []
+    all_input_throughput = []
+    all_output_throughput = []
+    all_tpot = []
+    
     # For single-value metrics, collect one value per run
     batch_total_seconds = []
     fastest_seconds = []
@@ -294,16 +448,34 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     spread_seconds = []
     batch_tokens_per_second = []
     
+    # Failure metrics (aggregated across runs)
+    total_requests = 0
+    total_successful = 0
+    total_failed = 0
+    
     for run_data in runs_data:
         all_input_tokens.extend(run_data["tokens"]["input_per_request"])
         all_output_tokens.extend(run_data["tokens"]["output_per_request"])
         all_request_tps.extend(run_data["throughput"]["request_tokens_per_second"])
+        
+        # TTFT metrics
+        ttft_metrics = run_data.get("ttft_metrics", {})
+        all_ttft.extend(ttft_metrics.get("ttft_per_request", []))
+        all_input_throughput.extend(ttft_metrics.get("input_throughput_per_request", []))
+        all_output_throughput.extend(ttft_metrics.get("output_throughput_per_request", []))
+        all_tpot.extend(ttft_metrics.get("tpot_per_request", []))
         
         batch_total_seconds.append(run_data["timings"]["batch_total_seconds"])
         fastest_seconds.append(run_data["timings"]["fastest_seconds"])
         slowest_seconds.append(run_data["timings"]["slowest_seconds"])
         spread_seconds.append(run_data["timings"]["spread_seconds"])
         batch_tokens_per_second.append(run_data["throughput"]["batch_tokens_per_second"])
+        
+        # Aggregate failure metrics
+        failures = run_data.get("failures", {})
+        total_requests += failures.get("total_requests", 0)
+        total_successful += failures.get("successful", 0)
+        total_failed += failures.get("failed", 0)
     
     return {
         "tokens": {
@@ -343,6 +515,33 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
                 "mean": safe_mean(all_request_tps),
                 "std": safe_std(all_request_tps)
             }
+        },
+        # GenAI-Bench style TTFT statistics
+        "ttft_metrics": {
+            "ttft": {
+                "mean": safe_mean(all_ttft),
+                "std": safe_std(all_ttft)
+            },
+            "input_throughput": {
+                "mean": safe_mean(all_input_throughput),
+                "std": safe_std(all_input_throughput)
+            },
+            "output_throughput": {
+                "mean": safe_mean(all_output_throughput),
+                "std": safe_std(all_output_throughput)
+            },
+            "tpot": {
+                "mean": safe_mean(all_tpot),
+                "std": safe_std(all_tpot)
+            }
+        },
+        # Failure/Success metrics
+        "reliability": {
+            "total_requests": total_requests,
+            "successful_requests": total_successful, 
+            "failed_requests": total_failed,
+            "success_rate": (total_successful / total_requests * 100) if total_requests > 0 else 0,
+            "failure_rate": (total_failed / total_requests * 100) if total_requests > 0 else 0
         }
     }
 
@@ -437,20 +636,47 @@ def main():
             # Run the batch (using multiprocessing like original)
             run_data = run_multiprocess_benchmark(
                 user_requests, args.api_base, args.model, args.temperature, 
-                args.max_tokens, multiprocessing.cpu_count()
+                args.max_tokens, multiprocessing.cpu_count(), tokenizer_name
             )
             
             runs_data.append(run_data)
             
-            # Print progress (same format as original)
+            # Print progress with proper TTFT metrics and failure tracking
+            failures = run_data.get("failures", {})
+            total_req = failures.get("total_requests", 0)
+            successful = failures.get("successful", 0)
+            failed = failures.get("failed", 0)
+            
             if run_data["tokens"]["output_per_request"]:
+                total_input_tokens = sum(run_data["tokens"]["input_per_request"])
                 total_output_tokens = sum(run_data["tokens"]["output_per_request"])
                 batch_time = run_data["timings"]["batch_total_seconds"]
-                throughput = run_data["throughput"]["batch_tokens_per_second"]
                 
-                print(f"    ✅ Batch time: {batch_time:.2f}s, Output tokens: {total_output_tokens}, Throughput: {throughput:.1f} tokens/s")
+                # Extract TTFT metrics for reporting
+                ttft_metrics = run_data.get("ttft_metrics", {})
+                ttft_values = ttft_metrics.get("ttft_per_request", [])
+                input_throughput_values = ttft_metrics.get("input_throughput_per_request", [])
+                output_throughput_values = ttft_metrics.get("output_throughput_per_request", [])
+                
+                # Calculate averages per request
+                avg_ttft = statistics.mean(ttft_values) if ttft_values else 0
+                avg_input_throughput = statistics.mean(input_throughput_values) if input_throughput_values else 0
+                avg_output_throughput = statistics.mean(output_throughput_values) if output_throughput_values else 0
+                
+                # Calculate batch-level throughput (different from per-request averages)
+                batch_total_throughput = total_output_tokens / batch_time if batch_time > 0 else 0
+                
+                success_rate = (successful / total_req * 100) if total_req > 0 else 0
+                print(f"    ✅ Batch: {batch_time:.2f}s | Success: {successful}/{total_req} ({success_rate:.1f}%)")
+                if failed > 0:
+                    print(f"       ❌ {failed} requests failed")
+                print(f"       Tokens - Input: {total_input_tokens:,} | Output: {total_output_tokens:,}")
+                print(f"       Batch Throughput: {batch_total_throughput:.1f} tok/s")
+                
+                if avg_ttft > 0:
+                    print(f"       Per-Request Avg - TTFT: {avg_ttft:.3f}s | Prefill: {avg_input_throughput:.1f} tok/s | Decode: {avg_output_throughput:.1f} tok/s")
             else:
-                print(f"    ❌ Run failed")
+                print(f"    ❌ All {total_req} requests failed")
         
         # Calculate statistics for this batch size
         results["results"][str(batch_size)] = calculate_stats(runs_data)
