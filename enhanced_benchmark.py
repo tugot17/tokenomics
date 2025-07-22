@@ -517,7 +517,6 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
         total_successful += failures.get("successful", 0)
         total_failed += failures.get("failed", 0)
     
-    print(f"DEBUG calculate_stats: all_combined_throughput = {all_combined_throughput}")
     
     return {
         "tokens": {
