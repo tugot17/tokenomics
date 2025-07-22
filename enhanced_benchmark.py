@@ -596,6 +596,51 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     }
 
 
+def warmup_server(api_base: str, model: str, temperature: float, tokenizer_name: str, 
+                  text_sampler, batch_sampler, num_warmup_runs: int = 3):
+    """Perform warmup runs to prepare the server before benchmarking."""
+    print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
+    
+    # Create a simple scenario for warmup (small tokens)
+    warmup_scenario = Scenario.from_string("N(100,50)/(50,25)")
+    
+    async def run_warmup():
+        for _ in range(num_warmup_runs):
+            # Generate a single warmup request
+            sampled_requests = batch_sampler.sample_batch(warmup_scenario, 1)
+            warmup_request = sampled_requests[0]
+            
+            # Use scenario's sampled output tokens (consistent with main benchmark)
+            max_tokens = warmup_request.target_output_tokens
+            max_tokens = max(1, min(4096, int(max_tokens)))  # Same bounds as main benchmark
+            
+            warmup_data = {
+                "prompt": warmup_request.prompt,
+                "max_tokens": max_tokens,
+                "target_input_tokens": warmup_request.target_input_tokens,
+                "target_output_tokens": warmup_request.target_output_tokens
+            }
+            
+            # Load tokenizer for warmup
+            tokenizer = None
+            if tokenizer_name:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+            
+            # Run single warmup request (simple, not multiprocessing)
+            async with aiohttp.ClientSession() as session:
+                try:
+                    await single_request(session, api_base, model, warmup_data, temperature, time.time(), tokenizer)
+                except Exception:
+                    pass  # Ignore warmup errors
+    
+    # Run the async warmup in its own event loop
+    asyncio.run(run_warmup())
+    print(" done")
+
+
 def main():
     """Main function to run the enhanced benchmark."""
     parser = argparse.ArgumentParser(description="Enhanced OAI server benchmark with scenario-based sampling")
@@ -613,6 +658,7 @@ def main():
     # Benchmark parameters (same as original)
     parser.add_argument("--batch-sizes", default="1,2,4,8", help="Comma-separated batch sizes")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per batch size")
+    parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each batch size")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
     parser.add_argument("--description", default="Enhanced benchmark", help="Description of the benchmark")
     
@@ -650,6 +696,7 @@ def main():
             "api_base": args.api_base,
             "batch_sizes": batch_sizes,
             "num_runs": args.num_runs,
+            "warmup_runs": args.warmup_runs,
             "temperature": args.temperature,
             "description": args.description
         },
@@ -659,6 +706,9 @@ def main():
     # Run benchmark for each batch size
     for batch_size in batch_sizes:
         print(f"\n🔄 Testing batch size: {batch_size}")
+        
+        warmup_server(args.api_base, args.model, args.temperature, tokenizer_name, 
+                     text_sampler, batch_sampler, args.warmup_runs)
         
         runs_data = []
         for run_idx in range(args.num_runs):
