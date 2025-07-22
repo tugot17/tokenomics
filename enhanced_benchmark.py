@@ -20,13 +20,16 @@ from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, Dataset
 
 
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
-                        request_data: Dict[str, Any], temperature: float, max_tokens: int,
+                        request_data: Dict[str, Any], temperature: float,
                         semaphore: asyncio.Semaphore, start_time: float, tokenizer=None) -> Dict:
     """Make a single API request with TTFT timing (streaming enabled)."""
     async with semaphore:
         request_start = time.time()
         time_at_first_token = None
         generated_text = ""
+        
+        # Extract max_tokens from request_data
+        max_tokens = request_data["max_tokens"]
         
         headers = {
             "Content-Type": "application/json",
@@ -145,7 +148,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 
 
 async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
-                         temperature: float, max_tokens: int, max_concurrent: int, tokenizer=None) -> Dict:
+                         temperature: float, max_concurrent: int, tokenizer=None) -> Dict:
     """Run batch of requests asynchronously."""
     
     start_time = time.time()
@@ -154,7 +157,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     async with aiohttp.ClientSession() as session:
         tasks = []
         for request_data in user_requests:
-            task = single_request(session, api_base, model, request_data, temperature, max_tokens, semaphore, start_time, tokenizer)
+            task = single_request(session, api_base, model, request_data, temperature, semaphore, start_time, tokenizer)
             tasks.append(task)
         
         results = await asyncio.gather(*tasks)
@@ -239,7 +242,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
 
 
 def worker_process(worker_id: int, user_requests: List[Dict], api_base: str, model: str,
-                   temperature: float, max_tokens: int, max_concurrent: int, result_queue: multiprocessing.Queue, tokenizer_name: str = None):
+                   temperature: float, max_concurrent: int, result_queue: multiprocessing.Queue, tokenizer_name: str = None):
     """Worker process for multiprocessing."""
     try:
         # Load tokenizer in worker process if needed
@@ -250,7 +253,7 @@ def worker_process(worker_id: int, user_requests: List[Dict], api_base: str, mod
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token
                 
-        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_tokens, max_concurrent, tokenizer))
+        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_concurrent, tokenizer))
         result_queue.put(result)
     except Exception as e:
         print(f"Worker {worker_id} failed: {e}")
@@ -363,7 +366,7 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
 
 
 def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: str,
-                             temperature: float, max_tokens: int, n_cores: int, tokenizer_name: str = None) -> Dict:
+                             temperature: float, n_cores: int, tokenizer_name: str = None) -> Dict:
     """Run benchmark using multiple processes (same format as original)."""
     
     # Disable HuggingFace Transformers' tokenizer parallelism in Rust
@@ -401,7 +404,7 @@ def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: 
     for i, chunk in enumerate(request_chunks):
         p = multiprocessing.Process(
             target=worker_process,
-            args=(i, chunk, api_base, model, temperature, max_tokens, max_concurrent_per_process, result_queue, tokenizer_name)
+            args=(i, chunk, api_base, model, temperature, max_concurrent_per_process, result_queue, tokenizer_name)
         )
         processes.append(p)
         p.start()
@@ -612,7 +615,6 @@ def main():
     # Benchmark parameters (same as original)
     parser.add_argument("--batch-sizes", default="1,2,4,8", help="Comma-separated batch sizes")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per batch size")
-    parser.add_argument("--max-tokens", type=int, default=100, help="Maximum tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
     parser.add_argument("--description", default="Enhanced benchmark", help="Description of the benchmark")
     
@@ -650,7 +652,6 @@ def main():
             "api_base": args.api_base,
             "batch_sizes": batch_sizes,
             "num_runs": args.num_runs,
-            "max_tokens": args.max_tokens,
             "temperature": args.temperature,
             "description": args.description
         },
@@ -669,8 +670,8 @@ def main():
             sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
             user_requests = []
             for request in sampled_requests:
-                # Use scenario's output tokens unless overridden by --max-tokens
-                max_tokens = args.max_tokens if args.max_tokens is not None else request.target_output_tokens
+                # Use scenario's sampled output tokens
+                max_tokens = request.target_output_tokens
                 
                 # Ensure max_tokens is reasonable (at least 1, at most 4096)
                 max_tokens = max(1, min(4096, int(max_tokens)))
@@ -685,7 +686,7 @@ def main():
             # Run the batch (using multiprocessing like original)
             run_data = run_multiprocess_benchmark(
                 user_requests, args.api_base, args.model, args.temperature, 
-                args.max_tokens, multiprocessing.cpu_count(), tokenizer_name
+                multiprocessing.cpu_count(), tokenizer_name
             )
             
             
