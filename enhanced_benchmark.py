@@ -21,130 +21,129 @@ from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, Dataset
 
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float,
-                        semaphore: asyncio.Semaphore, start_time: float, tokenizer=None) -> Dict:
+                        start_time: float, tokenizer=None) -> Dict:
     """Make a single API request with TTFT timing (streaming enabled)."""
-    async with semaphore:
-        request_start = time.time()
-        time_at_first_token = None
-        generated_text = ""
-        
-        # Extract max_tokens from request_data
-        max_tokens = request_data["max_tokens"]
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer dummy-key"
-        }
-        
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": request_data["prompt"]}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": True,  # Enable streaming for TTFT measurement
-            "stream_options": {"include_usage": True}
-        }
-        
-        try:
-            async with session.post(
-                f"{api_base}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=120)
-            ) as response:
+    request_start = time.time()
+    time_at_first_token = None
+    generated_text = ""
+    
+    # Extract max_tokens from request_data
+    max_tokens = request_data["max_tokens"]
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer dummy-key"
+    }
+    
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": request_data["prompt"]}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,  # Enable streaming for TTFT measurement
+        "stream_options": {"include_usage": True}
+    }
+    
+    try:
+        async with session.post(
+            f"{api_base}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=120)
+        ) as response:
+            
+            if response.status == 200:
+                # Process streaming response to capture TTFT and exact usage
+                api_usage = None
                 
-                if response.status == 200:
-                    # Process streaming response to capture TTFT and exact usage
-                    api_usage = None
+                async for line in response.content:
+                    line_text = line.decode('utf-8').strip()
                     
-                    async for line in response.content:
-                        line_text = line.decode('utf-8').strip()
+                    if line_text.startswith('data: '):
+                        data_text = line_text[6:]  # Remove 'data: ' prefix
                         
-                        if line_text.startswith('data: '):
-                            data_text = line_text[6:]  # Remove 'data: ' prefix
+                        if data_text == '[DONE]':
+                            break
+                        
+                        try:
+                            chunk_data = json.loads(data_text)
+                            choices = chunk_data.get('choices', [])
                             
-                            if data_text == '[DONE]':
-                                break
                             
-                            try:
-                                chunk_data = json.loads(data_text)
-                                choices = chunk_data.get('choices', [])
+                            if 'usage' in chunk_data:
+                                api_usage = chunk_data['usage']
+                            
+                            # Process content from choices
+                            if choices:
+                                delta = choices[0].get('delta', {})
+                                content = delta.get('content', '')
                                 
+                                if content and time_at_first_token is None:
+                                    time_at_first_token = time.time()
                                 
-                                if 'usage' in chunk_data:
-                                    api_usage = chunk_data['usage']
-                                
-                                # Process content from choices
-                                if choices:
-                                    delta = choices[0].get('delta', {})
-                                    content = delta.get('content', '')
+                                if content:
+                                    generated_text += content
                                     
-                                    if content and time_at_first_token is None:
-                                        time_at_first_token = time.time()
-                                    
-                                    if content:
-                                        generated_text += content
-                                        
-                            except json.JSONDecodeError:
-                                continue  # Skip invalid JSON chunks
-                    
-                    request_end = time.time()
-                    
-                    # Calculate TTFT-based metrics
-                    ttft = time_at_first_token - request_start if time_at_first_token else 0
-                    e2e_latency = request_end - request_start
-                    output_latency = e2e_latency - ttft if ttft > 0 else e2e_latency
-                    
-                    # Get exact token counts from API usage
-                    if api_usage:
-                        input_tokens = api_usage.get("prompt_tokens", 0)
-                        output_tokens = api_usage.get("completion_tokens", 0)
-                    else:
-                        # Fallback: use target for input, tokenize output with actual tokenizer
-                        input_tokens = request_data.get("target_input_tokens", 0)
-                        if tokenizer and generated_text:
-                            try:
-                                output_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
-                            except Exception as e:
-                                output_tokens = int(len(generated_text.split()) * 1.3)
-                                print(f"⚠️  Tokenizer failed ({e}), using word estimation")
-                        else:
-                            output_tokens = int(len(generated_text.split()) * 1.3) if generated_text else 0
-                        print(f"⚠️  No API usage info - using tokenizer fallback for output tokens")
-                    
-                    input_throughput = input_tokens / ttft if ttft > 0 else 0
-                    output_throughput = (output_tokens - 1) / output_latency if output_latency > 0 and output_tokens > 1 else 0
-                    tpot = output_latency / (output_tokens - 1) if output_tokens > 1 else 0
-                    
-                    return {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "start_time": request_start,
-                        "end_time": request_end,
-                        "time_at_first_token": time_at_first_token,
-                        "relative_start": request_start - start_time,
-                        "relative_end": request_end - start_time,
-                        "ttft": ttft,
-                        "e2e_latency": e2e_latency,
-                        "output_latency": output_latency,
-                        "tpot": tpot,
-                        "input_throughput": input_throughput,  # tokens/sec for prefill
-                        "output_throughput": output_throughput,  # tokens/sec for decode
-                        "decode_time": output_latency,  # total time spent in decode phase
-                        "success": True
-                    }
+                        except json.JSONDecodeError:
+                            continue  # Skip invalid JSON chunks
+                
+                request_end = time.time()
+                
+                # Calculate TTFT-based metrics
+                ttft = time_at_first_token - request_start if time_at_first_token else 0
+                e2e_latency = request_end - request_start
+                output_latency = e2e_latency - ttft if ttft > 0 else e2e_latency
+                
+                # Get exact token counts from API usage
+                if api_usage:
+                    input_tokens = api_usage.get("prompt_tokens", 0)
+                    output_tokens = api_usage.get("completion_tokens", 0)
                 else:
-                    error_text = await response.text()
-                    return {
-                        "error": f"API error {response.status}: {error_text}",
-                        "success": False
-                    }
-                    
-        except Exception as e:
-            return {
-                "error": str(e),
-                "success": False
-            }
+                    # Fallback: use target for input, tokenize output with actual tokenizer
+                    input_tokens = request_data.get("target_input_tokens", 0)
+                    if tokenizer and generated_text:
+                        try:
+                            output_tokens = len(tokenizer.encode(generated_text, add_special_tokens=False))
+                        except Exception as e:
+                            output_tokens = int(len(generated_text.split()) * 1.3)
+                            print(f"⚠️  Tokenizer failed ({e}), using word estimation")
+                    else:
+                        output_tokens = int(len(generated_text.split()) * 1.3) if generated_text else 0
+                    print(f"⚠️  No API usage info - using tokenizer fallback for output tokens")
+                
+                input_throughput = input_tokens / ttft if ttft > 0 else 0
+                output_throughput = (output_tokens - 1) / output_latency if output_latency > 0 and output_tokens > 1 else 0
+                tpot = output_latency / (output_tokens - 1) if output_tokens > 1 else 0
+                
+                return {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "start_time": request_start,
+                    "end_time": request_end,
+                    "time_at_first_token": time_at_first_token,
+                    "relative_start": request_start - start_time,
+                    "relative_end": request_end - start_time,
+                    "ttft": ttft,
+                    "e2e_latency": e2e_latency,
+                    "output_latency": output_latency,
+                    "tpot": tpot,
+                    "input_throughput": input_throughput,  # tokens/sec for prefill
+                    "output_throughput": output_throughput,  # tokens/sec for decode
+                    "decode_time": output_latency,  # total time spent in decode phase
+                    "success": True
+                }
+            else:
+                error_text = await response.text()
+                return {
+                    "error": f"API error {response.status}: {error_text}",
+                    "success": False
+                }
+                
+    except Exception as e:
+        return {
+            "error": str(e),
+            "success": False
+        }
 
 
 async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
@@ -152,12 +151,11 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     """Run batch of requests asynchronously."""
     
     start_time = time.time()
-    semaphore = asyncio.Semaphore(max_concurrent)
     
     async with aiohttp.ClientSession() as session:
         tasks = []
         for request_data in user_requests:
-            task = single_request(session, api_base, model, request_data, temperature, semaphore, start_time, tokenizer)
+            task = single_request(session, api_base, model, request_data, temperature, start_time, tokenizer)
             tasks.append(task)
         
         results = await asyncio.gather(*tasks)
