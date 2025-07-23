@@ -5,7 +5,7 @@ import numpy as np
 from typing import List, Dict
 from matplotlib.gridspec import GridSpec
 
-def plot_enhanced_benchmark(json_file: str, output_image: str) -> None:
+def plot_advanced_benchmark(json_file: str, output_image: str) -> None:
     """
     Creates a comprehensive visualization of enhanced benchmark data with focus on
     prefill vs decode performance for long context analysis.
@@ -225,10 +225,10 @@ def plot_enhanced_benchmark(json_file: str, output_image: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python plot_enhanced_benchmark.py <json_file> <output_image>")
-        print("Example: python plot_enhanced_benchmark.py test_30k.json benchmark_results.png")
+        print("Usage: python plot_advanced_benchmark.py <json_file> <output_image>")
+        print("Example: python plot_advanced_benchmark.py test_30k.json benchmark_results.png")
         sys.exit(1)
 
     json_file = sys.argv[1]
     output_image = sys.argv[2]
-    plot_enhanced_benchmark(json_file, output_image)
+    plot_advanced_benchmark(json_file, output_image)

@@ -663,7 +663,7 @@ def main():
     parser.add_argument("--description", default="Enhanced benchmark", help="Description of the benchmark")
     
     # Output configuration
-    parser.add_argument("--results-file", default="enhanced_benchmark_results.json", help="Output file for results")
+    parser.add_argument("--results-file", default="completion_advanced_benchmark_results.json", help="Output file for results")
     
     args = parser.parse_args()
     
