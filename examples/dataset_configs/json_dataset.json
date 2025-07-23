@@ -1,0 +1,8 @@
+{
+  "source": {
+    "type": "file",
+    "path": "path/to/your/dataset.json"
+  },
+  "prompt_column": "text",
+  "description": "JSON dataset with prompts in 'text' field"
+}

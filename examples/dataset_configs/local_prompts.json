@@ -1,0 +1,8 @@
+{
+  "source": {
+    "type": "file",
+    "path": "path/to/your/prompts.txt"
+  },
+  "prompt_column": "text",
+  "description": "Your custom dataset description"
+}

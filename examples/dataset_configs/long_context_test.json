@@ -1,0 +1,8 @@
+{
+  "source": {
+    "type": "file",
+    "path": "examples/data/sample_prompts.txt"
+  },
+  "prompt_column": "text",
+  "description": "Dataset for testing long context (30k tokens) with Qwen3-32B-FP8"
+}

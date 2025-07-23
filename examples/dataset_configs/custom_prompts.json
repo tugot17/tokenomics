@@ -1,0 +1,8 @@
+{
+  "source": {
+    "type": "file",
+    "path": "examples/data/sample_prompts.txt"
+  },
+  "prompt_column": "text",
+  "description": "Custom dataset for 30k token testing"
+}
