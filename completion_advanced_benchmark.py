@@ -240,18 +240,11 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
 
 
 def worker_process(worker_id: int, user_requests: List[Dict], api_base: str, model: str,
-                   temperature: float, max_concurrent: int, result_queue: multiprocessing.Queue, tokenizer_name: str = None):
+                   temperature: float, max_concurrent: int, result_queue: multiprocessing.Queue):
     """Worker process for multiprocessing."""
     try:
-        # Load tokenizer in worker process if needed
-        tokenizer = None
-        if tokenizer_name:
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-                
-        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_concurrent, tokenizer))
+        # No tokenizer loading in worker process - rely on API usage info for accurate token counts
+        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_concurrent, tokenizer=None))
         result_queue.put(result)
     except Exception as e:
         print(f"Worker {worker_id} failed: {e}")
@@ -364,7 +357,7 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
 
 
 def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: str,
-                             temperature: float, n_cores: int, tokenizer_name: str = None) -> Dict:
+                             temperature: float, n_cores: int) -> Dict:
     """Run benchmark using multiple processes (same format as original)."""
     
     # Disable HuggingFace Transformers' tokenizer parallelism in Rust
@@ -402,7 +395,7 @@ def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: 
     for i, chunk in enumerate(request_chunks):
         p = multiprocessing.Process(
             target=worker_process,
-            args=(i, chunk, api_base, model, temperature, max_concurrent_per_process, result_queue, tokenizer_name)
+            args=(i, chunk, api_base, model, temperature, max_concurrent_per_process, result_queue)
         )
         processes.append(p)
         p.start()
@@ -596,7 +589,7 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     }
 
 
-def warmup_server(api_base: str, model: str, temperature: float, tokenizer_name: str, 
+def warmup_server(api_base: str, model: str, temperature: float, 
                   text_sampler, batch_sampler, num_warmup_runs: int = 3):
     """Perform warmup runs to prepare the server before benchmarking."""
     print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
@@ -621,13 +614,8 @@ def warmup_server(api_base: str, model: str, temperature: float, tokenizer_name:
                 "target_output_tokens": warmup_request.target_output_tokens
             }
             
-            # Load tokenizer for warmup
-            tokenizer = None
-            if tokenizer_name:
-                from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-                if tokenizer.pad_token is None:
-                    tokenizer.pad_token = tokenizer.eos_token
+            # Use tokenizer from text_sampler (already loaded)
+            tokenizer = text_sampler.tokenizer
             
             # Run single warmup request (simple, not multiprocessing)
             async with aiohttp.ClientSession() as session:
@@ -707,7 +695,7 @@ def main():
     for batch_size in batch_sizes:
         print(f"\n🔄 Testing batch size: {batch_size}")
         
-        warmup_server(args.api_base, args.model, args.temperature, tokenizer_name, 
+        warmup_server(args.api_base, args.model, args.temperature, 
                      text_sampler, batch_sampler, args.warmup_runs)
         
         runs_data = []
@@ -734,7 +722,7 @@ def main():
             # Run the batch (using multiprocessing like original)
             run_data = run_multiprocess_benchmark(
                 user_requests, args.api_base, args.model, args.temperature, 
-                multiprocessing.cpu_count(), tokenizer_name
+                multiprocessing.cpu_count()
             )
             
             
