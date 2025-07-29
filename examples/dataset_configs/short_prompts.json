@@ -1,0 +1,8 @@
+{
+  "source": {
+    "type": "file",
+    "path": "examples/data/short_prompts.txt"
+  },
+  "prompt_column": "text",
+  "description": "Very short prompts (1-5 tokens each) for small token count scenarios"
+}

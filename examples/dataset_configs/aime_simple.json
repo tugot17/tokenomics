@@ -1,0 +1,7 @@
+{
+  "source": {
+    "type": "aime"
+  },
+  "prompt_column": "Question",
+  "description": "Simple AIME dataset configuration using existing dataset loader"
+}

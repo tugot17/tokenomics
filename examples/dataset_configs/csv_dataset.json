@@ -1,0 +1,8 @@
+{
+  "source": {
+    "type": "file",
+    "path": "path/to/your/dataset.csv"
+  },
+  "prompt_column": "prompt",
+  "description": "CSV dataset with prompts in 'prompt' column"
+}

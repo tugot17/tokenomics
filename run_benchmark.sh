@@ -1,1 +1,11 @@
-uv run python oai_server_benchmark.py --api_base http://localhost:8000  --model qwen-235b-a22b --dataset_key aime --batch_sizes 1,2,4,8,16,32 --description "qwen-235b-a22b running on 8xA100" --results_file qwen-235b-a22b_8x_a100.json --max_tokens 3000 --num_runs 3 --api_key "TOKEN-HERE"
+  python completion_advanced_benchmark.py \
+      --model Qwen3-4B \
+      --scenario "N(100,50)/(50,0)" \
+      --dataset-config examples/dataset_configs/aime_simple.json \
+      --api-base http://localhost:8000/v1 \
+      --batch-sizes 1,2,4 \
+      --num-runs 3 \
+      --temperature 0.7 \
+      --tokenizer Qwen/Qwen3-4B \
+      --description "Test 30k tokens with scenario output sampling" \
+      --results-file test_30k.json

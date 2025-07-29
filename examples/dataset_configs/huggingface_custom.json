@@ -1,0 +1,12 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "your/dataset/name",
+    "huggingface_kwargs": {
+      "split": "train",
+      "streaming": false
+    }
+  },
+  "prompt_column": "text",
+  "description": "HuggingFace dataset with custom configuration"
+}

@@ -51,7 +51,7 @@ python test_server.py --port 8000 --workers 4 --timeout 5.0
 
 ```bash
 # Test with benchmark script
-python ../oai_server_benchmark.py --model test-model --api_base http://127.0.0.1:8000/v1
+python ../completion_simple_benchmark.py --model test-model --api_base http://127.0.0.1:8000/v1
 
 # View documentation
 curl http://127.0.0.1:8000/docs
