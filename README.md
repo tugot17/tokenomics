@@ -396,20 +396,9 @@ uv pip install "sglang[all]" --find-links https://flashinfer.ai/whl/cu124/torch2
 ## ⚠️ Limitations
 
 ### Simple Completion Benchmark Limitations
-- **Homogeneous batches**: Similar prompt lengths; doesn't simulate mixed pre-fill/decoding scenarios well
-- **Fixed batch processing**: Sends fixed batches without continuous request flow, unlike real server behavior
-- **Limited prompt diversity**: Uses built-in datasets with similar characteristics
-- **Token length mismatches**: Batch elements ending at different times can skew performance metrics
+- This setup only works well simulating short prefill workloads. In AIME, each request is <200 tokens, so usually the majority of the time is spent in decoding anyway. This means that we combine the end-to-end time, effectively assuming prefill is "instant." While it is an ok heuristic to measure the decode speed at short prompt lengths, you need to be aware of the limitations.
+- All of the requests are sent concurrently, and they have similar short context prompts. This is very unlikely to be the case in a real-world setup, and especially in the chat applications. 
+
 
 ### Advanced Completion Benchmark Improvements
-The advanced completion benchmark addresses several simple benchmark limitations:
-- ✅ **Flexible prompt distributions**: Configurable token length distributions (Normal, Uniform, Deterministic)
-- ✅ **Diverse datasets**: Support for any HuggingFace dataset, local files, and custom data sources
-- ✅ **Multimodal scenarios**: Supports vision-language tasks beyond text-only benchmarks
-- ✅ **Research scenarios**: Specialized traffic patterns for embeddings, reranking, and complex workflows
-
-### Shared Limitations (Both Tools)
-- **Continuous traffic simulation**: Neither tool simulates realistic continuous request patterns with overlapping batches
-- **Memory bandwidth impact**: Don't account for memory contention from concurrent requests in production
-- **Engine-specific optimizations**: May not reflect performance gains from engine-specific batching strategies
-- **Real-world request patterns**: Simplified compared to actual production traffic with varying priorities and timeouts
+- Since the benchmark is streaming-based on different requests, there is no reliable way to say which requests run concurrently. We measure the throughput per request, and to estimate the combined throughput, we simply add all the throughputs from all the requests. However, it only works if decode is substantially longer than prefill. Otherwise we might find ourselves in a situation where some requests are in the prefill phase, some are in the decode phase, the decode phase ends, and the other requests are moved from prefill and put into decode, so effectively the decode phase is happening with a smaller batch size than we expect. This problem is espe
