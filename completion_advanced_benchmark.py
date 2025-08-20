@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Optional
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader
+from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
 
 
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
@@ -642,6 +642,7 @@ def main():
     parser.add_argument("--scenario", required=True, help="Scenario string (e.g., 'N(480,240)/(300,150)', 'D(100,100)')")
     parser.add_argument("--dataset-config", required=True, help="Path to dataset configuration JSON")
     parser.add_argument("--tokenizer", help="Tokenizer name (defaults to model name)")
+    parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic sampling")
     
     # Benchmark parameters (same as original)
     parser.add_argument("--batch-sizes", default="1,2,4,8", help="Comma-separated batch sizes")
@@ -686,7 +687,8 @@ def main():
             "num_runs": args.num_runs,
             "warmup_runs": args.warmup_runs,
             "temperature": args.temperature,
-            "description": args.description
+            "description": args.description,
+            "seed": args.seed,
         },
         "results": {}
     }
@@ -695,15 +697,19 @@ def main():
     for batch_size in batch_sizes:
         print(f"\n🔄 Testing batch size: {batch_size}")
         
-        warmup_server(args.api_base, args.model, args.temperature, 
-                     text_sampler, batch_sampler, args.warmup_runs)
+        warmup_seed = derive_seed(args.seed, batch_size, -1)
+        with use_seed(warmup_seed):
+            warmup_server(args.api_base, args.model, args.temperature, 
+                         text_sampler, batch_sampler, args.warmup_runs)
         
         runs_data = []
         for run_idx in range(args.num_runs):
             print(f"  Run {run_idx + 1}/{args.num_runs}")
             
             # Generate batch of requests using scenario (on-demand)
-            sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
+            run_seed = derive_seed(args.seed, batch_size, run_idx)
+            with use_seed(run_seed):
+                sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
             user_requests = []
             for request in sampled_requests:
                 # Use scenario's sampled output tokens

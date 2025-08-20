@@ -9,6 +9,7 @@ import os
 from datetime import datetime
 from datasets import load_dataset
 from typing import List, Dict, Any, Tuple
+from sampling import derive_seed
 
 class DatasetHandler:
     @staticmethod
@@ -396,8 +397,9 @@ async def main():
         print(f"\n=== Benchmarking Batch Size: {batch_size} ===")
         
         print(f"Performing {args.warmup_runs} warmup runs...", end="", flush=True)
+        warmup_seed = derive_seed(args.seed, batch_size, -1)
         for _ in range(args.warmup_runs):
-            conversations = create_sample_conversations(args.dataset_key, num_samples=1, seed=args.seed)
+            conversations = create_sample_conversations(args.dataset_key, num_samples=1, seed=warmup_seed)
             # Simple warmup with single process
             benchmark = AsyncBenchmark(args.api_base, args.model, max_concurrent=1)
             async with benchmark.create_session() as session:
@@ -413,7 +415,8 @@ async def main():
 
         for run in range(1, args.num_runs + 1):
             print(f" Run {run}/{args.num_runs} ... ", end="", flush=True)
-            conversations = create_sample_conversations(args.dataset_key, num_samples=batch_size, seed=args.seed)
+            run_seed = derive_seed(args.seed, batch_size, run - 1)
+            conversations = create_sample_conversations(args.dataset_key, num_samples=batch_size, seed=run_seed)
             
             metrics = run_multiprocess_benchmark(
                 conversations, 
