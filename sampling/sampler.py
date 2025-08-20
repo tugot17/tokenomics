@@ -7,6 +7,10 @@ realistic requests with controlled token distributions.
 
 import random
 import warnings
+import hashlib
+import contextlib
+import random
+import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from transformers import AutoTokenizer
 
@@ -226,3 +230,22 @@ class BatchSampler:
                     break
         
         return requests
+    
+    
+@contextlib.contextmanager
+def use_seed(seed: int):
+    state = random.getstate()
+    np_state = np.random.get_state()
+    random.seed(seed)
+    # NumPy's RandomState requires a 32-bit unsigned seed
+    np.random.seed(int(seed % (2**32)))
+    try:
+        yield
+    finally:
+        random.setstate(state)
+        np.random.set_state(np_state)
+
+
+def derive_seed(base_seed: int, batch_size: int, run_idx: int) -> int:
+    s = f"{base_seed}|{batch_size}|{run_idx}".encode()
+    return int.from_bytes(hashlib.sha256(s).digest()[:8], "big")
