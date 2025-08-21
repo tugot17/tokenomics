@@ -132,16 +132,15 @@ The result is a `.json` file looks something like this:
 }
 ```
 
-Post generation use the following line to plot the throghput:
-
+Post generation use the following line to plot the throghput The plot can take as many input files as wanted and optionally a title. At least one input file and the output file are required.
 ```bash
-uv run plot_throughput.py <PATH-TO-JSON-OUTPUT> <PATH-TO-IMAGE-WITH-VISUALIZATION>
+uv run python plot_throughput.py --title "My Custom Title" <PATH-TO-JSON-OUTPUT-0> <PATH-TO-JSON-OUTPUT-1> <PATH-TO-JSON-OUTPUT-2> <PATH-TO-IMAGE-WITH-VISUALIZATION>
 ```
 
 E.g.
 
 ```bash
-uv run plot_throughput.py my_server_benchmark.json my_output.png
+uv run python plot_throughput.py --title "My Custom Title" my_server_benchmark_model0.json my_server_benchmark_model1.json my_output.png
 ```
 
 ![alt text](assets/example_visualization.png)
