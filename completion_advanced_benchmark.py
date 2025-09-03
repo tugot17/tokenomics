@@ -76,13 +76,13 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                             # Process content from choices
                             if choices:
                                 delta = choices[0].get('delta', {})
-                                content = delta.get('content', '')
+                                text = ''.join(x for x in (delta.get('reasoning_content'), delta.get('content')) if x)
                                 
-                                if content and time_at_first_token is None:
+                                if text.strip() and time_at_first_token is None:
                                     time_at_first_token = time.time()
-                                
-                                if content:
-                                    generated_text += content
+                                                                
+                                if text:
+                                    generated_text += text
                                     
                         except json.JSONDecodeError:
                             continue  # Skip invalid JSON chunks
@@ -97,7 +97,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 # Get exact token counts from API usage
                 if api_usage:
                     input_tokens = api_usage.get("prompt_tokens", 0)
-                    output_tokens = api_usage.get("completion_tokens", 0)
+                    output_tokens = api_usage.get("reasoning_tokens", 0) + api_usage.get("completion_tokens", 0)
                 else:
                     # Fallback: use target for input, tokenize output with actual tokenizer
                     input_tokens = request_data.get("target_input_tokens", 0)
