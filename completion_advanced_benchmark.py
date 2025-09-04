@@ -21,7 +21,7 @@ from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, Dataset
 
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float,
-                        start_time: float, tokenizer=None) -> Dict:
+                        timeout: int, start_time: float, tokenizer=None) -> Dict:
     """Make a single API request with TTFT timing (streaming enabled)."""
     request_start = time.time()
     time_at_first_token = None
@@ -49,7 +49,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
             f"{api_base}/chat/completions",
             headers=headers,
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=120)
+            timeout=aiohttp.ClientTimeout(total=timeout)
         ) as response:
             
             if response.status == 200:
@@ -146,8 +146,8 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
         }
 
 
-async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
-                         temperature: float, max_concurrent: int, tokenizer=None) -> Dict:
+async def run_batch_async(user_requests: List[Dict], api_base: str, model: str, temperature: float,
+                          timeout: int, max_concurrent: int,tokenizer=None) -> Dict:
     """Run batch of requests asynchronously."""
     
     start_time = time.time()
@@ -155,7 +155,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     async with aiohttp.ClientSession() as session:
         tasks = []
         for request_data in user_requests:
-            task = single_request(session, api_base, model, request_data, temperature, start_time, tokenizer)
+            task = single_request(session, api_base, model, request_data, temperature, timeout, start_time, tokenizer)
             tasks.append(task)
         
         results = await asyncio.gather(*tasks)
@@ -240,11 +240,11 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
 
 
 def worker_process(worker_id: int, user_requests: List[Dict], api_base: str, model: str,
-                   temperature: float, max_concurrent: int, result_queue: multiprocessing.Queue):
+                   temperature: float, timeout: int, max_concurrent: int, result_queue: multiprocessing.Queue):
     """Worker process for multiprocessing."""
     try:
         # No tokenizer loading in worker process - rely on API usage info for accurate token counts
-        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, max_concurrent, tokenizer=None))
+        result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, timeout, max_concurrent, tokenizer=None))
         result_queue.put(result)
     except Exception as e:
         print(f"Worker {worker_id} failed: {e}")
@@ -357,7 +357,7 @@ def aggregate_metrics(worker_results: List[Dict]) -> Dict:
 
 
 def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: str,
-                             temperature: float, n_cores: int) -> Dict:
+                             temperature: float, timeout: int, n_cores: int) -> Dict:
     """Run benchmark using multiple processes (same format as original)."""
     
     # Disable HuggingFace Transformers' tokenizer parallelism in Rust
@@ -395,15 +395,18 @@ def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: 
     for i, chunk in enumerate(request_chunks):
         p = multiprocessing.Process(
             target=worker_process,
-            args=(i, chunk, api_base, model, temperature, max_concurrent_per_process, result_queue)
+            args=(i, chunk, api_base, model, temperature, timeout, max_concurrent_per_process, result_queue)
         )
         processes.append(p)
         p.start()
     
+    # Unified multiprocessing wait budget for queue retrieval and process joins
+    mp_wait_timeout = 600 + timeout*4
+
     worker_results = []
     for _ in range(actual_cores):
         try:
-            result = result_queue.get(timeout=1800)  # 30 minute timeout per process
+            result = result_queue.get(timeout=mp_wait_timeout)
             if result is not None:
                 worker_results.append(result)
         except:
@@ -411,7 +414,11 @@ def run_multiprocess_benchmark(user_requests: List[Dict], api_base: str, model: 
     
     # Wait for all processes to complete
     for p in processes:
-        p.join()
+        p.join(timeout=mp_wait_timeout)
+        if p.is_alive():
+            print(f"Warning: Process {p.pid} didn't finish in time, terminating")
+            p.terminate()
+            p.join(5)
     
     if not worker_results:
         raise RuntimeError("No worker processes completed successfully")
@@ -589,7 +596,7 @@ def calculate_stats(runs_data: List[Dict]) -> Dict:
     }
 
 
-def warmup_server(api_base: str, model: str, temperature: float, 
+def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
                   text_sampler, batch_sampler, num_warmup_runs: int = 3):
     """Perform warmup runs to prepare the server before benchmarking."""
     print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
@@ -620,7 +627,7 @@ def warmup_server(api_base: str, model: str, temperature: float,
             # Run single warmup request (simple, not multiprocessing)
             async with aiohttp.ClientSession() as session:
                 try:
-                    await single_request(session, api_base, model, warmup_data, temperature, time.time(), tokenizer)
+                    await single_request(session, api_base, model, warmup_data, temperature, timeout, time.time(), tokenizer)
                 except Exception:
                     pass  # Ignore warmup errors
     
@@ -643,6 +650,7 @@ def main():
     parser.add_argument("--dataset-config", required=True, help="Path to dataset configuration JSON")
     parser.add_argument("--tokenizer", help="Tokenizer name (defaults to model name)")
     parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic sampling")
+    parser.add_argument("--timeout", type=int, default=3000, help="Timeout in seconds per request.")
     
     # Benchmark parameters (same as original)
     parser.add_argument("--batch-sizes", default="1,2,4,8", help="Comma-separated batch sizes")
@@ -699,7 +707,7 @@ def main():
         
         warmup_seed = derive_seed(args.seed, batch_size, -1)
         with use_seed(warmup_seed):
-            warmup_server(args.api_base, args.model, args.temperature, 
+            warmup_server(args.api_base, args.model, args.temperature, args.timeout,
                          text_sampler, batch_sampler, args.warmup_runs)
         
         runs_data = []
@@ -727,7 +735,7 @@ def main():
             
             # Run the batch (using multiprocessing like original)
             run_data = run_multiprocess_benchmark(
-                user_requests, args.api_base, args.model, args.temperature, 
+                user_requests, args.api_base, args.model, args.temperature, args.timeout,
                 multiprocessing.cpu_count()
             )
             
