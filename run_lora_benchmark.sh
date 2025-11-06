@@ -33,7 +33,8 @@ python completion_advanced_benchmark.py \
     --batch-sizes "$BATCH_SIZES" \
     --num-runs "$NUM_RUNS" \
     --tokenizer "$TOKENIZER" \
-    --lora-config "lora_configs/uniform_4.json" \
+    --lora-strategy uniform \
+    --lora-names lora_finance,lora_medical,lora_legal,lora_coding \
     --description "Uniform: 4 LoRAs" \
     --results-file "$RESULTS_DIR/uniform_4.json"
 
@@ -47,7 +48,8 @@ python completion_advanced_benchmark.py \
     --batch-sizes "$BATCH_SIZES" \
     --num-runs "$NUM_RUNS" \
     --tokenizer "$TOKENIZER" \
-    --lora-config "lora_configs/all_unique_8.json" \
+    --lora-strategy all-unique \
+    --lora-names lora_finance,lora_medical,lora_legal,lora_coding,lora_creative,lora_technical,lora_customer,lora_research \
     --description "Stress test: 8 unique LoRAs" \
     --results-file "$RESULTS_DIR/all_unique_8.json"
 

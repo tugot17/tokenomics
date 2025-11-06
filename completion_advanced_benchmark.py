@@ -43,17 +43,6 @@ class LoRAConfig:
         self.base_model_ratio = base_model_ratio
         self.zipf_alpha = zipf_alpha
 
-    @classmethod
-    def from_file(cls, file_path: str) -> 'LoRAConfig':
-        """Load LoRA config from JSON file."""
-        with open(file_path, 'r') as f:
-            config = json.load(f)
-        return cls(
-            strategy=config['strategy'],
-            lora_names=config['lora_names'],
-            base_model_ratio=config.get('base_model_ratio', 0.0),
-            zipf_alpha=config.get('zipf_alpha', 1.0)
-        )
 
     def _apply_base_model_ratio(self, lora_choices: List[Optional[str]]) -> List[Optional[str]]:
         """Apply base_model_ratio to replace some LoRA assignments with None (base model)."""
@@ -760,19 +749,28 @@ def main():
     # Output configuration
     parser.add_argument("--results-file", default="completion_advanced_benchmark_results.json", help="Output file for results")
 
-    # LoRA configuration
-    parser.add_argument("--lora-config", help="Path to LoRA configuration JSON (optional)")
+    # LoRA configuration (direct parameters)
+    parser.add_argument("--lora-strategy", help="LoRA distribution strategy (single, uniform, zipf, mixed, all-unique)")
+    parser.add_argument("--lora-names", help="Comma-separated LoRA adapter names")
+    parser.add_argument("--base-model-ratio", type=float, default=0.0, help="Fraction of requests using base model without LoRA (0.0-1.0)")
+    parser.add_argument("--zipf-alpha", type=float, default=1.0, help="Zipf distribution alpha parameter (default: 1.0)")
 
     args = parser.parse_args()
-    
+
     # Parse batch sizes
     batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",")]
 
-    # Load LoRA config if provided
+    # Create LoRA config from command-line arguments
     lora_config = None
-    if args.lora_config:
-        lora_config = LoRAConfig.from_file(args.lora_config)
-        print(f"🔧 Loaded LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs")
+    if args.lora_strategy and args.lora_names:
+        lora_names_list = [name.strip() for name in args.lora_names.split(",")]
+        lora_config = LoRAConfig(
+            strategy=args.lora_strategy,
+            lora_names=lora_names_list,
+            base_model_ratio=args.base_model_ratio,
+            zipf_alpha=args.zipf_alpha
+        )
+        print(f"🔧 LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs, base_model_ratio={lora_config.base_model_ratio}")
 
     # Initialize scenario and dataset
     scenario = Scenario.from_string(args.scenario)
