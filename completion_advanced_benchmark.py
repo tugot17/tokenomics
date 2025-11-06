@@ -10,6 +10,8 @@ import statistics
 import json
 import multiprocessing
 import os
+import random
+import numpy as np
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -19,6 +21,70 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
 
 
+class LoRAConfig:
+    """Configuration for LoRA distribution in benchmark."""
+
+    VALID_STRATEGIES = {"single", "uniform", "zipf", "mixed", "all-unique"}
+
+    def __init__(self, strategy: str, lora_names: List[str],
+                 base_model_ratio: float = 0.0, zipf_alpha: float = 1.0):
+        # Validation
+        if not lora_names:
+            raise ValueError("lora_names cannot be empty")
+        if not 0.0 <= base_model_ratio <= 1.0:
+            raise ValueError(f"base_model_ratio must be between 0 and 1, got {base_model_ratio}")
+        if strategy not in self.VALID_STRATEGIES:
+            raise ValueError(f"Unknown strategy '{strategy}'. Valid strategies: {self.VALID_STRATEGIES}")
+        if zipf_alpha <= 0:
+            raise ValueError(f"zipf_alpha must be positive, got {zipf_alpha}")
+
+        self.strategy = strategy
+        self.lora_names = lora_names
+        self.base_model_ratio = base_model_ratio
+        self.zipf_alpha = zipf_alpha
+
+
+    def _apply_base_model_ratio(self, lora_choices: List[Optional[str]]) -> List[Optional[str]]:
+        """Apply base_model_ratio to replace some LoRA assignments with None (base model)."""
+        if self.base_model_ratio == 0.0:
+            return lora_choices
+
+        return [None if random.random() < self.base_model_ratio else lora
+                for lora in lora_choices]
+
+    def _get_lora_assignments(self, batch_size: int) -> List[str]:
+        """Get raw LoRA assignments based on strategy (before applying base_model_ratio)."""
+        if self.strategy == "single":
+            # All requests use the same LoRA
+            return [self.lora_names[0]] * batch_size
+
+        elif self.strategy == "uniform":
+            # Uniformly distribute across all LoRAs (round-robin)
+            return [self.lora_names[i % len(self.lora_names)] for i in range(batch_size)]
+
+        elif self.strategy == "zipf":
+            # Zipf distribution (power law) - some LoRAs more popular
+            zipf_samples = np.random.zipf(self.zipf_alpha, batch_size)
+            return [self.lora_names[(sample - 1) % len(self.lora_names)] for sample in zipf_samples]
+
+        elif self.strategy == "mixed":
+            # Random mix
+            return [random.choice(self.lora_names) for _ in range(batch_size)]
+
+        elif self.strategy == "all-unique":
+            # Each request gets a unique LoRA (cycles if batch > num loras)
+            return [self.lora_names[i % len(self.lora_names)] for i in range(batch_size)]
+
+        else:
+            # This should never happen due to validation in __init__
+            raise ValueError(f"Unknown LoRA strategy: {self.strategy}")
+
+    def assign_lora(self, batch_size: int) -> List[Optional[str]]:
+        """Assign LoRA names to a batch of requests based on strategy."""
+        raw_assignments = self._get_lora_assignments(batch_size)
+        return self._apply_base_model_ratio(raw_assignments)
+
+
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float,
                         timeout: int, start_time: float, tokenizer=None) -> Dict:
@@ -26,17 +92,24 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
     request_start = time.time()
     time_at_first_token = None
     generated_text = ""
-    
-    # Extract max_tokens from request_data
+
+    # Extract max_tokens and optional LoRA name from request_data
     max_tokens = request_data["max_tokens"]
-    
+    lora_name = request_data.get("lora_name")
+
+    # Build model string with LoRA if specified
+    if lora_name:
+        model_with_lora = f"{model}:{lora_name}"
+    else:
+        model_with_lora = model
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer dummy-key"
     }
-    
+
     payload = {
-        "model": model,
+        "model": model_with_lora,
         "messages": [{"role": "user", "content": request_data["prompt"]}],
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -130,6 +203,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                     "input_throughput": input_throughput,  # tokens/sec for prefill
                     "output_throughput": output_throughput,  # tokens/sec for decode
                     "decode_time": output_latency,  # total time spent in decode phase
+                    "lora_name": lora_name,  # Track which LoRA was used
                     "success": True
                 }
             else:
@@ -186,21 +260,26 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str, 
     # Extract original metrics
     input_tokens = [r["input_tokens"] for r in successful_results]
     output_tokens = [r["output_tokens"] for r in successful_results]
-    
-    # Extract TTFT-based metrics 
+
+    # Extract TTFT-based metrics
     ttft_values = [r.get("ttft", 0) for r in successful_results if r.get("ttft", 0) > 0]
     input_throughput_values = [r.get("input_throughput", 0) for r in successful_results if r.get("input_throughput", 0) > 0]
     output_throughput_values = [r.get("output_throughput", 0) for r in successful_results if r.get("output_throughput", 0) > 0]
     tpot_values = [r.get("tpot", 0) for r in successful_results if r.get("tpot", 0) > 0]
     decode_time_values = [r.get("decode_time", 0) for r in successful_results if r.get("decode_time", 0) > 0]
-    
+
+    # Extract LoRA metrics
+    lora_names = [r.get("lora_name") for r in successful_results]
+    unique_loras = set(lora_names) - {None}
+    base_model_count = lora_names.count(None)
+
     # Calculate timing metrics (relative to batch start)
     relative_ends = [r["relative_end"] for r in successful_results]
     fastest_seconds = min(relative_ends)
     slowest_seconds = max(relative_ends)
     spread_seconds = slowest_seconds - fastest_seconds
-    
-    
+
+
     return {
         "tokens": {
             "input_per_request": input_tokens,
@@ -235,6 +314,14 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str, 
             "total_requests": total_requests,
             "successful": success_count,
             "failed": failure_count
+        },
+        # LoRA-specific metrics
+        "lora_metrics": {
+            "lora_names_per_request": lora_names,
+            "unique_loras_count": len(unique_loras),
+            "unique_loras": list(unique_loras),
+            "base_model_count": base_model_count,
+            "base_model_percentage": (base_model_count / len(successful_results) * 100) if successful_results else 0
         }
     }
 
@@ -661,26 +748,46 @@ def main():
     
     # Output configuration
     parser.add_argument("--results-file", default="completion_advanced_benchmark_results.json", help="Output file for results")
-    
+
+    # LoRA configuration (direct parameters)
+    parser.add_argument("--lora-strategy", help="LoRA distribution strategy (single, uniform, zipf, mixed, all-unique)")
+    parser.add_argument("--lora-names", help="Comma-separated LoRA adapter names")
+    parser.add_argument("--base-model-ratio", type=float, default=0.0, help="Fraction of requests using base model without LoRA (0.0-1.0)")
+    parser.add_argument("--zipf-alpha", type=float, default=1.0, help="Zipf distribution alpha parameter (default: 1.0)")
+
     args = parser.parse_args()
-    
+
     # Parse batch sizes
     batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",")]
-    
+
+    # Create LoRA config from command-line arguments
+    lora_config = None
+    if args.lora_strategy and args.lora_names:
+        lora_names_list = [name.strip() for name in args.lora_names.split(",")]
+        lora_config = LoRAConfig(
+            strategy=args.lora_strategy,
+            lora_names=lora_names_list,
+            base_model_ratio=args.base_model_ratio,
+            zipf_alpha=args.zipf_alpha
+        )
+        print(f"🔧 LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs, base_model_ratio={lora_config.base_model_ratio}")
+
     # Initialize scenario and dataset
     scenario = Scenario.from_string(args.scenario)
     dataset_config = DatasetConfig.from_file(args.dataset_config)
     dataset_loader = DatasetLoader(dataset_config)
-    
+
     # Initialize tokenizer (default to model name if not specified)
     tokenizer_name = args.tokenizer if args.tokenizer else args.model
-    
+
     # Create samplers for on-demand generation
     text_sampler = TextSampler(tokenizer_name, dataset_loader)
     batch_sampler = BatchSampler(text_sampler)
-    
+
     print(f"📊 Initialized benchmark with scenario: {args.scenario}")
     print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
+    if lora_config:
+        print(f"🎯 LoRA strategy: {lora_config.strategy} with {len(lora_config.lora_names)} adapters")
     print(f"🚀 Starting enhanced benchmark: {args.description}")
     
     # Create results structure (same format as original)
@@ -697,6 +804,11 @@ def main():
             "temperature": args.temperature,
             "description": args.description,
             "seed": args.seed,
+            "lora_config": {
+                "strategy": lora_config.strategy if lora_config else None,
+                "lora_names": lora_config.lora_names if lora_config else [],
+                "base_model_ratio": lora_config.base_model_ratio if lora_config else 0.0
+            } if lora_config else None
         },
         "results": {}
     }
@@ -718,20 +830,32 @@ def main():
             run_seed = derive_seed(args.seed, batch_size, run_idx)
             with use_seed(run_seed):
                 sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
+
+            # Assign LoRAs if config is provided
+            lora_assignments = None
+            if lora_config:
+                lora_assignments = lora_config.assign_lora(batch_size)
+
             user_requests = []
-            for request in sampled_requests:
+            for idx, request in enumerate(sampled_requests):
                 # Use scenario's sampled output tokens
                 max_tokens = request.target_output_tokens
-                
+
                 # Ensure max_tokens is reasonable (at least 1, at most 4096)
                 max_tokens = max(1, min(4096, int(max_tokens)))
-                
-                user_requests.append({
+
+                request_dict = {
                     "prompt": request.prompt,
                     "max_tokens": max_tokens,
                     "target_input_tokens": request.target_input_tokens,
                     "target_output_tokens": request.target_output_tokens
-                })
+                }
+
+                # Add LoRA assignment if available
+                if lora_assignments:
+                    request_dict["lora_name"] = lora_assignments[idx]
+
+                user_requests.append(request_dict)
             
             # Run the batch (using multiprocessing like original)
             run_data = run_multiprocess_benchmark(

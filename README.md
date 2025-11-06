@@ -146,7 +146,7 @@ uv run plot_throughput.py my_server_benchmark.json my_output.png
 
 ![alt text](assets/example_visualization.png)
 
-### 🔬 Advanced Completion Benchmark (Research & Development)
+### Advanced Completion Benchmark
 
 For more sophisticated benchmarking needs, the advanced benchmark provides flexible dataset configuration, multimodal support, and research-oriented features through JSON configuration files.
 
@@ -172,6 +172,9 @@ uv run completion_advanced_benchmark.py --dataset-config CONFIG_FILE --scenario 
 - `--api-base`: Server URL (default: http://localhost:8000/v1)
 - `--batch-sizes`: Comma-separated batch sizes (default: 1,2,4,8)
 - `--results-file`: Output JSON file path
+- `--lora-strategy`: LoRA distribution strategy (single, uniform, zipf, mixed, all-unique)
+- `--lora-names`: Comma-separated LoRA adapter names
+- `--base-model-ratio`: Fraction of requests using base model without LoRA (0.0-1.0)
 
 ### Dataset Configuration Examples
 
@@ -230,6 +233,16 @@ uv run completion_advanced_benchmark.py \
   --scenario "I(512,512)" \
   --model llava-model \
   --results-file multimodal_results.json
+
+# LoRA benchmark with Zipf distribution
+uv run completion_advanced_benchmark.py \
+  --dataset-config examples/dataset_configs/aime_simple.json \
+  --scenario "N(100,50)/(50,0)" \
+  --model Qwen3-4B \
+  --lora-strategy zipf \
+  --lora-names lora1,lora2,lora3,lora4 \
+  --base-model-ratio 0.1 \
+  --results-file lora_results.json
 ```
 
 ### Traffic Scenarios
@@ -311,7 +324,11 @@ Key metrics include:
 Generate comprehensive visualizations with:
 
 ```bash
+# Single benchmark results
 uv run plot_advanced_benchmark.py advanced_results.json advanced_plot.png
+
+# Compare multiple benchmarks
+uv run plot_advanced_benchmark.py comparison.png results1.json results2.json results3.json
 ```
 
 ![Advanced Benchmark Results](assets/advanced_benchmark_example.png)
