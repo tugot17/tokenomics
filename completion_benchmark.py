@@ -251,20 +251,8 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
         if semaphore is None:
             return await single_request(session, api_base, model, req, temperature, timeout, api_key)
 
-        # Record time before semaphore wait so TTFT includes queue time
-        queue_start = time.perf_counter()
         async with semaphore:
-            result = await single_request(session, api_base, model, req, temperature, timeout, api_key)
-
-        if result.get("success"):
-            queue_wait = result["start_time"] - queue_start
-            result["ttft"] += queue_wait
-            result["start_time"] = queue_start
-            # output_latency, output_throughput, tpot are unchanged:
-            # the queue_wait shifts start_time and ttft by the same amount,
-            # so (end - start) - ttft is invariant.
-
-        return result
+            return await single_request(session, api_base, model, req, temperature, timeout, api_key)
 
     # Match sglang's read_bufsize (10MB) to avoid event loop bottleneck at high concurrency.
     # Default 64KB buffer can cause excessive read syscalls under pressure.
@@ -344,13 +332,16 @@ def run_benchmark_batch(user_requests: List[Dict], api_base: str, model: str,
 
 def compute_phased_metrics(
     request_details: List[Dict],
-    bucket_size: float = 1.0,
+    bucket_size: float = 0.05,
     steady_state_threshold: float = 0.8,
+    target_concurrency: Optional[int] = None,
 ) -> Dict:
     """Compute time-bucketed metrics with steady-state filtering.
 
-    steady_state_threshold: fraction of peak active requests required
+    steady_state_threshold: fraction of reference concurrency required
     for a bucket to be considered steady-state (default 0.8 = 80%).
+    target_concurrency: if set (sustained mode), use this as the reference
+    instead of observed peak. Avoids bucket-boundary inflation of peak.
     """
     if not request_details:
         return {}
@@ -376,9 +367,11 @@ def compute_phased_metrics(
             if 0 <= b < n_buckets:
                 output_tokens_per_bucket[b] += 1
 
-    # Steady-state = buckets where active requests >= k% of peak
     peak_active = max(active_requests_per_bucket) if active_requests_per_bucket else 0
-    threshold = peak_active * steady_state_threshold
+    # Use target concurrency as reference when available (sustained mode),
+    # otherwise fall back to observed peak (burst mode).
+    reference = target_concurrency if target_concurrency else peak_active
+    threshold = reference * steady_state_threshold
 
     steady_state_tps = [
         output_tokens_per_bucket[i] / bucket_size
@@ -435,7 +428,8 @@ def _aggregate_phased_metrics(per_run_metrics: List[Dict]) -> Dict:
     }
 
 
-def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8) -> Dict:
+def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
+                    target_concurrency: Optional[int] = None) -> Dict:
     """Calculate statistics across multiple runs (enhanced with TTFT metrics)."""
 
     def safe_mean(values):
@@ -501,6 +495,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8) 
             run_phased = compute_phased_metrics(
                 run_request_details,
                 steady_state_threshold=steady_state_threshold,
+                target_concurrency=target_concurrency,
             )
             all_run_phased_metrics.append(run_phased)
 
@@ -578,7 +573,7 @@ def main():
     parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes (burst mode)")
     parser.add_argument("--max-concurrency", default=None, help="Comma-separated concurrency levels (sustained mode)")
     parser.add_argument("--num-prompts", type=int, default=None,
-                        help="Total prompts per sweep point in sustained mode (default: max(64, 10*concurrency))")
+                        help="Total prompts per sweep point in sustained mode (default: max(64, 8*concurrency))")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
@@ -662,7 +657,7 @@ def main():
             "base_model_ratio": lora_config.base_model_ratio if lora_config else 0.0
         } if lora_config else None,
         "steady_state_threshold": args.steady_state_threshold,
-        "bucket_size_seconds": 1.0,
+        "bucket_size_seconds": 0.05,
     }
 
     if execution_mode == "sustained":
@@ -677,7 +672,7 @@ def main():
     for sweep_value in sweep_values:
         if execution_mode == "sustained":
             concurrency = sweep_value
-            num_prompts = args.num_prompts or max(64, 10 * concurrency)
+            num_prompts = args.num_prompts or max(64, 8 * concurrency)
             max_concurrency = concurrency
             print(f"\n🔄 Testing concurrency: {concurrency} ({num_prompts} prompts)")
         else:
@@ -746,7 +741,8 @@ def main():
                 print(f"    ❌ All requests failed")
 
         # Calculate statistics for this sweep value
-        batch_stats = calculate_stats(runs_data, steady_state_threshold=args.steady_state_threshold)
+        batch_stats = calculate_stats(runs_data, steady_state_threshold=args.steady_state_threshold,
+                                       target_concurrency=max_concurrency)
         results["results"][str(sweep_value)] = batch_stats
 
         # Print phased metrics summary
