@@ -369,7 +369,7 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
     ax3 = fig.add_subplot(gs[1, 0])
     setup_line_plot(ax3, x_positions, sweep_values, benchmarks,
                     'e2e_tps_mean', 'e2e_tps_std',
-                    'End-to-End Output Throughput',
+                    'Output Combined Throughput',
                     'Output Tokens/second', sweep_label, '{:.1f} tok/s')
 
     # ===== Plot 4: Latency Breakdown (Stacked Bar) =====
