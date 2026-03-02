@@ -14,12 +14,20 @@ uv pip install -r requirements.txt
 # Start a server (vLLM or SGLang — adapt scripts to your model/TP config)
 ./server/vllm_run_server.sh
 
-# Run benchmark
+# Run benchmark (burst mode — all requests at once)
 uv run completion_benchmark.py \
   --dataset-config examples/dataset_configs/aime_simple.json \
   --scenario "N(100,50)/(50,0)" \
   --model your-model \
   --batch-sizes 1,2,4,8 \
+  --results-file results.json
+
+# Or sustained mode — constant concurrency via semaphore
+uv run completion_benchmark.py \
+  --dataset-config examples/dataset_configs/aime_simple.json \
+  --scenario "N(100,50)/(50,0)" \
+  --model your-model \
+  --max-concurrency 1,2,4,8 \
   --results-file results.json
 
 # Plot results
@@ -44,13 +52,40 @@ uv run completion_benchmark.py --dataset-config CONFIG --scenario SCENARIO [OPTI
 | `--scenario` | Traffic pattern (see below) | required |
 | `--model` | Model name | required |
 | `--api-base` | Server URL | `http://localhost:8000/v1` |
-| `--batch-sizes` | Comma-separated batch sizes | `1,2,4,8` |
-| `--num-runs` | Runs per batch size | `3` |
+| `--batch-sizes` | Comma-separated batch sizes (burst mode) | `1,2,4,8` |
+| `--max-concurrency` | Comma-separated concurrency levels (sustained mode) | — |
+| `--num-prompts` | Total prompts per sweep point in sustained mode | `max(64, 10*concurrency)` |
+| `--num-runs` | Runs per sweep point | `3` |
 | `--results-file` | Output JSON path | `completion_benchmark_results.json` |
 | `--steady-state-threshold` | Fraction of peak requests for steady-state | `0.8` |
 | `--lora-strategy` | LoRA distribution (single, uniform, zipf, mixed, all-unique) | — |
 | `--lora-names` | Comma-separated LoRA adapter names | — |
 | `--base-model-ratio` | Fraction of requests using base model | `0.0` |
+
+#### Execution Modes
+
+The benchmark has two execution modes, selected by which flag you pass:
+
+**Burst mode** (`--batch-sizes`): Fires all requests at once. Each batch size is both the number of prompts and the concurrency level. Good for measuring peak throughput and how the server handles sudden load.
+
+```bash
+uv run completion_benchmark.py \
+  --batch-sizes 1,2,4,8,16 \
+  ...
+```
+
+**Sustained mode** (`--max-concurrency`): Sends many prompts but limits in-flight requests with a semaphore, maintaining constant concurrency. Matches `sglang.bench_serving`'s closed-loop pattern. Gives more realistic throughput measurements for production workloads.
+
+```bash
+uv run completion_benchmark.py \
+  --max-concurrency 1,2,4,8,16 \
+  --num-prompts 128 \
+  ...
+```
+
+In sustained mode, TTFT includes queue wait time (time spent waiting for a semaphore slot). The number of prompts per sweep point defaults to `max(64, 10 * concurrency)` if `--num-prompts` is not set.
+
+The two flags are mutually exclusive — passing both is an error.
 
 #### Traffic Scenarios
 
@@ -69,6 +104,7 @@ uv run completion_benchmark.py --dataset-config CONFIG --scenario SCENARIO [OPTI
 |--------|---------|----------|
 | TTFT | Time to first token | Prefill latency |
 | Decode throughput | `(output_tokens - 1) / decode_time` | Per-request decode speed |
+| TPOT | `decode_time / (output_tokens - 1)` | Time per output token |
 | Input throughput | `input_tokens / ttft` | Prefill speed |
 
 **System throughput** (across all concurrent requests):
@@ -145,5 +181,5 @@ uv run plot_embedding_benchmark.py embedding_results.json embedding_plot.png
 
 ## Limitations
 
-- **Open-loop design**: All requests fire at once. The steady-state filter mitigates ramp-up/drain noise, but doesn't maintain constant concurrency (unlike closed-loop tools like SGLang's `bench_serving --max-concurrency`).
+- **Burst mode is open-loop**: All requests fire at once. The steady-state filter mitigates ramp-up/drain noise, but doesn't maintain constant concurrency. Use `--max-concurrency` (sustained mode) for closed-loop benchmarking.
 - **Chunk-based token counting**: Time-series counts SSE chunks as tokens (~99.8% accurate for most servers). Servers that batch multiple tokens per chunk would undercount.

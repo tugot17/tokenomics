@@ -84,11 +84,68 @@ class LoRAConfig:
         return self._apply_base_model_ratio(raw_assignments)
 
 
+async def _iter_sse_data(response):
+    """Yield SSE data payloads, robust to chunk boundaries.
+
+    Properly handles cases where a single SSE event spans multiple TCP chunks,
+    or multiple events arrive in a single chunk.
+    """
+    buffer = ""
+    event_data_lines = []
+
+    async for chunk in response.content.iter_any():
+        if not chunk:
+            continue
+        buffer += chunk.decode("utf-8", errors="replace")
+        while "\n" in buffer:
+            raw_line, buffer = buffer.split("\n", 1)
+            line = raw_line.rstrip("\r")
+
+            if line == "":
+                # Empty line = end of SSE event
+                if event_data_lines:
+                    yield "\n".join(event_data_lines)
+                    event_data_lines = []
+                continue
+
+            if line.startswith(":"):
+                # SSE comment, skip
+                continue
+            if line.startswith("data:"):
+                event_data_lines.append(line[5:].lstrip())
+
+    # Flush remaining data
+    if event_data_lines:
+        yield "\n".join(event_data_lines)
+
+
+def _extract_text_from_delta(delta: Dict[str, Any]) -> str:
+    """Extract streamed text from common API delta layouts.
+
+    Handles OpenAI, Anthropic, and other common response formats.
+    """
+    pieces = []
+    for key in ("reasoning_content", "content", "text", "reasoning", "output_text"):
+        value = delta.get(key)
+        if isinstance(value, str):
+            pieces.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    pieces.append(item)
+                elif isinstance(item, dict):
+                    for sub_key in ("reasoning_content", "content", "text", "output_text"):
+                        sub_val = item.get(sub_key)
+                        if isinstance(sub_val, str):
+                            pieces.append(sub_val)
+    return "".join(pieces)
+
+
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float,
-                        timeout: int) -> Dict:
+                        timeout: int, api_key: str = "dummy-key") -> Dict:
     """Make a single streaming API request, returning per-request metrics."""
-    request_start = time.time()
+    request_start = time.perf_counter()
     time_at_first_token = None
     chunk_timestamps = []
 
@@ -107,7 +164,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
     try:
         async with session.post(
             f"{api_base}/chat/completions",
-            headers={"Content-Type": "application/json", "Authorization": "Bearer dummy-key"},
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             json=payload,
             timeout=aiohttp.ClientTimeout(total=timeout)
         ) as response:
@@ -117,12 +174,8 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 
             api_usage = None
 
-            async for line in response.content:
-                line_text = line.decode('utf-8').strip()
-                if not line_text.startswith('data: '):
-                    continue
-                data_text = line_text[6:]
-                if data_text == '[DONE]':
+            async for data_text in _iter_sse_data(response):
+                if data_text == "[DONE]":
                     break
 
                 try:
@@ -130,21 +183,21 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 except json.JSONDecodeError:
                     continue
 
-                if 'usage' in chunk_data:
-                    api_usage = chunk_data['usage']
+                if "usage" in chunk_data:
+                    api_usage = chunk_data["usage"]
 
-                choices = chunk_data.get('choices', [])
+                choices = chunk_data.get("choices", [])
                 if choices:
-                    delta = choices[0].get('delta', {})
-                    text = ''.join(x for x in (delta.get('reasoning_content'), delta.get('content')) if x)
+                    delta = choices[0].get("delta", {})
+                    text = _extract_text_from_delta(delta)
 
-                    if text.strip() and time_at_first_token is None:
-                        time_at_first_token = time.time()
+                    if text and time_at_first_token is None:
+                        time_at_first_token = time.perf_counter()
 
                     if text:
-                        chunk_timestamps.append(time.time())
+                        chunk_timestamps.append(time.perf_counter())
 
-            request_end = time.time()
+            request_end = time.perf_counter()
 
             ttft = time_at_first_token - request_start if time_at_first_token else 0
             e2e_latency = request_end - request_start
@@ -160,6 +213,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 
             input_throughput = input_tokens / ttft if ttft > 0 else 0
             output_throughput = (output_tokens - 1) / output_latency if output_latency > 0 and output_tokens > 1 else 0
+            tpot = output_latency / (output_tokens - 1) if output_tokens > 1 and output_latency > 0 else 0
 
             return {
                 "input_tokens": input_tokens,
@@ -170,6 +224,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 "output_latency": output_latency,
                 "input_throughput": input_throughput,
                 "output_throughput": output_throughput,
+                "tpot": tpot,
                 "chunk_timestamps": chunk_timestamps,
                 "success": True
             }
@@ -179,16 +234,49 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 
 
 async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
-                         temperature: float, timeout: int) -> Dict:
-    """Run batch of requests asynchronously."""
-    start_time = time.time()
+                         temperature: float, timeout: int,
+                         max_concurrency: Optional[int] = None,
+                         api_key: str = "dummy-key") -> Dict:
+    """Run batch of requests asynchronously.
 
-    async with aiohttp.ClientSession() as session:
-        tasks = [single_request(session, api_base, model, req, temperature, timeout)
-                 for req in user_requests]
+    Args:
+        max_concurrency: If set, limits the number of concurrent in-flight
+            requests using a semaphore (sustained-load mode). When None, all
+            requests are fired at once (burst mode).
+    """
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    start_time = time.perf_counter()
+
+    async def send_request(session, req):
+        if semaphore is None:
+            return await single_request(session, api_base, model, req, temperature, timeout, api_key)
+
+        # Record time before semaphore wait so TTFT includes queue time
+        queue_start = time.perf_counter()
+        async with semaphore:
+            result = await single_request(session, api_base, model, req, temperature, timeout, api_key)
+
+        if result.get("success"):
+            queue_wait = result["start_time"] - queue_start
+            result["ttft"] += queue_wait
+            result["start_time"] = queue_start
+            # output_latency, output_throughput, tpot are unchanged:
+            # the queue_wait shifts start_time and ttft by the same amount,
+            # so (end - start) - ttft is invariant.
+
+        return result
+
+    # Match sglang's read_bufsize (10MB) to avoid event loop bottleneck at high concurrency.
+    # Default 64KB buffer can cause excessive read syscalls under pressure.
+    connector = aiohttp.TCPConnector(limit=0)
+    async with aiohttp.ClientSession(
+        connector=connector,
+        read_bufsize=10 * 1024**2,
+    ) as session:
+        tasks = [send_request(session, req) for req in user_requests]
         results = await asyncio.gather(*tasks)
 
-    batch_total_seconds = time.time() - start_time
+    batch_total_seconds = time.perf_counter() - start_time
 
     successful_results = [r for r in results if r.get("success", False)]
     total_requests = len(user_requests)
@@ -200,7 +288,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
             "tokens": {"input_per_request": [], "output_per_request": []},
             "batch_total_seconds": batch_total_seconds,
             "prefill_metrics": {"ttft_per_request": [], "input_throughput_per_request": []},
-            "decode_metrics": {"output_throughput_per_request": [], "decode_time_per_request": []},
+            "decode_metrics": {"output_throughput_per_request": [], "tpot_per_request": [], "decode_time_per_request": []},
             "failures": {"total_requests": total_requests, "successful": success_count, "failed": failure_count},
             "request_details": [],
         }
@@ -217,6 +305,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
         },
         "decode_metrics": {
             "output_throughput_per_request": [r["output_throughput"] for r in successful_results if r["output_throughput"] > 0],
+            "tpot_per_request": [r["tpot"] for r in successful_results if r.get("tpot", 0) > 0],
             "decode_time_per_request": [r["output_latency"] for r in successful_results if r["output_latency"] > 0],
         },
         "failures": {
@@ -239,9 +328,12 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
 
 
 def run_benchmark_batch(user_requests: List[Dict], api_base: str, model: str,
-                        temperature: float, timeout: int) -> Dict:
+                        temperature: float, timeout: int,
+                        max_concurrency: Optional[int] = None,
+                        api_key: str = "dummy-key") -> Dict:
     """Run a batch of requests and return results."""
-    result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, timeout))
+    result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, timeout,
+                                         max_concurrency=max_concurrency, api_key=api_key))
 
     failures = result["failures"]
     print(f"    📊 {failures['successful']}/{failures['total_requests']} successful"
@@ -360,6 +452,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8) 
     all_ttft = []
     all_input_throughput = []
     all_output_throughput = []
+    all_tpot = []
     all_decode_time = []
 
     # Batch-level metrics (one value per run)
@@ -386,6 +479,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8) 
         # Decode metrics
         decode_metrics = run_data.get("decode_metrics", {})
         all_output_throughput.extend(decode_metrics.get("output_throughput_per_request", []))
+        all_tpot.extend(decode_metrics.get("tpot_per_request", []))
         all_decode_time.extend(decode_metrics.get("decode_time_per_request", []))
         
         batch_total_seconds.append(run_data["batch_total_seconds"])
@@ -424,6 +518,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8) 
         },
         "decode_metrics": {
             "output_throughput": {"mean": safe_mean(all_output_throughput), "std": safe_std(all_output_throughput)},
+            "tpot": {"mean": safe_mean(all_tpot), "std": safe_std(all_tpot)},
             "decode_time": {"mean": safe_mean(all_decode_time), "std": safe_std(all_decode_time)},
         },
         "batch_metrics": {
@@ -440,7 +535,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8) 
 
 
 def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
-                  batch_sampler, num_warmup_runs: int = 3):
+                  batch_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key"):
     """Perform warmup runs to prepare the server before benchmarking."""
     print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
 
@@ -455,7 +550,7 @@ def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
                     "max_tokens": max(1, min(4096, int(req.target_output_tokens))),
                 }
                 try:
-                    await single_request(session, api_base, model, warmup_data, temperature, timeout)
+                    await single_request(session, api_base, model, warmup_data, temperature, timeout, api_key)
                 except Exception:
                     pass
 
@@ -479,10 +574,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic sampling")
     parser.add_argument("--timeout", type=int, default=3000, help="Timeout in seconds per request.")
     
-    # Benchmark parameters (same as original)
-    parser.add_argument("--batch-sizes", default="1,2,4,8", help="Comma-separated batch sizes")
-    parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per batch size")
-    parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each batch size")
+    # Benchmark parameters
+    parser.add_argument("--batch-sizes", default=None, help="Comma-separated batch sizes (burst mode)")
+    parser.add_argument("--max-concurrency", default=None, help="Comma-separated concurrency levels (sustained mode)")
+    parser.add_argument("--num-prompts", type=int, default=None,
+                        help="Total prompts per sweep point in sustained mode (default: max(64, 10*concurrency))")
+    parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
+    parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
@@ -501,8 +599,18 @@ def main():
 
     args = parser.parse_args()
 
-    # Parse batch sizes
-    batch_sizes = [int(x.strip()) for x in args.batch_sizes.split(",")]
+    # Determine execution mode and sweep values
+    both_set = args.batch_sizes is not None and args.max_concurrency is not None
+    if both_set:
+        parser.error("--batch-sizes and --max-concurrency are mutually exclusive")
+
+    if args.max_concurrency is not None:
+        execution_mode = "sustained"
+        sweep_values = [int(x.strip()) for x in args.max_concurrency.split(",")]
+    else:
+        execution_mode = "burst"
+        batch_sizes_str = args.batch_sizes if args.batch_sizes is not None else "1,2,4,8"
+        sweep_values = [int(x.strip()) for x in batch_sizes_str.split(",")]
 
     # Create LoRA config from command-line arguments
     lora_config = None
@@ -530,57 +638,71 @@ def main():
 
     print(f"📊 Initialized benchmark with scenario: {args.scenario}")
     print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
+    print(f"⚙️  Execution mode: {execution_mode}")
     if lora_config:
         print(f"🎯 LoRA strategy: {lora_config.strategy} with {len(lora_config.lora_names)} adapters")
     print(f"🚀 Starting benchmark: {args.description}")
-    
-    # Create results structure (same format as original)
-    results = {
-        "metadata": {
-            "timestamp": datetime.now().isoformat(),
-            "model": args.model,
-            "scenario": args.scenario,
-            "dataset_config": dataset_config.config,
-            "api_base": args.api_base,
-            "batch_sizes": batch_sizes,
-            "num_runs": args.num_runs,
-            "warmup_runs": args.warmup_runs,
-            "temperature": args.temperature,
-            "description": args.description,
-            "seed": args.seed,
-            "lora_config": {
-                "strategy": lora_config.strategy if lora_config else None,
-                "lora_names": lora_config.lora_names if lora_config else [],
-                "base_model_ratio": lora_config.base_model_ratio if lora_config else 0.0
-            } if lora_config else None,
-            "steady_state_threshold": args.steady_state_threshold,
-            "bucket_size_seconds": 1.0,
-        },
-        "results": {}
+
+    # Create results structure
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "model": args.model,
+        "scenario": args.scenario,
+        "dataset_config": dataset_config.config,
+        "api_base": args.api_base,
+        "execution_mode": execution_mode,
+        "num_runs": args.num_runs,
+        "warmup_runs": args.warmup_runs,
+        "temperature": args.temperature,
+        "description": args.description,
+        "seed": args.seed,
+        "lora_config": {
+            "strategy": lora_config.strategy if lora_config else None,
+            "lora_names": lora_config.lora_names if lora_config else [],
+            "base_model_ratio": lora_config.base_model_ratio if lora_config else 0.0
+        } if lora_config else None,
+        "steady_state_threshold": args.steady_state_threshold,
+        "bucket_size_seconds": 1.0,
     }
-    
-    # Run benchmark for each batch size
-    for batch_size in batch_sizes:
-        print(f"\n🔄 Testing batch size: {batch_size}")
-        
-        warmup_seed = derive_seed(args.seed, batch_size, -1)
+
+    if execution_mode == "sustained":
+        metadata["concurrency_levels"] = sweep_values
+        metadata["num_prompts"] = args.num_prompts
+    else:
+        metadata["batch_sizes"] = sweep_values
+
+    results = {"metadata": metadata, "results": {}}
+
+    # Run benchmark for each sweep value
+    for sweep_value in sweep_values:
+        if execution_mode == "sustained":
+            concurrency = sweep_value
+            num_prompts = args.num_prompts or max(64, 10 * concurrency)
+            max_concurrency = concurrency
+            print(f"\n🔄 Testing concurrency: {concurrency} ({num_prompts} prompts)")
+        else:
+            num_prompts = sweep_value
+            max_concurrency = None
+            print(f"\n🔄 Testing batch size: {sweep_value}")
+
+        warmup_seed = derive_seed(args.seed, sweep_value, -1)
         with use_seed(warmup_seed):
             warmup_server(args.api_base, args.model, args.temperature, args.timeout,
-                         batch_sampler, args.warmup_runs)
-        
+                         batch_sampler, args.warmup_runs, api_key=args.api_key)
+
         runs_data = []
         for run_idx in range(args.num_runs):
             print(f"  Run {run_idx + 1}/{args.num_runs}")
-            
+
             # Generate batch of requests using scenario (on-demand)
-            run_seed = derive_seed(args.seed, batch_size, run_idx)
+            run_seed = derive_seed(args.seed, sweep_value, run_idx)
             with use_seed(run_seed):
-                sampled_requests = batch_sampler.sample_batch(scenario, batch_size)
+                sampled_requests = batch_sampler.sample_batch(scenario, num_prompts)
 
             # Assign LoRAs if config is provided
             lora_assignments = None
             if lora_config:
-                lora_assignments = lora_config.assign_lora(batch_size)
+                lora_assignments = lora_config.assign_lora(num_prompts)
 
             user_requests = []
             for idx, request in enumerate(sampled_requests):
@@ -602,14 +724,14 @@ def main():
                     request_dict["lora_name"] = lora_assignments[idx]
 
                 user_requests.append(request_dict)
-            
+
             run_data = run_benchmark_batch(
-                user_requests, args.api_base, args.model, args.temperature, args.timeout
+                user_requests, args.api_base, args.model, args.temperature, args.timeout,
+                max_concurrency=max_concurrency, api_key=args.api_key
             )
-            
-            
+
             runs_data.append(run_data)
-            
+
             # Print per-run progress
             if run_data["tokens"]["output_per_request"]:
                 total_output = sum(run_data["tokens"]["output_per_request"])
@@ -622,10 +744,10 @@ def main():
                 print(f"    ✅ {wall_time:.2f}s | {total_output:,} tokens | {wall_tps:.0f} tok/s | TTFT {avg_ttft:.3f}s")
             else:
                 print(f"    ❌ All requests failed")
-        
-        # Calculate statistics for this batch size
+
+        # Calculate statistics for this sweep value
         batch_stats = calculate_stats(runs_data, steady_state_threshold=args.steady_state_threshold)
-        results["results"][str(batch_size)] = batch_stats
+        results["results"][str(sweep_value)] = batch_stats
 
         # Print phased metrics summary
         pm = batch_stats.get("phased_metrics", {})
@@ -639,7 +761,7 @@ def main():
             print(f"    End-to-end TPS:            {wall_tps:.1f} tok/s")
             print(f"    Peak active requests:      {pm['peak_active_requests']}")
 
-    # Save results (same format as original)
+    # Save results
     def _round_floats(obj, sig=4):
         """Round all floats in a nested structure to sig significant digits."""
         if isinstance(obj, float):
@@ -655,7 +777,7 @@ def main():
 
     with open(args.results_file, 'w') as f:
         json.dump(_round_floats(results), f, indent=2)
-    
+
     print(f"\n✅ Benchmark completed! Results saved to {args.results_file}")
 
 

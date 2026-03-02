@@ -87,14 +87,33 @@ def load_benchmark_data(json_file: str) -> Tuple[str, Dict, str, str]:
 
 
 def extract_metrics(data: Dict) -> Dict:
-    """Extract all metrics from a single benchmark result."""
-    batch_sizes = sorted(map(int, data["metadata"]["batch_sizes"]))
+    """Extract all metrics from a single benchmark result.
+
+    Auto-detects the sweep axis: concurrency_levels (sustained mode) or
+    batch_sizes (burst mode). Falls back to inferring from result keys.
+    """
+    metadata = data.get("metadata", {})
+
+    # Auto-detect sweep axis
+    if "concurrency_levels" in metadata:
+        sweep_values = sorted(map(int, metadata["concurrency_levels"]))
+        sweep_label = "Concurrency"
+    elif "batch_sizes" in metadata:
+        sweep_values = sorted(map(int, metadata["batch_sizes"]))
+        sweep_label = "Batch Size"
+    else:
+        # Fallback: infer from result keys
+        sweep_values = sorted(int(k) for k in data.get("results", {}).keys() if k.isdigit())
+        sweep_label = "Batch Size"
 
     def _get(d, key, stat):
         return d.get(key, {}).get(stat, 0)
 
     metrics = {
-        'batch_sizes': batch_sizes,
+        'sweep_values': sweep_values,
+        'sweep_label': sweep_label,
+        # Keep batch_sizes as alias for backward compat with internal references
+        'batch_sizes': sweep_values,
         'ttft_mean': [], 'ttft_std': [],
         'output_throughput_mean': [], 'output_throughput_std': [],
         'e2e_tps_mean': [], 'e2e_tps_std': [],
@@ -102,8 +121,8 @@ def extract_metrics(data: Dict) -> Dict:
         'decode_time_mean': [], 'decode_time_std': [],
     }
 
-    for batch in batch_sizes:
-        entry = data["results"][str(batch)]
+    for sv in sweep_values:
+        entry = data["results"][str(sv)]
         prefill = entry.get("prefill_metrics", {})
         decode = entry.get("decode_metrics", {})
         batch_m = entry.get("batch_metrics", {})
@@ -184,7 +203,7 @@ def setup_line_plot(ax, x_positions, batch_sizes, benchmarks, metric_mean, metri
     ax.set_xticklabels(batch_sizes)
 
 
-def setup_bar_chart(ax, x_positions, batch_sizes, benchmarks):
+def setup_bar_chart(ax, x_positions, batch_sizes, benchmarks, xlabel='Batch Size'):
     """Setup a stacked bar chart for latency breakdown."""
     num_benchmarks = len(benchmarks)
     bar_width = BAR_WIDTH_FACTOR / num_benchmarks
@@ -235,7 +254,7 @@ def setup_bar_chart(ax, x_positions, batch_sizes, benchmarks):
     ax.set_title('Latency Breakdown: Prefill vs Decode',
                  fontsize=14, fontweight='bold', pad=20)
     ax.set_ylabel('Time (seconds)', fontsize=11)
-    ax.set_xlabel('Batch Size', fontsize=11)
+    ax.set_xlabel(xlabel, fontsize=11)
     ax.legend(fontsize=9, loc='upper left')
     ax.grid(True, alpha=0.3)
     ax.set_xticks(x_positions)
@@ -312,6 +331,11 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
         "" if len(unique_scenarios) == 1 else "Multiple Scenarios"
     )
 
+    # Detect execution mode from first benchmark
+    first_metadata = benchmarks[0].data.get("metadata", {})
+    execution_mode = first_metadata.get("execution_mode", "burst")
+    mode_label = "Sustained" if execution_mode == "sustained" else "Burst"
+
     # Check if any benchmark has phased_metrics
     has_phased = any(
         entry.get("phased_metrics", {}).get("time_series", {}).get("output_tokens_per_bucket")
@@ -319,9 +343,10 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
         for entry in b.data.get("results", {}).values()
     )
 
-    # Get x positions from first benchmark
-    batch_sizes = benchmarks[0].metrics['batch_sizes']
-    x_positions = range(len(batch_sizes))
+    # Get sweep values and label from first benchmark
+    sweep_values = benchmarks[0].metrics['sweep_values']
+    sweep_label = benchmarks[0].metrics['sweep_label']
+    x_positions = range(len(sweep_values))
 
     if has_phased:
         # 3-row layout: 2x2 on top, time-series spanning bottom
@@ -334,17 +359,17 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
 
     # ===== Plot 1: TTFT (Prefill Phase) =====
     ax1 = fig.add_subplot(gs[0, 0])
-    setup_line_plot(ax1, x_positions, batch_sizes, benchmarks,
+    setup_line_plot(ax1, x_positions, sweep_values, benchmarks,
                     'ttft_mean', 'ttft_std',
                     'Prefill Phase: Time to First Token',
-                    'TTFT (seconds)', 'Batch Size', '{:.2f}s')
+                    'TTFT (seconds)', sweep_label, '{:.2f}s')
 
     # ===== Plot 2: Decode Throughput Per Request =====
     ax2 = fig.add_subplot(gs[0, 1])
-    setup_line_plot(ax2, x_positions, batch_sizes, benchmarks,
+    setup_line_plot(ax2, x_positions, sweep_values, benchmarks,
                     'output_throughput_mean', 'output_throughput_std',
                     'Decode Phase: Throughput per Request',
-                    'Tokens/second (per request)', 'Batch Size', '{:.1f} tok/s')
+                    'Tokens/second (per request)', sweep_label, '{:.1f} tok/s')
 
     # ===== Plot 3: System Throughput =====
     ax3 = fig.add_subplot(gs[1, 0])
@@ -376,21 +401,21 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
 
         ax3.set_title('System Throughput', fontsize=14, fontweight='bold', pad=20)
         ax3.set_ylabel('Total Tokens/second', fontsize=11)
-        ax3.set_xlabel('Batch Size', fontsize=11)
+        ax3.set_xlabel(sweep_label, fontsize=11)
         ax3.legend(fontsize=9, loc='best')
         ax3.grid(True, alpha=0.3)
         ax3.set_xticks(x_positions)
-        ax3.set_xticklabels(batch_sizes)
+        ax3.set_xticklabels(sweep_values)
     else:
         # Fallback: end-to-end TPS only
-        setup_line_plot(ax3, x_positions, batch_sizes, benchmarks,
+        setup_line_plot(ax3, x_positions, sweep_values, benchmarks,
                         'e2e_tps_mean', 'e2e_tps_std',
                         'System Throughput (output tokens / wall time)',
-                        'Total Tokens/second', 'Batch Size', '{:.1f} tok/s')
+                        'Total Tokens/second', sweep_label, '{:.1f} tok/s')
 
     # ===== Plot 4: Latency Breakdown (Stacked Bar) =====
     ax4 = fig.add_subplot(gs[1, 1])
-    setup_bar_chart(ax4, x_positions, batch_sizes, benchmarks)
+    setup_bar_chart(ax4, x_positions, sweep_values, benchmarks, xlabel=sweep_label)
 
     # ===== Plot 5: Phased Metrics Time-Series (if available) =====
     if has_phased:
@@ -398,7 +423,7 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
         plot_phased_metrics_panel(ax5, benchmarks)
 
     # Main title
-    title_parts = [f"Benchmark Comparison ({len(benchmarks)} configurations)"]
+    title_parts = [f"Benchmark ({len(benchmarks)} configs, {mode_label})"]
     if title_model != "Unknown":
         title_parts.append(f"Model: {title_model}")
     if title_scenario:
@@ -414,7 +439,7 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
     plt.close()
 
     print(f"📊 Multi-benchmark comparison plot saved to: {output_image}")
-    print(f"📈 Compared {len(benchmarks)} configurations across {len(batch_sizes)} batch sizes")
+    print(f"📈 Compared {len(benchmarks)} configurations across {len(sweep_values)} {sweep_label.lower()} levels")
 
 
 if __name__ == "__main__":
