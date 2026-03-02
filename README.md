@@ -31,7 +31,7 @@ uv run completion_benchmark.py \
   --results-file results.json
 
 # Plot results
-uv run plot_benchmark.py results.json plot.png
+uv run plot_completion_benchmark.py results.json plot.png
 ```
 
 Requires an OpenAI chat-compatible server ([vLLM](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html?ref=blog.mozilla.ai), [SGLang](https://docs.sglang.ai/backend/server_arguments.html), or any other).
@@ -137,10 +137,10 @@ Supports HuggingFace datasets, local files (CSV, JSON, TXT), and multimodal (ima
 
 ```bash
 # Single benchmark
-uv run plot_benchmark.py results.json plot.png
+uv run plot_completion_benchmark.py results.json plot.png
 
 # Compare multiple benchmarks
-uv run plot_benchmark.py comparison.png results1.json results2.json results3.json
+uv run plot_completion_benchmark.py comparison.png results1.json results2.json results3.json
 ```
 
 ![Benchmark Results](assets/advanced_benchmark_example.png)

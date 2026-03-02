@@ -445,12 +445,12 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage:")
-        print("  Single file:  python plot_benchmark.py <json_file> <output_image>")
-        print("  Multi files:  python plot_benchmark.py <output_image> <json_file1> [json_file2] ...")
+        print("  Single file:  python plot_completion_benchmark.py <json_file> <output_image>")
+        print("  Multi files:  python plot_completion_benchmark.py <output_image> <json_file1> [json_file2] ...")
         print()
         print("Examples:")
-        print("  Single: python plot_benchmark.py benchmark.json output.png")
-        print("  Multi:  python plot_benchmark.py comparison.png \\")
+        print("  Single: python plot_completion_benchmark.py benchmark.json output.png")
+        print("  Multi:  python plot_completion_benchmark.py comparison.png \\")
         print("              lora_benchmark_results/00_baseline_no_lora.json \\")
         print("              lora_benchmark_results/01_single_lora.json \\")
         print("              lora_benchmark_results/03_all_unique_8_loras.json")
