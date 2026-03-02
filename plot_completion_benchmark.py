@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Plot benchmark results on a 4-panel dashboard.
+Plot benchmark results on a 6-panel dashboard.
 
 Supports both single-file and multi-file comparison modes:
 - Single file: Plot one benchmark result
@@ -348,14 +348,8 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
     sweep_label = benchmarks[0].metrics['sweep_label']
     x_positions = range(len(sweep_values))
 
-    if has_phased:
-        # 3-row layout: 2x2 on top, time-series spanning bottom
-        fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] + 5))
-        gs = GridSpec(3, 2, hspace=0.35, wspace=0.3, height_ratios=[1, 1, 1])
-    else:
-        # Standard 2x2 layout
-        fig = plt.figure(figsize=FIGURE_SIZE)
-        gs = GridSpec(2, 2, hspace=0.3, wspace=0.3)
+    fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] + 5))
+    gs = GridSpec(3, 2, hspace=0.35, wspace=0.3, height_ratios=[1, 1, 1])
 
     # ===== Plot 1: TTFT (Prefill Phase) =====
     ax1 = fig.add_subplot(gs[0, 0])
@@ -368,59 +362,31 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
     ax2 = fig.add_subplot(gs[0, 1])
     setup_line_plot(ax2, x_positions, sweep_values, benchmarks,
                     'output_throughput_mean', 'output_throughput_std',
-                    'Decode Phase: Throughput per Request',
-                    'Tokens/second (per request)', sweep_label, '{:.1f} tok/s')
+                    'Decode Phase: Output Throughput per Request',
+                    'Output Tokens/second (per request)', sweep_label, '{:.1f} tok/s')
 
-    # ===== Plot 3: System Throughput =====
+    # ===== Plot 3: End-to-End Throughput =====
     ax3 = fig.add_subplot(gs[1, 0])
-    # Primary: steady-state median (honest decode throughput at full batch)
-    # Secondary (dashed): end-to-end TPS (total_tokens / wall_time, includes ramp-up/drain)
-    has_steady_state = any(v > 0 for v in benchmarks[0].metrics.get('steady_state_median_mean', []))
-    has_eff = any(v > 0 for v in benchmarks[0].metrics.get('e2e_tps_mean', []))
-
-    if has_steady_state:
-        # Plot steady-state median as the primary line
-        for idx, benchmark in enumerate(benchmarks):
-            color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
-            marker = MARKER_STYLES[idx % len(MARKER_STYLES)]
-            display_label = benchmark.label
-
-            plot_line_with_errorband(ax3, x_positions,
-                                     benchmark.metrics['steady_state_median_mean'],
-                                     benchmark.metrics['steady_state_median_std'],
-                                     color, marker, f'{display_label} (steady-state)')
-            add_annotations(ax3, x_positions, benchmark.metrics['steady_state_median_mean'], idx,
-                           format_string='{:.1f} tok/s')
-
-            # Plot end-to-end TPS as dashed reference
-            if has_eff:
-                ax3.plot(x_positions, benchmark.metrics['e2e_tps_mean'],
-                        color=color, linewidth=1.5, linestyle='--', alpha=0.5,
-                        marker=marker, markersize=5,
-                        label=f'{display_label} (end-to-end)')
-
-        ax3.set_title('System Throughput', fontsize=14, fontweight='bold', pad=20)
-        ax3.set_ylabel('Total Tokens/second', fontsize=11)
-        ax3.set_xlabel(sweep_label, fontsize=11)
-        ax3.legend(fontsize=9, loc='best')
-        ax3.grid(True, alpha=0.3)
-        ax3.set_xticks(x_positions)
-        ax3.set_xticklabels(sweep_values)
-    else:
-        # Fallback: end-to-end TPS only
-        setup_line_plot(ax3, x_positions, sweep_values, benchmarks,
-                        'e2e_tps_mean', 'e2e_tps_std',
-                        'System Throughput (output tokens / wall time)',
-                        'Total Tokens/second', sweep_label, '{:.1f} tok/s')
+    setup_line_plot(ax3, x_positions, sweep_values, benchmarks,
+                    'e2e_tps_mean', 'e2e_tps_std',
+                    'End-to-End Output Throughput',
+                    'Output Tokens/second', sweep_label, '{:.1f} tok/s')
 
     # ===== Plot 4: Latency Breakdown (Stacked Bar) =====
     ax4 = fig.add_subplot(gs[1, 1])
     setup_bar_chart(ax4, x_positions, sweep_values, benchmarks, xlabel=sweep_label)
 
-    # ===== Plot 5: Phased Metrics Time-Series (if available) =====
+    # ===== Plot 5: Steady-State Decode Throughput =====
+    ax5 = fig.add_subplot(gs[2, 0])
+    setup_line_plot(ax5, x_positions, sweep_values, benchmarks,
+                    'steady_state_median_mean', 'steady_state_median_std',
+                    'Steady-State Output Throughput',
+                    'Output Tokens/second', sweep_label, '{:.1f} tok/s')
+
+    # ===== Plot 6: Phased Metrics Time-Series (if available) =====
     if has_phased:
-        ax5 = fig.add_subplot(gs[2, :])
-        plot_phased_metrics_panel(ax5, benchmarks)
+        ax6 = fig.add_subplot(gs[2, 1])
+        plot_phased_metrics_panel(ax6, benchmarks)
 
     # Main title
     title_parts = [f"Benchmark ({len(benchmarks)} configs, {mode_label})"]
