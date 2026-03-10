@@ -1,4 +1,4 @@
-uv run python embedding_benchmark.py \
+tokenomics embedding \
   --model Qwen/Qwen3-Embedding-4B \
   --sequence_lengths "200" \
   --batch_sizes "1024,2048" \

@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import os
 import time
 import statistics
 import json
@@ -7,6 +8,8 @@ import random
 from datetime import datetime
 from openai import OpenAI
 from typing import List, Tuple, Dict, Any
+
+from .io import round_floats, atomic_write_json
 
 
 class TextGenerator:
@@ -325,10 +328,6 @@ def calculate_stats(run_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     return stats
 
-def save_results(results: Dict[str, Any], filename: str):
-    """Save benchmark results to JSON file."""
-    with open(filename, "w") as f:
-        json.dump(results, f, indent=2)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -351,11 +350,8 @@ def main():
                         help="Random seed for text generation")
     parser.add_argument("--description", type=str, default="",
                         help="Optional description for the experiment")
-    parser.add_argument("--results_file", type=str, default="embedding_benchmark_results.json",
-                        help="Path to JSON file for saving results")
-
-    parser.add_argument("--save_progress", action="store_true", default=False,
-                        help="Save results after each configuration")
+    parser.add_argument("--results_dir", type=str, default="embedding_results/",
+                        help="Output directory for per-config result files")
     
     args = parser.parse_args()
     
@@ -382,21 +378,20 @@ def main():
     )
     text_gen = TextGenerator(seed=args.seed)
     
-    # Initialize results structure
-    results = {
-        "metadata": {
-            "timestamp": datetime.now().isoformat(),
-            "model": args.model,
-            "api_base": args.api_base,
-            "batch_sizes": batch_sizes,
-            "sequence_lengths": sequence_lengths,
-            "num_runs": args.num_runs,
-            "warmup_runs": args.warmup_runs,
-            "concurrent_requests": True,
-            "seed": args.seed,
-            "description": args.description
-        },
-        "results": {}
+    # Create results directory
+    os.makedirs(args.results_dir, exist_ok=True)
+
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "model": args.model,
+        "api_base": args.api_base,
+        "batch_sizes": batch_sizes,
+        "sequence_lengths": sequence_lengths,
+        "num_runs": args.num_runs,
+        "warmup_runs": args.warmup_runs,
+        "concurrent_requests": True,
+        "seed": args.seed,
+        "description": args.description
     }
     
     print(f"Starting embedding benchmark for model: {args.model}")
@@ -444,23 +439,25 @@ def main():
             
             # Calculate statistics across runs
             stats = calculate_stats(run_metrics)
-            results["results"][config_key] = stats
-            
+
+            # Write per-config result file atomically
+            result_entry = {
+                "metadata": metadata,
+                "config_key": config_key,
+                "result": stats,
+            }
+            result_path = os.path.join(args.results_dir, f"{config_key}.json")
+            atomic_write_json(result_path, round_floats(result_entry))
+
             # Print summary statistics
             print(f"\nSummary for {config_key}:")
             print(f"  Batch Embeddings/sec: {stats['throughput']['batch_embeddings_per_second']['mean']:.2f} ± {stats['throughput']['batch_embeddings_per_second']['std']:.2f}")
             print(f"  Batch Tokens/sec: {stats['throughput']['batch_tokens_per_second']['mean']:.2f} ± {stats['throughput']['batch_tokens_per_second']['std']:.2f}")
             print(f"  Batch Time: {stats['timings']['batch_total_seconds']['mean']:.3f} ± {stats['timings']['batch_total_seconds']['std']:.3f}s")
-    
-    # Save results
-    save_results(results, args.results_file)
-    print(f"\nBenchmark results saved to {args.results_file}")
-    
-    # Print overall summary
-    print(f"\n=== Overall Summary ===")
+            print(f"  💾 Saved {result_path}")
+
+    print(f"\n✅ Benchmark completed! Results saved to {args.results_dir}")
     print(f"Tested {len(batch_sizes)} batch sizes × {len(sequence_lengths)} sequence lengths")
-    print(f"Total configurations: {len(results['results'])}")
-    print(f"Results saved to: {args.results_file}")
 
 if __name__ == "__main__":
     main() 

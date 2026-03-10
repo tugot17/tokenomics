@@ -17,6 +17,8 @@ from typing import List, Dict, Tuple, NamedTuple
 from matplotlib.gridspec import GridSpec
 from pathlib import Path
 
+from .io import load_results_dir
+
 
 # Constants
 FIGURE_SIZE = (16, 12)
@@ -73,15 +75,24 @@ def generate_label_from_metadata(metadata: Dict, json_file: str) -> str:
     return desc or Path(json_file).stem
 
 
-def load_benchmark_data(json_file: str) -> Tuple[str, Dict, str, str]:
-    """Load benchmark JSON and return (label, data, model, scenario)."""
-    with open(json_file, "r") as f:
-        data = json.load(f)
+def load_benchmark_data(path: str) -> Tuple[str, Dict, str, str]:
+    """Load benchmark data from a directory of per-sweep files or a single JSON.
+
+    Accepts both a results directory (new per-file format) and a legacy
+    single-file JSON for backward compatibility.
+    """
+    p = Path(path)
+
+    if p.is_dir():
+        data = load_results_dir(str(p), key_field="sweep_value")
+    else:
+        with open(path, "r") as f:
+            data = json.load(f)
 
     metadata = data.get("metadata", {})
     model = metadata.get("model", "Unknown")
     scenario = metadata.get("scenario", "")
-    label = generate_label_from_metadata(metadata, json_file)
+    label = generate_label_from_metadata(metadata, path)
 
     return label, data, model, scenario
 
@@ -94,17 +105,16 @@ def extract_metrics(data: Dict) -> Dict:
     """
     metadata = data.get("metadata", {})
 
-    # Auto-detect sweep axis
+    # Auto-detect sweep axis label
     if "concurrency_levels" in metadata:
-        sweep_values = sorted(map(int, metadata["concurrency_levels"]))
         sweep_label = "Concurrency"
     elif "batch_sizes" in metadata:
-        sweep_values = sorted(map(int, metadata["batch_sizes"]))
         sweep_label = "Batch Size"
     else:
-        # Fallback: infer from result keys
-        sweep_values = sorted(int(k) for k in data.get("results", {}).keys() if k.isdigit())
         sweep_label = "Batch Size"
+
+    # Use actual result keys (metadata may list values whose files don't exist yet)
+    sweep_values = sorted(int(k) for k in data.get("results", {}).keys() if k.isdigit())
 
     def _get(d, key, stat):
         return d.get(key, {}).get(stat, 0)
@@ -112,8 +122,6 @@ def extract_metrics(data: Dict) -> Dict:
     metrics = {
         'sweep_values': sweep_values,
         'sweep_label': sweep_label,
-        # Keep batch_sizes as alias for backward compat with internal references
-        'batch_sizes': sweep_values,
         'ttft_mean': [], 'ttft_std': [],
         'output_throughput_mean': [], 'output_throughput_std': [],
         'e2e_tps_mean': [], 'e2e_tps_std': [],
@@ -145,10 +153,10 @@ def extract_metrics(data: Dict) -> Dict:
     return metrics
 
 
-def add_annotations(ax, x_positions, y_values, benchmark_idx, format_string='{:.2f}s', y_offset_base=15, y_offset_step=12):
+def add_annotations(ax, x_values, y_values, benchmark_idx, format_string='{:.2f}s', y_offset_base=15, y_offset_step=12):
     """Add value annotations to plot points with vertical spreading per benchmark."""
     y_offset = y_offset_base + (benchmark_idx * y_offset_step)
-    for x, y_val in zip(x_positions, y_values):
+    for x, y_val in zip(x_values, y_values):
         if y_val > 0:
             ax.annotate(format_string.format(y_val),
                        xy=(x, y_val), xytext=(0, y_offset),
@@ -156,16 +164,16 @@ def add_annotations(ax, x_positions, y_values, benchmark_idx, format_string='{:.
                        fontsize=9, fontweight='bold')
 
 
-def plot_line_with_errorband(ax, x_positions, y_mean, y_std, color, marker, label):
+def plot_line_with_errorband(ax, x_values, y_mean, y_std, color, marker, label):
     """Plot a line with shaded error band."""
-    ax.plot(x_positions, y_mean,
+    ax.plot(x_values, y_mean,
            color=color, linewidth=2, marker=marker,
            markersize=8, label=label)
 
     # Error band with clipping at 0
     y_lower = [max(0, m - s) for m, s in zip(y_mean, y_std)]
     y_upper = [m + s for m, s in zip(y_mean, y_std)]
-    ax.fill_between(x_positions, y_lower, y_upper, color=color, alpha=0.15)
+    ax.fill_between(x_values, y_lower, y_upper, color=color, alpha=0.15)
 
 
 def configure_matplotlib_style() -> None:
@@ -179,19 +187,29 @@ def configure_matplotlib_style() -> None:
     plt.rcParams['axes.spines.right'] = False
 
 
-def setup_line_plot(ax, x_positions, batch_sizes, benchmarks, metric_mean, metric_std,
-                    title, ylabel, xlabel, format_string):
-    """Setup a line plot with multiple benchmarks."""
+def _configure_log_xticks(ax, all_ticks: List[int]) -> None:
+    """Set log2 x-axis ticks with rotation when labels are dense."""
+    ax.set_xscale('log', base=2)
+    ax.set_xticks(all_ticks)
+    ax.set_xticklabels([str(v) for v in all_ticks])
+    ax.minorticks_off()
+    if len(all_ticks) > 8:
+        ax.tick_params(axis='x', rotation=45)
+
+
+def setup_line_plot(ax, benchmarks, all_ticks: List[int], xlabel: str,
+                    metric_mean, metric_std, title, ylabel, format_string):
+    """Setup a line plot where each benchmark uses its own sweep values as x."""
     for idx, benchmark in enumerate(benchmarks):
         color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
         marker = MARKER_STYLES[idx % len(MARKER_STYLES)]
-        display_label = benchmark.label
+        x_values = benchmark.metrics['sweep_values']
 
-        plot_line_with_errorband(ax, x_positions,
+        plot_line_with_errorband(ax, x_values,
                                  benchmark.metrics[metric_mean],
                                  benchmark.metrics[metric_std],
-                                 color, marker, display_label)
-        add_annotations(ax, x_positions, benchmark.metrics[metric_mean], idx,
+                                 color, marker, benchmark.label)
+        add_annotations(ax, x_values, benchmark.metrics[metric_mean], idx,
                        format_string=format_string)
 
     ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
@@ -199,39 +217,41 @@ def setup_line_plot(ax, x_positions, batch_sizes, benchmarks, metric_mean, metri
     ax.set_xlabel(xlabel, fontsize=11)
     ax.legend(fontsize=9, loc='best')
     ax.grid(True, alpha=0.3)
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(batch_sizes)
+    _configure_log_xticks(ax, all_ticks)
 
 
-def setup_bar_chart(ax, x_positions, batch_sizes, benchmarks, xlabel='Batch Size'):
-    """Setup a stacked bar chart for latency breakdown."""
+def setup_bar_chart(ax, benchmarks, all_ticks: List[int], xlabel: str):
+    """Setup a stacked bar chart for latency breakdown on log2 x-axis."""
+    import math
+    # Use log2 positions so bar spacing matches the line plots
+    log_positions = {v: math.log2(v) for v in all_ticks}
     num_benchmarks = len(benchmarks)
-    bar_width = BAR_WIDTH_FACTOR / num_benchmarks
+    # Scale bar width relative to the smallest gap in log-space
+    log_vals = sorted(log_positions.values())
+    min_gap = min((b - a) for a, b in zip(log_vals, log_vals[1:])) if len(log_vals) > 1 else 1.0
+    bar_width = min_gap * BAR_WIDTH_FACTOR / num_benchmarks
 
     for idx, benchmark in enumerate(benchmarks):
-        bar_positions = [x + (idx - num_benchmarks/2 + 0.5) * bar_width for x in x_positions]
+        sv = benchmark.metrics['sweep_values']
+        bar_centers = [log_positions[v] + (idx - num_benchmarks/2 + 0.5) * bar_width for v in sv]
 
-        # Use different shades for each configuration
         prefill_color = PREFILL_COLORS[idx % len(PREFILL_COLORS)]
         decode_color = DECODE_COLORS[idx % len(DECODE_COLORS)]
-
-        # Get letter for this configuration
         letter = LETTERS[idx] if idx < len(LETTERS) else str(idx)
-        display_label = benchmark.label
 
         # Stacked bars: TTFT on bottom, decode_time on top
-        ax.bar(bar_positions, benchmark.metrics['ttft_mean'], bar_width,
-               label=f'({letter}) {display_label}',
+        ax.bar(bar_centers, benchmark.metrics['ttft_mean'], bar_width,
+               label=f'({letter}) {benchmark.label}',
                color=prefill_color, alpha=0.8,
                edgecolor='black', linewidth=0.5)
 
-        ax.bar(bar_positions, benchmark.metrics['decode_time_mean'], bar_width,
+        ax.bar(bar_centers, benchmark.metrics['decode_time_mean'], bar_width,
                bottom=benchmark.metrics['ttft_mean'],
                color=decode_color, alpha=0.8,
                edgecolor='black', linewidth=0.5)
 
         # Add letter labels on each bar
-        for bar_pos, ttft, decode_time in zip(bar_positions,
+        for bar_pos, ttft, decode_time in zip(bar_centers,
                                               benchmark.metrics['ttft_mean'],
                                               benchmark.metrics['decode_time_mean']):
             if ttft > 0:
@@ -244,7 +264,7 @@ def setup_bar_chart(ax, x_positions, batch_sizes, benchmarks, xlabel='Batch Size
         # Add total time annotations on top of each bar
         total_times = [t + d for t, d in zip(benchmark.metrics['ttft_mean'],
                                              benchmark.metrics['decode_time_mean'])]
-        for bar_pos, total in zip(bar_positions, total_times):
+        for bar_pos, total in zip(bar_centers, total_times):
             if total > 0:
                 ax.annotate(f'{total:.2f}s',
                             xy=(bar_pos, total), xytext=(0, 5),
@@ -257,18 +277,62 @@ def setup_bar_chart(ax, x_positions, batch_sizes, benchmarks, xlabel='Batch Size
     ax.set_xlabel(xlabel, fontsize=11)
     ax.legend(fontsize=9, loc='upper left')
     ax.grid(True, alpha=0.3)
-    ax.set_xticks(x_positions)
-    ax.set_xticklabels(batch_sizes)
+    ax.set_xticks([log_positions[v] for v in all_ticks])
+    ax.set_xticklabels([str(v) for v in all_ticks])
+    if len(all_ticks) > 8:
+        ax.tick_params(axis='x', rotation=45)
+
+
+def _prepare_timeseries(tokens_per_bucket: List, bucket_size: float,
+                        max_display_buckets: int = 1500) -> tuple:
+    """Prepare time-series for plotting: trim inactive tail and downsample.
+
+    1. Trims trailing empty buckets (keeps up to 5% padding after last activity).
+    2. If still too many points, merges consecutive buckets by summing tokens.
+
+    Returns (time_axis, tps).
+    """
+    # Trim trailing inactivity
+    last_active = 0
+    for i in range(len(tokens_per_bucket) - 1, -1, -1):
+        if tokens_per_bucket[i] > 0:
+            last_active = i
+            break
+    # Keep a small margin (5% of active range) after last activity
+    margin = max(1, int(last_active * 0.05))
+    n = min(len(tokens_per_bucket), last_active + margin + 1)
+    tokens_per_bucket = tokens_per_bucket[:n]
+
+    if n <= max_display_buckets:
+        time_axis = [i * bucket_size for i in range(n)]
+        tps = [t / bucket_size for t in tokens_per_bucket]
+        return time_axis, tps
+
+    # Downsample: merge consecutive buckets
+    factor = n / max_display_buckets
+
+    time_axis = []
+    tps = []
+    i = 0.0
+    while int(i) < n:
+        start = int(i)
+        end = min(int(i + factor), n)
+        total_tokens = sum(tokens_per_bucket[start:end])
+        actual_span = (end - start) * bucket_size
+        time_axis.append(start * bucket_size)
+        tps.append(total_tokens / actual_span if actual_span > 0 else 0)
+        i += factor
+
+    return time_axis, tps
 
 
 def plot_phased_metrics_panel(ax, benchmarks: List['BenchmarkData']) -> None:
     """Plot time-series of output tok/s per bucket with steady-state median line."""
     plotted = False
     for idx, benchmark in enumerate(benchmarks):
-        # phased_metrics is stored per batch_size in the results
-        # We pick the largest batch size since it's most interesting
-        batch_sizes = benchmark.metrics['batch_sizes']
-        largest_batch = str(max(batch_sizes))
+        # Pick the largest sweep value since it's most interesting for time-series
+        sweep_values = benchmark.metrics['sweep_values']
+        largest_batch = str(max(sweep_values))
         entry = benchmark.data["results"].get(largest_batch, {})
         pm = entry.get("phased_metrics", {})
         ts = pm.get("time_series", {})
@@ -280,9 +344,7 @@ def plot_phased_metrics_panel(ax, benchmarks: List['BenchmarkData']) -> None:
             continue
 
         plotted = True
-        n_buckets = len(tokens_per_bucket)
-        time_axis = [i * bucket_size for i in range(n_buckets)]
-        tps_per_bucket = [t / bucket_size for t in tokens_per_bucket]
+        time_axis, tps_per_bucket = _prepare_timeseries(tokens_per_bucket, bucket_size)
 
         color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
         display_label = benchmark.label
@@ -312,14 +374,14 @@ def plot_phased_metrics_panel(ax, benchmarks: List['BenchmarkData']) -> None:
     return plotted
 
 
-def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
+def plot_multiple_benchmarks(data_sources: List[str], output_image: str) -> None:
     """Create multi-panel dashboard comparing benchmark results."""
     configure_matplotlib_style()
 
-    # Load all benchmarks
+    # Load all benchmarks (each source can be a directory or a JSON file)
     benchmarks = []
-    for json_file in json_files:
-        label, data, model, scenario = load_benchmark_data(json_file)
+    for source in data_sources:
+        label, data, model, scenario = load_benchmark_data(source)
         metrics = extract_metrics(data)
         benchmarks.append(BenchmarkData(label, metrics, data, model, scenario))
 
@@ -331,10 +393,15 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
         "" if len(unique_scenarios) == 1 else "Multiple Scenarios"
     )
 
-    # Detect execution mode from first benchmark
-    first_metadata = benchmarks[0].data.get("metadata", {})
-    execution_mode = first_metadata.get("execution_mode", "burst")
-    mode_label = "Sustained" if execution_mode == "sustained" else "Burst"
+    # Detect execution modes across all benchmarks
+    modes = set()
+    for b in benchmarks:
+        m = b.data.get("metadata", {}).get("execution_mode", "burst")
+        modes.add(m)
+    if len(modes) == 1:
+        mode_label = "Sustained" if "sustained" in modes else "Burst"
+    else:
+        mode_label = "Mixed"
 
     # Check if any benchmark has phased_metrics
     has_phased = any(
@@ -343,45 +410,49 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
         for entry in b.data.get("results", {}).values()
     )
 
-    # Get sweep values and label from first benchmark
-    sweep_values = benchmarks[0].metrics['sweep_values']
-    sweep_label = benchmarks[0].metrics['sweep_label']
-    x_positions = range(len(sweep_values))
+    # Compute shared x-axis info once
+    all_sv = set()
+    for b in benchmarks:
+        all_sv.update(b.metrics['sweep_values'])
+    all_ticks = sorted(all_sv)
+
+    sweep_labels = set(b.metrics['sweep_label'] for b in benchmarks)
+    xlabel = sweep_labels.pop() if len(sweep_labels) == 1 else "Concurrency / Batch Size"
 
     fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] + 5))
     gs = GridSpec(3, 2, hspace=0.35, wspace=0.3, height_ratios=[1, 1, 1])
 
     # ===== Plot 1: TTFT (Prefill Phase) =====
     ax1 = fig.add_subplot(gs[0, 0])
-    setup_line_plot(ax1, x_positions, sweep_values, benchmarks,
+    setup_line_plot(ax1, benchmarks, all_ticks, xlabel,
                     'ttft_mean', 'ttft_std',
                     'Prefill Phase: Time to First Token',
-                    'TTFT (seconds)', sweep_label, '{:.2f}s')
+                    'TTFT (seconds)', '{:.2f}s')
 
     # ===== Plot 2: Decode Throughput Per Request =====
     ax2 = fig.add_subplot(gs[0, 1])
-    setup_line_plot(ax2, x_positions, sweep_values, benchmarks,
+    setup_line_plot(ax2, benchmarks, all_ticks, xlabel,
                     'output_throughput_mean', 'output_throughput_std',
                     'Decode Phase: Output Throughput per Request',
-                    'Output Tokens/second (per request)', sweep_label, '{:.1f} tok/s')
+                    'Output Tokens/second (per request)', '{:.1f} tok/s')
 
     # ===== Plot 3: End-to-End Throughput =====
     ax3 = fig.add_subplot(gs[1, 0])
-    setup_line_plot(ax3, x_positions, sweep_values, benchmarks,
+    setup_line_plot(ax3, benchmarks, all_ticks, xlabel,
                     'e2e_tps_mean', 'e2e_tps_std',
                     'Output Combined Throughput',
-                    'Output Tokens/second', sweep_label, '{:.1f} tok/s')
+                    'Output Tokens/second', '{:.1f} tok/s')
 
     # ===== Plot 4: Latency Breakdown (Stacked Bar) =====
     ax4 = fig.add_subplot(gs[1, 1])
-    setup_bar_chart(ax4, x_positions, sweep_values, benchmarks, xlabel=sweep_label)
+    setup_bar_chart(ax4, benchmarks, all_ticks, xlabel)
 
     # ===== Plot 5: Steady-State Decode Throughput =====
     ax5 = fig.add_subplot(gs[2, 0])
-    setup_line_plot(ax5, x_positions, sweep_values, benchmarks,
+    setup_line_plot(ax5, benchmarks, all_ticks, xlabel,
                     'steady_state_median_mean', 'steady_state_median_std',
                     'Steady-State Output Throughput',
-                    'Output Tokens/second', sweep_label, '{:.1f} tok/s')
+                    'Output Tokens/second', '{:.1f} tok/s')
 
     # ===== Plot 6: Phased Metrics Time-Series (if available) =====
     if has_phased:
@@ -405,41 +476,40 @@ def plot_multiple_benchmarks(json_files: List[str], output_image: str) -> None:
     plt.close()
 
     print(f"📊 Multi-benchmark comparison plot saved to: {output_image}")
-    print(f"📈 Compared {len(benchmarks)} configurations across {len(sweep_values)} {sweep_label.lower()} levels")
+    print(f"📈 Compared {len(benchmarks)} configurations across {len(all_ticks)} {xlabel.lower()} levels")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Plot completion benchmark results.",
+        epilog="Auto-detects single vs multi mode based on whether the first positional arg is a .json file.",
+    )
+    parser.add_argument("args", nargs="+", help="<json_file> <output_image>  OR  <output_image> <json_file> ...")
+    parsed = parser.parse_args()
+
+    positional = parsed.args
+    if len(positional) < 2:
+        parser.error("at least 2 positional arguments required")
+
+    first_arg = positional[0]
+    # Detect whether the first arg is a data source (json file or directory) or an output image
+    if Path(first_arg).is_dir() or (first_arg.endswith('.json') and Path(first_arg).exists()):
+        data_sources = [positional[0]]
+        output_image = positional[1]
+    else:
+        output_image = positional[0]
+        data_sources = positional[1:]
+
+    for s in data_sources:
+        if not Path(s).exists():
+            print(f"Error: Path not found: {s}")
+            sys.exit(1)
+
+    print(f"Plotting {len(data_sources)} benchmark(s)")
+    plot_multiple_benchmarks(data_sources, output_image)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage:")
-        print("  Single file:  python plot_completion_benchmark.py <json_file> <output_image>")
-        print("  Multi files:  python plot_completion_benchmark.py <output_image> <json_file1> [json_file2] ...")
-        print()
-        print("Examples:")
-        print("  Single: python plot_completion_benchmark.py benchmark.json output.png")
-        print("  Multi:  python plot_completion_benchmark.py comparison.png \\")
-        print("              lora_benchmark_results/00_baseline_no_lora.json \\")
-        print("              lora_benchmark_results/01_single_lora.json \\")
-        print("              lora_benchmark_results/03_all_unique_8_loras.json")
-        sys.exit(1)
-
-    # Auto-detect mode based on first argument
-    # If first arg is a JSON file -> single mode (backward compatible)
-    # Otherwise -> multi mode
-    first_arg = sys.argv[1]
-
-    if first_arg.endswith('.json') and Path(first_arg).exists():
-        # Single file mode (backward compatible)
-        json_files = [sys.argv[1]]
-        output_image = sys.argv[2]
-    else:
-        # Multi-file mode
-        output_image = sys.argv[1]
-        json_files = sys.argv[2:]
-
-    for f in json_files:
-        if not Path(f).exists():
-            print(f"Error: File not found: {f}")
-            sys.exit(1)
-
-    print(f"📊 Plotting {len(json_files)} benchmark(s)")
-    plot_multiple_benchmarks(json_files, output_image)
+    main()

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-MODEL="Qwen/Qwen3-4B"
+MODEL="LiquidAI/LFM2.5-1.2B-Instruct"
 TP_SIZE=1
 
 echo "Starting vLLM server with model: ${MODEL}"

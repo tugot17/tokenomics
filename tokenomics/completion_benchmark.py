@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import aiohttp
 import time
-import statistics
 import json
 import os
 import random
@@ -17,7 +16,18 @@ from typing import List, Dict, Any, Optional
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .io import round_floats, atomic_write_json
+
+
+def _safe_mean(values):
+    """Return the mean of values, or 0 if empty."""
+    return float(np.mean(values)) if values else 0
+
+
+def _safe_std(values):
+    """Return the population std of values, or 0 if fewer than 2."""
+    return float(np.std(values)) if len(values) > 1 else 0
 
 
 class LoRAConfig:
@@ -57,8 +67,8 @@ class LoRAConfig:
             # All requests use the same LoRA
             return [self.lora_names[0]] * batch_size
 
-        elif self.strategy == "uniform":
-            # Uniformly distribute across all LoRAs (round-robin)
+        elif self.strategy in ("uniform", "all-unique"):
+            # Round-robin across all LoRAs (cycles if batch > num loras)
             return [self.lora_names[i % len(self.lora_names)] for i in range(batch_size)]
 
         elif self.strategy == "zipf":
@@ -67,16 +77,7 @@ class LoRAConfig:
             return [self.lora_names[(sample - 1) % len(self.lora_names)] for sample in zipf_samples]
 
         elif self.strategy == "mixed":
-            # Random mix
             return [random.choice(self.lora_names) for _ in range(batch_size)]
-
-        elif self.strategy == "all-unique":
-            # Each request gets a unique LoRA (cycles if batch > num loras)
-            return [self.lora_names[i % len(self.lora_names)] for i in range(batch_size)]
-
-        else:
-            # This should never happen due to validation in __init__
-            raise ValueError(f"Unknown LoRA strategy: {self.strategy}")
 
     def assign_lora(self, batch_size: int) -> List[Optional[str]]:
         """Assign LoRA names to a batch of requests based on strategy."""
@@ -191,10 +192,9 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                     delta = choices[0].get("delta", {})
                     text = _extract_text_from_delta(delta)
 
-                    if text and time_at_first_token is None:
-                        time_at_first_token = time.perf_counter()
-
                     if text:
+                        if time_at_first_token is None:
+                            time_at_first_token = time.perf_counter()
                         chunk_timestamps.append(time.perf_counter())
 
             request_end = time.perf_counter()
@@ -271,16 +271,6 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     success_count = len(successful_results)
     failure_count = total_requests - success_count
 
-    if not successful_results:
-        return {
-            "tokens": {"input_per_request": [], "output_per_request": []},
-            "batch_total_seconds": batch_total_seconds,
-            "prefill_metrics": {"ttft_per_request": [], "input_throughput_per_request": []},
-            "decode_metrics": {"output_throughput_per_request": [], "tpot_per_request": [], "decode_time_per_request": []},
-            "failures": {"total_requests": total_requests, "successful": success_count, "failed": failure_count},
-            "request_details": [],
-        }
-
     return {
         "tokens": {
             "input_per_request": [r["input_tokens"] for r in successful_results],
@@ -353,19 +343,29 @@ def compute_phased_metrics(
     output_tokens_per_bucket = [0] * n_buckets
     active_requests_per_bucket = [0] * n_buckets
 
+    # Sweep-line for active request counting: O(n log n) instead of O(n * buckets)
+    events = []  # (bucket_index, +1 or -1)
     for r in request_details:
-        # Count requests actively decoding (from first token onward, not from request start)
         decode_start = r["start_time"] + r.get("ttft", 0)
         req_start_b = int((decode_start - t0) / bucket_size)
         req_end_b = int((r["end_time"] - t0) / bucket_size)
-        for b in range(req_start_b, min(req_end_b + 1, n_buckets)):
-            active_requests_per_bucket[b] += 1
+        events.append((req_start_b, 1))
+        events.append((min(req_end_b + 1, n_buckets), -1))
 
         # Bin output tokens by chunk timestamp
         for ts in r.get("chunk_timestamps", []):
             b = int((ts - t0) / bucket_size)
             if 0 <= b < n_buckets:
                 output_tokens_per_bucket[b] += 1
+
+    events.sort()
+    active = 0
+    ei = 0
+    for b in range(n_buckets):
+        while ei < len(events) and events[ei][0] <= b:
+            active += events[ei][1]
+            ei += 1
+        active_requests_per_bucket[b] = active
 
     peak_active = max(active_requests_per_bucket) if active_requests_per_bucket else 0
     # Use target concurrency as reference when available (sustained mode),
@@ -379,9 +379,6 @@ def compute_phased_metrics(
         if active_requests_per_bucket[i] >= threshold
         and output_tokens_per_bucket[i] > 0
     ]
-
-    total_output = sum(r["output_tokens"] for r in request_details)
-    wall_time = t_end - t0
 
     return {
         "steady_state_tps": {
@@ -409,19 +406,13 @@ def _aggregate_phased_metrics(per_run_metrics: List[Dict]) -> Dict:
     peak_actives = [m["peak_active_requests"] for m in per_run_metrics
                     if m.get("peak_active_requests", 0) > 0]
 
-    def safe_mean(v):
-        return float(np.mean(v)) if v else None
-
-    def safe_std(v):
-        return float(np.std(v)) if len(v) > 1 else 0.0
-
     # Use the last run's time_series for plotting (representative of the batch size)
     last_ts = per_run_metrics[-1].get("time_series", {})
 
     return {
         "steady_state_tps": {
-            "median": safe_mean(steady_state_medians),
-            "median_std": safe_std(steady_state_medians),
+            "median": _safe_mean(steady_state_medians) or None,
+            "median_std": _safe_std(steady_state_medians),
         },
         "peak_active_requests": max(peak_actives) if peak_actives else 0,
         "time_series": last_ts,
@@ -431,13 +422,6 @@ def _aggregate_phased_metrics(per_run_metrics: List[Dict]) -> Dict:
 def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
                     target_concurrency: Optional[int] = None) -> Dict:
     """Calculate statistics across multiple runs (enhanced with TTFT metrics)."""
-
-    def safe_mean(values):
-        return statistics.mean(values) if values else 0
-
-    def safe_std(values):
-        return statistics.stdev(values) if len(values) > 1 else 0
-
     # For list-based metrics, flatten all values from all runs
     all_input_tokens = []
     all_output_tokens = []
@@ -504,21 +488,21 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
 
     return {
         "tokens": {
-            "input_per_request": {"mean": safe_mean(all_input_tokens), "std": safe_std(all_input_tokens)},
-            "output_per_request": {"mean": safe_mean(all_output_tokens), "std": safe_std(all_output_tokens)},
+            "input_per_request": {"mean": _safe_mean(all_input_tokens), "std": _safe_std(all_input_tokens)},
+            "output_per_request": {"mean": _safe_mean(all_output_tokens), "std": _safe_std(all_output_tokens)},
         },
         "prefill_metrics": {
-            "ttft": {"mean": safe_mean(all_ttft), "std": safe_std(all_ttft)},
-            "input_throughput": {"mean": safe_mean(all_input_throughput), "std": safe_std(all_input_throughput)},
+            "ttft": {"mean": _safe_mean(all_ttft), "std": _safe_std(all_ttft)},
+            "input_throughput": {"mean": _safe_mean(all_input_throughput), "std": _safe_std(all_input_throughput)},
         },
         "decode_metrics": {
-            "output_throughput": {"mean": safe_mean(all_output_throughput), "std": safe_std(all_output_throughput)},
-            "tpot": {"mean": safe_mean(all_tpot), "std": safe_std(all_tpot)},
-            "decode_time": {"mean": safe_mean(all_decode_time), "std": safe_std(all_decode_time)},
+            "output_throughput": {"mean": _safe_mean(all_output_throughput), "std": _safe_std(all_output_throughput)},
+            "tpot": {"mean": _safe_mean(all_tpot), "std": _safe_std(all_tpot)},
+            "decode_time": {"mean": _safe_mean(all_decode_time), "std": _safe_std(all_decode_time)},
         },
         "batch_metrics": {
-            "e2e_tps": {"mean": safe_mean(all_e2e_tps), "std": safe_std(all_e2e_tps)},
-            "wall_time": {"mean": safe_mean(batch_total_seconds), "std": safe_std(batch_total_seconds)},
+            "e2e_tps": {"mean": _safe_mean(all_e2e_tps), "std": _safe_std(all_e2e_tps)},
+            "wall_time": {"mean": _safe_mean(batch_total_seconds), "std": _safe_std(batch_total_seconds)},
         },
         "reliability": {
             "total_requests": total_requests,
@@ -577,10 +561,11 @@ def main():
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
     # Output configuration
-    parser.add_argument("--results-file", default="completion_benchmark_results.json", help="Output file for results")
+    parser.add_argument("--results-dir", default="completion_results/", help="Output directory for per-sweep-value result files")
 
     # LoRA configuration (direct parameters)
     parser.add_argument("--lora-strategy", help="LoRA distribution strategy (single, uniform, zipf, mixed, all-unique)")
@@ -595,8 +580,7 @@ def main():
     args = parser.parse_args()
 
     # Determine execution mode and sweep values
-    both_set = args.batch_sizes is not None and args.max_concurrency is not None
-    if both_set:
+    if args.batch_sizes is not None and args.max_concurrency is not None:
         parser.error("--batch-sizes and --max-concurrency are mutually exclusive")
 
     if args.max_concurrency is not None:
@@ -604,8 +588,7 @@ def main():
         sweep_values = [int(x.strip()) for x in args.max_concurrency.split(",")]
     else:
         execution_mode = "burst"
-        batch_sizes_str = args.batch_sizes if args.batch_sizes is not None else "1,2,4,8"
-        sweep_values = [int(x.strip()) for x in batch_sizes_str.split(",")]
+        sweep_values = [int(x.strip()) for x in (args.batch_sizes or "1,2,4,8").split(",")]
 
     # Create LoRA config from command-line arguments
     lora_config = None
@@ -624,8 +607,7 @@ def main():
     dataset_config = DatasetConfig.from_file(args.dataset_config)
     dataset_loader = DatasetLoader(dataset_config)
 
-    # Initialize tokenizer (default to model name if not specified)
-    tokenizer_name = args.tokenizer if args.tokenizer else args.model
+    tokenizer_name = args.tokenizer or args.model
 
     # Create samplers for on-demand generation
     text_sampler = TextSampler(tokenizer_name, dataset_loader)
@@ -652,9 +634,9 @@ def main():
         "description": args.description,
         "seed": args.seed,
         "lora_config": {
-            "strategy": lora_config.strategy if lora_config else None,
-            "lora_names": lora_config.lora_names if lora_config else [],
-            "base_model_ratio": lora_config.base_model_ratio if lora_config else 0.0
+            "strategy": lora_config.strategy,
+            "lora_names": lora_config.lora_names,
+            "base_model_ratio": lora_config.base_model_ratio,
         } if lora_config else None,
         "steady_state_threshold": args.steady_state_threshold,
         "bucket_size_seconds": 0.05,
@@ -666,15 +648,15 @@ def main():
     else:
         metadata["batch_sizes"] = sweep_values
 
-    results = {"metadata": metadata, "results": {}}
+    # Create results directory
+    os.makedirs(args.results_dir, exist_ok=True)
 
     # Run benchmark for each sweep value
     for sweep_value in sweep_values:
         if execution_mode == "sustained":
-            concurrency = sweep_value
-            num_prompts = args.num_prompts or max(64, 8 * concurrency)
-            max_concurrency = concurrency
-            print(f"\n🔄 Testing concurrency: {concurrency} ({num_prompts} prompts)")
+            num_prompts = args.num_prompts or max(64, 8 * sweep_value)
+            max_concurrency = sweep_value
+            print(f"\n🔄 Testing concurrency: {sweep_value} ({num_prompts} prompts)")
         else:
             num_prompts = sweep_value
             max_concurrency = None
@@ -701,23 +683,14 @@ def main():
 
             user_requests = []
             for idx, request in enumerate(sampled_requests):
-                # Use scenario's sampled output tokens
-                max_tokens = request.target_output_tokens
-
-                # Ensure max_tokens is reasonable (at least 1, at most 4096)
-                max_tokens = max(1, min(4096, int(max_tokens)))
-
                 request_dict = {
                     "prompt": request.prompt,
-                    "max_tokens": max_tokens,
+                    "max_tokens": max(1, min(args.max_tokens, int(request.target_output_tokens))),
                     "target_input_tokens": request.target_input_tokens,
-                    "target_output_tokens": request.target_output_tokens
+                    "target_output_tokens": request.target_output_tokens,
                 }
-
-                # Add LoRA assignment if available
                 if lora_assignments:
                     request_dict["lora_name"] = lora_assignments[idx]
-
                 user_requests.append(request_dict)
 
             run_data = run_benchmark_batch(
@@ -734,7 +707,7 @@ def main():
                 wall_tps = total_output / wall_time if wall_time > 0 else 0
 
                 ttft_vals = run_data["prefill_metrics"]["ttft_per_request"]
-                avg_ttft = statistics.mean(ttft_vals) if ttft_vals else 0
+                avg_ttft = _safe_mean(ttft_vals)
 
                 print(f"    ✅ {wall_time:.2f}s | {total_output:,} tokens | {wall_tps:.0f} tok/s | TTFT {avg_ttft:.3f}s")
             else:
@@ -743,7 +716,6 @@ def main():
         # Calculate statistics for this sweep value
         batch_stats = calculate_stats(runs_data, steady_state_threshold=args.steady_state_threshold,
                                        target_concurrency=max_concurrency)
-        results["results"][str(sweep_value)] = batch_stats
 
         # Print phased metrics summary
         pm = batch_stats.get("phased_metrics", {})
@@ -757,24 +729,17 @@ def main():
             print(f"    End-to-end TPS:            {wall_tps:.1f} tok/s")
             print(f"    Peak active requests:      {pm['peak_active_requests']}")
 
-    # Save results
-    def _round_floats(obj, sig=4):
-        """Round all floats in a nested structure to sig significant digits."""
-        if isinstance(obj, float):
-            if obj == 0:
-                return 0.0
-            from math import log10, floor
-            return round(obj, -int(floor(log10(abs(obj)))) + (sig - 1))
-        elif isinstance(obj, dict):
-            return {k: _round_floats(v, sig) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [_round_floats(v, sig) for v in obj]
-        return obj
+        # Write per-sweep-value result file atomically
+        result_entry = {
+            "metadata": metadata,
+            "sweep_value": sweep_value,
+            "result": batch_stats,
+        }
+        result_path = os.path.join(args.results_dir, f"{sweep_value}.json")
+        atomic_write_json(result_path, round_floats(result_entry))
+        print(f"  💾 Saved {result_path}")
 
-    with open(args.results_file, 'w') as f:
-        json.dump(_round_floats(results), f, indent=2)
-
-    print(f"\n✅ Benchmark completed! Results saved to {args.results_file}")
+    print(f"\n✅ Benchmark completed! Results saved to {args.results_dir}")
 
 
 if __name__ == "__main__":

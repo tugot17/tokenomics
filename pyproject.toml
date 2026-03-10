@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tokenomics"
+version = "0.5.0"
+description = "LLM inference benchmarking toolkit"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Liquid AI" },
+]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "datasets>=3.2.0",
+    "openai",
+    "matplotlib",
+    "seaborn",
+    "aiohttp",
+    "numpy",
+]
+
+[project.urls]
+Homepage = "https://github.com/LiquidAI/tokenomics"
+
+[project.scripts]
+tokenomics = "tokenomics.cli:main"

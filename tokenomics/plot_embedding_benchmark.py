@@ -4,7 +4,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict, Tuple
 from matplotlib.gridspec import GridSpec
+from pathlib import Path
 import seaborn as sns
+
+from .io import load_results_dir
 
 def parse_config_key(config_key: str) -> Tuple[int, str]:
     """Parse configuration key to extract batch size and sequence length."""
@@ -21,14 +24,24 @@ def parse_config_key(config_key: str) -> Tuple[int, str]:
     
     return batch_size, seq_length
 
-def plot_embedding_benchmark(json_file: str, output_image: str) -> None:
+def _load_embedding_data(path: str) -> Dict:
+    """Load embedding benchmark data from a directory or single JSON."""
+    p = Path(path)
+    if p.is_dir():
+        return load_results_dir(str(p), key_field="config_key")
+    else:
+        with open(path, "r") as f:
+            return json.load(f)
+
+
+def plot_embedding_benchmark(data_path: str, output_image: str) -> None:
     """
     Creates a comprehensive visualization of embedding benchmark data.
-    
+
     Parameters
     ----------
-    json_file : str
-        Path to the JSON file containing embedding benchmark data.
+    data_path : str
+        Path to a results directory or a single JSON file.
     output_image : str
         Path for saving the output figure.
     """
@@ -38,11 +51,10 @@ def plot_embedding_benchmark(json_file: str, output_image: str) -> None:
     plt.rcParams['axes.grid'] = True
     plt.rcParams['grid.linestyle'] = '--'
     plt.rcParams['grid.alpha'] = 0.5
-    
+
     # Load data
-    with open(json_file, "r") as f:
-        data: Dict = json.load(f)
-    
+    data = _load_embedding_data(data_path)
+
     metadata = data["metadata"]
     results = data["results"]
     
@@ -272,14 +284,16 @@ def plot_embedding_benchmark(json_file: str, output_image: str) -> None:
 
 
 
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Plot embedding benchmark results.")
+    parser.add_argument("data_path", help="Path to results directory or single JSON file")
+    parser.add_argument("output_image", help="Path for output image")
+    args = parser.parse_args()
+
+    plot_embedding_benchmark(args.data_path, args.output_image)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python plot_embedding_benchmark.py <json_file> <output_image>")
-        print("Example: python plot_embedding_benchmark.py embedding_benchmark_results.json plot.png")
-        sys.exit(1)
-    
-    json_file = sys.argv[1]
-    output_image = sys.argv[2]
-    
-    # Create main plot
-    plot_embedding_benchmark(json_file, output_image) 
+    main() 
