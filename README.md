@@ -8,7 +8,7 @@ Benchmarking suite for OpenAI-compatible inference servers. Measures throughput,
 
 ```bash
 uv venv --python 3.12 --seed && source .venv/bin/activate
-uv pip install -r requirements.txt
+uv pip install -e .
 ```
 
 ## Completion Benchmark
@@ -19,14 +19,14 @@ Sends chat completion requests to any OpenAI-compatible server and records per-r
 
 ```bash
 # Burst mode — fires all requests at once
-uv run completion_benchmark.py \
+tokenomics completion \
   --dataset-config examples/dataset_configs/aime_simple.json \
   --scenario "N(100,50)/(50,0)" \
   --model your-model \
   --batch-sizes 1,2,4,8
 
 # Sustained mode — maintains constant concurrency via semaphore
-uv run completion_benchmark.py \
+tokenomics completion \
   --dataset-config examples/dataset_configs/aime_simple.json \
   --scenario "N(100,50)/(50,0)" \
   --model your-model \
@@ -57,7 +57,8 @@ The two modes are mutually exclusive. Burst is good for peak throughput; sustain
 | `--max-concurrency` | Sustained mode sweep points |
 | `--num-prompts` | Prompts per sweep point in sustained mode |
 | `--num-runs` | Runs per sweep point (default: 3) |
-| `--results-file` | Output JSON path |
+| `--max-tokens` | Max output tokens (default: 4096) |
+| `--results-dir` | Output directory (one JSON per sweep value) |
 | `--lora-strategy` | LoRA distribution: single, uniform, zipf, mixed, all-unique |
 | `--lora-names` | Comma-separated LoRA adapter names |
 
@@ -76,10 +77,10 @@ The two modes are mutually exclusive. Burst is good for peak throughput; sustain
 
 ```bash
 # Single benchmark
-uv run plot_completion_benchmark.py results.json plot.png
+tokenomics plot-completion results_dir/ plot.png
 
 # Compare multiple benchmarks
-uv run plot_completion_benchmark.py comparison.png results1.json results2.json
+tokenomics plot-completion output.png results_dir1/ results_dir2/
 ```
 
 Produces a 6-panel dashboard:
@@ -95,14 +96,14 @@ Produces a 6-panel dashboard:
 Tests concurrent embedding throughput.
 
 ```bash
-uv run embedding_benchmark.py \
+tokenomics embedding \
   --model Qwen/Qwen3-Embedding-4B \
   --sequence_lengths "200" \
   --batch_sizes "1,8,16,32,64,128,256,512" \
   --num_runs 3 \
-  --results_file embedding_results.json
+  --results-dir embedding_results/
 
-uv run plot_embedding_benchmark.py embedding_results.json embedding_plot.png
+tokenomics plot-embedding embedding_results/ embedding_plot.png
 ```
 
 ![Embedding performance](assets/embeddings_speed.png)
