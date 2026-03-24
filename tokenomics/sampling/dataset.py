@@ -16,18 +16,20 @@ from datasets import load_dataset
 class DatasetConfig:
     """Configuration for dataset loading."""
     
-    def __init__(self, config_dict: Dict[str, Any]):
+    def __init__(self, config_dict: Dict[str, Any], base_dir: Optional[Path] = None):
         self.config = config_dict
+        self.base_dir = base_dir or Path.cwd()
         self.source_type = config_dict.get("source", {}).get("type", "file")
         self.source_path = config_dict.get("source", {}).get("path", "")
         self.prompt_column = config_dict.get("prompt_column", "text")
-        
+
     @classmethod
     def from_file(cls, config_path: str) -> "DatasetConfig":
         """Load configuration from JSON file."""
+        config_path = Path(config_path)
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
-        return cls(config_dict)
+        return cls(config_dict, base_dir=config_path.parent)
     
     @classmethod
     def from_dict(cls, config_dict: Dict[str, Any]) -> "DatasetConfig":
@@ -56,7 +58,7 @@ class DatasetLoader:
     
     def _load_from_file(self) -> None:
         """Load data from local file."""
-        file_path = Path(self.config.source_path)
+        file_path = self.config.base_dir / self.config.source_path
         
         if not file_path.exists():
             raise FileNotFoundError(f"Dataset file not found: {file_path}")

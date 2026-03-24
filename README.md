@@ -52,6 +52,44 @@ The two modes are mutually exclusive. Burst is good for peak throughput; sustain
 | `N(mu,sigma)/(mu,sigma)` | `N(100,50)/(50,0)` | Normal distribution |
 | `U(min,max)/(min,max)` | `U(50,150)/(20,80)` | Uniform distribution |
 
+### Datasets
+
+The benchmark concatenates random text snippets from a dataset until it reaches the input token count specified by the scenario. Snippets are picked with replacement, so even a small dataset can produce long prompts. If the target is smaller than a single snippet, you get one full snippet (no truncation).
+
+#### Dataset config format
+
+A dataset config is a JSON file with a `source` section:
+
+**Local file** (TXT, CSV, or JSON):
+```json
+{
+  "source": { "type": "file", "path": "../data/prompts.txt" },
+  "prompt_column": "text"
+}
+```
+File paths are resolved relative to the config file.
+
+**HuggingFace dataset:**
+```json
+{
+  "source": {
+    "type": "huggingface",
+    "path": "squad",
+    "huggingface_kwargs": { "split": "train" }
+  },
+  "prompt_column": "question"
+}
+```
+
+**AIME** (built-in shortcut):
+```json
+{
+  "source": { "type": "aime" }
+}
+```
+
+See `examples/dataset_configs/` for more examples.
+
 ### Key Options
 
 | Flag | Description |
