@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Optional
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from .sampling import Scenario, TextSampler, BatchSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .sampling import Scenario, TextSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
 from .io import round_floats, atomic_write_json
 
 
@@ -514,7 +514,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
 
 
 def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
-                  batch_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key"):
+                  text_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key"):
     """Perform warmup runs to prepare the server before benchmarking."""
     print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
 
@@ -523,7 +523,7 @@ def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
     async def run_warmup():
         async with aiohttp.ClientSession() as session:
             for _ in range(num_warmup_runs):
-                req = batch_sampler.sample_batch(warmup_scenario, 1)[0]
+                req = text_sampler.sample_batch(warmup_scenario, 1)[0]
                 warmup_data = {
                     "prompt": req.prompt,
                     "max_tokens": max(1, min(4096, int(req.target_output_tokens))),
@@ -609,9 +609,7 @@ def main():
 
     tokenizer_name = args.tokenizer or args.model
 
-    # Create samplers for on-demand generation
     text_sampler = TextSampler(tokenizer_name, dataset_loader)
-    batch_sampler = BatchSampler(text_sampler)
 
     print(f"📊 Initialized benchmark with scenario: {args.scenario}")
     print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
@@ -665,7 +663,7 @@ def main():
         warmup_seed = derive_seed(args.seed, sweep_value, -1)
         with use_seed(warmup_seed):
             warmup_server(args.api_base, args.model, args.temperature, args.timeout,
-                         batch_sampler, args.warmup_runs, api_key=args.api_key)
+                         text_sampler, args.warmup_runs, api_key=args.api_key)
 
         runs_data = []
         for run_idx in range(args.num_runs):
@@ -674,7 +672,7 @@ def main():
             # Generate batch of requests using scenario (on-demand)
             run_seed = derive_seed(args.seed, sweep_value, run_idx)
             with use_seed(run_seed):
-                sampled_requests = batch_sampler.sample_batch(scenario, num_prompts)
+                sampled_requests = text_sampler.sample_batch(scenario, num_prompts)
 
             # Assign LoRAs if config is provided
             lora_assignments = None
