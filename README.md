@@ -7,6 +7,14 @@ Benchmarking suite for OpenAI-compatible inference servers. Measures throughput,
 ## Install
 
 ```bash
+pip install tokenomics
+```
+
+### From source
+
+```bash
+git clone https://github.com/tugot17/tokenomics.git
+cd tokenomics
 uv venv --python 3.12 --seed && source .venv/bin/activate
 uv pip install -e .
 ```
@@ -43,7 +51,6 @@ The two modes are mutually exclusive. Burst is good for peak throughput; sustain
 | `D(in,out)` | `D(100,50)` | Fixed token counts |
 | `N(mu,sigma)/(mu,sigma)` | `N(100,50)/(50,0)` | Normal distribution |
 | `U(min,max)/(min,max)` | `U(50,150)/(20,80)` | Uniform distribution |
-| `I(w,h)` | `I(512,512)` | Image input |
 
 ### Key Options
 
