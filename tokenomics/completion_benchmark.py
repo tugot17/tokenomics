@@ -548,7 +548,7 @@ def main():
     
     # Scenario configuration
     parser.add_argument("--scenario", required=True, help="Scenario string (e.g., 'N(480,240)/(300,150)', 'D(100,100)')")
-    parser.add_argument("--dataset-config", required=True, help="Path to dataset configuration JSON")
+    parser.add_argument("--dataset-config", default=None, help="Path to dataset configuration JSON (defaults to bundled AIME dataset)")
     parser.add_argument("--tokenizer", help="Tokenizer name (defaults to model name)")
     parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic sampling")
     parser.add_argument("--timeout", type=int, default=3000, help="Timeout in seconds per request.")
@@ -604,6 +604,9 @@ def main():
 
     # Initialize scenario and dataset
     scenario = Scenario.from_string(args.scenario)
+    if args.dataset_config is None:
+        from tokenomics import EXAMPLES_DIR
+        args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
     dataset_config = DatasetConfig.from_file(args.dataset_config)
     dataset_loader = DatasetLoader(dataset_config)
 
