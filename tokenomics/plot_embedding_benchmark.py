@@ -5,7 +5,6 @@ import numpy as np
 from typing import List, Dict, Tuple
 from matplotlib.gridspec import GridSpec
 from pathlib import Path
-import seaborn as sns
 
 from .io import load_results_dir
 
