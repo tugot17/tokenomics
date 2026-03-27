@@ -403,7 +403,11 @@ def plot_multiple_benchmarks(data_sources: List[str], output_image: str) -> None
     else:
         mode_label = "Mixed"
 
-    # Check if any benchmark has phased_metrics
+    # Check if any benchmark has streaming data
+    has_streaming = any(
+        any(v > 0 for v in b.metrics.get('ttft_mean', []))
+        for b in benchmarks
+    )
     has_phased = any(
         entry.get("phased_metrics", {}).get("time_series", {}).get("output_tokens_per_bucket")
         for b in benchmarks
@@ -419,55 +423,67 @@ def plot_multiple_benchmarks(data_sources: List[str], output_image: str) -> None
     sweep_labels = set(b.metrics['sweep_label'] for b in benchmarks)
     xlabel = sweep_labels.pop() if len(sweep_labels) == 1 else "Concurrency / Batch Size"
 
-    fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] + 5))
-    gs = GridSpec(3, 2, hspace=0.35, wspace=0.3, height_ratios=[1, 1, 1])
+    if has_streaming:
+        # Full 6-panel layout for streaming benchmarks
+        fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] + 5))
+        gs = GridSpec(3, 2, hspace=0.35, wspace=0.3, height_ratios=[1, 1, 1])
 
-    # ===== Plot 1: TTFT (Prefill Phase) =====
-    ax1 = fig.add_subplot(gs[0, 0])
-    setup_line_plot(ax1, benchmarks, all_ticks, xlabel,
-                    'ttft_mean', 'ttft_std',
-                    'Prefill Phase: Time to First Token',
-                    'TTFT (seconds)', '{:.2f}s')
+        ax1 = fig.add_subplot(gs[0, 0])
+        setup_line_plot(ax1, benchmarks, all_ticks, xlabel,
+                        'ttft_mean', 'ttft_std',
+                        'Prefill Phase: Time to First Token',
+                        'TTFT (seconds)', '{:.2f}s')
 
-    # ===== Plot 2: Decode Throughput Per Request =====
-    ax2 = fig.add_subplot(gs[0, 1])
-    setup_line_plot(ax2, benchmarks, all_ticks, xlabel,
-                    'output_throughput_mean', 'output_throughput_std',
-                    'Decode Phase: Output Throughput per Request',
-                    'Output Tokens/second (per request)', '{:.1f} tok/s')
+        ax2 = fig.add_subplot(gs[0, 1])
+        setup_line_plot(ax2, benchmarks, all_ticks, xlabel,
+                        'output_throughput_mean', 'output_throughput_std',
+                        'Decode Phase: Output Throughput per Request',
+                        'Output Tokens/second (per request)', '{:.1f} tok/s')
 
-    # ===== Plot 3: End-to-End Throughput =====
-    ax3 = fig.add_subplot(gs[1, 0])
-    setup_line_plot(ax3, benchmarks, all_ticks, xlabel,
-                    'e2e_tps_mean', 'e2e_tps_std',
-                    'Output Combined Throughput',
-                    'Output Tokens/second', '{:.1f} tok/s')
+        ax3 = fig.add_subplot(gs[1, 0])
+        setup_line_plot(ax3, benchmarks, all_ticks, xlabel,
+                        'e2e_tps_mean', 'e2e_tps_std',
+                        'Output Combined Throughput',
+                        'Output Tokens/second', '{:.1f} tok/s')
 
-    # ===== Plot 4: Latency Breakdown (Stacked Bar) =====
-    ax4 = fig.add_subplot(gs[1, 1])
-    setup_bar_chart(ax4, benchmarks, all_ticks, xlabel)
+        ax4 = fig.add_subplot(gs[1, 1])
+        setup_bar_chart(ax4, benchmarks, all_ticks, xlabel)
 
-    # ===== Plot 5: Steady-State Decode Throughput =====
-    ax5 = fig.add_subplot(gs[2, 0])
-    setup_line_plot(ax5, benchmarks, all_ticks, xlabel,
-                    'steady_state_median_mean', 'steady_state_median_std',
-                    'Steady-State Output Throughput',
-                    'Output Tokens/second', '{:.1f} tok/s')
+        ax5 = fig.add_subplot(gs[2, 0])
+        setup_line_plot(ax5, benchmarks, all_ticks, xlabel,
+                        'steady_state_median_mean', 'steady_state_median_std',
+                        'Steady-State Output Throughput',
+                        'Output Tokens/second', '{:.1f} tok/s')
 
-    # ===== Plot 6: Phased Metrics Time-Series (if available) =====
-    if has_phased:
-        ax6 = fig.add_subplot(gs[2, 1])
-        plot_phased_metrics_panel(ax6, benchmarks)
+        if has_phased:
+            ax6 = fig.add_subplot(gs[2, 1])
+            plot_phased_metrics_panel(ax6, benchmarks)
+    else:
+        # Two-panel layout for non-streaming benchmarks: throughput + wall time
+        fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] * 0.5))
+        gs = GridSpec(1, 2, wspace=0.3)
+
+        ax3 = fig.add_subplot(gs[0, 0])
+        setup_line_plot(ax3, benchmarks, all_ticks, xlabel,
+                        'e2e_tps_mean', 'e2e_tps_std',
+                        'Output Throughput',
+                        'Output Tokens/second', '{:.1f} tok/s')
+
+        ax4 = fig.add_subplot(gs[0, 1])
+        setup_line_plot(ax4, benchmarks, all_ticks, xlabel,
+                        'decode_time_mean', 'decode_time_std',
+                        'Per-Request Latency',
+                        'Seconds', '{:.1f}s')
 
     # Main title
-    title_parts = [f"Benchmark ({len(benchmarks)} configs, {mode_label})"]
+    title_parts = []
     if title_model != "Unknown":
-        title_parts.append(f"Model: {title_model}")
+        title_parts.append(title_model)
     if title_scenario:
-        title_parts.append(f"Scenario: {title_scenario}")
+        title_parts.append(title_scenario)
 
     main_title = " | ".join(title_parts)
-    fig.suptitle(main_title, fontsize=16, fontweight='bold', y=0.98)
+    fig.suptitle(main_title, fontsize=16, fontweight='bold', y=1.02 if not has_streaming else 0.98)
 
     # Save with high quality
     plt.savefig(output_image,

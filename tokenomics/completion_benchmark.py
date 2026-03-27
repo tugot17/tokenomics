@@ -144,8 +144,9 @@ def _extract_text_from_delta(delta: Dict[str, Any]) -> str:
 
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float,
-                        timeout: int, api_key: str = "dummy-key") -> Dict:
-    """Make a single streaming API request, returning per-request metrics."""
+                        timeout: int, api_key: str = "dummy-key",
+                        n: int = 1, stream: bool = True) -> Dict:
+    """Make a single API request, returning per-request metrics."""
     request_start = time.perf_counter()
     time_at_first_token = None
     chunk_timestamps = []
@@ -158,9 +159,12 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
         "messages": [{"role": "user", "content": request_data["prompt"]}],
         "max_tokens": request_data["max_tokens"],
         "temperature": temperature,
-        "stream": True,
-        "stream_options": {"include_usage": True}
+        "stream": stream,
     }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
+    if n > 1:
+        payload["n"] = n
 
     try:
         async with session.post(
@@ -175,27 +179,31 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 
             api_usage = None
 
-            async for data_text in _iter_sse_data(response):
-                if data_text == "[DONE]":
-                    break
+            if stream:
+                async for data_text in _iter_sse_data(response):
+                    if data_text == "[DONE]":
+                        break
 
-                try:
-                    chunk_data = json.loads(data_text)
-                except json.JSONDecodeError:
-                    continue
+                    try:
+                        chunk_data = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
 
-                if "usage" in chunk_data:
-                    api_usage = chunk_data["usage"]
+                    if "usage" in chunk_data:
+                        api_usage = chunk_data["usage"]
 
-                choices = chunk_data.get("choices", [])
-                if choices:
-                    delta = choices[0].get("delta", {})
-                    text = _extract_text_from_delta(delta)
+                    choices = chunk_data.get("choices", [])
+                    for choice in choices:
+                        delta = choice.get("delta", {})
+                        text = _extract_text_from_delta(delta)
 
-                    if text:
-                        if time_at_first_token is None:
-                            time_at_first_token = time.perf_counter()
-                        chunk_timestamps.append(time.perf_counter())
+                        if text:
+                            if time_at_first_token is None:
+                                time_at_first_token = time.perf_counter()
+                            chunk_timestamps.append(time.perf_counter())
+            else:
+                resp_data = json.loads(await response.read())
+                api_usage = resp_data.get("usage")
 
             request_end = time.perf_counter()
 
@@ -212,8 +220,10 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 print(f"⚠️  No API usage info — using chunk count as token estimate")
 
             input_throughput = input_tokens / ttft if ttft > 0 else 0
-            output_throughput = (output_tokens - 1) / output_latency if output_latency > 0 and output_tokens > 1 else 0
-            tpot = output_latency / (output_tokens - 1) if output_tokens > 1 and output_latency > 0 else 0
+            # Per-sequence decode metrics use tokens per completion (not total across n)
+            tokens_per_seq = output_tokens / n
+            output_throughput = (tokens_per_seq - 1) / output_latency if output_latency > 0 and tokens_per_seq > 1 else 0
+            tpot = output_latency / (tokens_per_seq - 1) if tokens_per_seq > 1 and output_latency > 0 else 0
 
             return {
                 "input_tokens": input_tokens,
@@ -236,23 +246,25 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
 async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
                          temperature: float, timeout: int,
                          max_concurrency: Optional[int] = None,
-                         api_key: str = "dummy-key") -> Dict:
+                         api_key: str = "dummy-key",
+                         n: int = 1, stream: bool = True) -> Dict:
     """Run batch of requests asynchronously.
 
     Args:
         max_concurrency: If set, limits the number of concurrent in-flight
             requests using a semaphore (sustained-load mode). When None, all
             requests are fired at once (burst mode).
+        n: Number of completions per request.
     """
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
     start_time = time.perf_counter()
 
     async def send_request(session, req):
         if semaphore is None:
-            return await single_request(session, api_base, model, req, temperature, timeout, api_key)
+            return await single_request(session, api_base, model, req, temperature, timeout, api_key, n=n, stream=stream)
 
         async with semaphore:
-            return await single_request(session, api_base, model, req, temperature, timeout, api_key)
+            return await single_request(session, api_base, model, req, temperature, timeout, api_key, n=n, stream=stream)
 
     # Match sglang's read_bufsize (10MB) to avoid event loop bottleneck at high concurrency.
     # Default 64KB buffer can cause excessive read syscalls under pressure.
@@ -308,10 +320,11 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
 def run_benchmark_batch(user_requests: List[Dict], api_base: str, model: str,
                         temperature: float, timeout: int,
                         max_concurrency: Optional[int] = None,
-                        api_key: str = "dummy-key") -> Dict:
+                        api_key: str = "dummy-key",
+                        n: int = 1, stream: bool = True) -> Dict:
     """Run a batch of requests and return results."""
     result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, timeout,
-                                         max_concurrency=max_concurrency, api_key=api_key))
+                                         max_concurrency=max_concurrency, api_key=api_key, n=n, stream=stream))
 
     failures = result["failures"]
     print(f"    📊 {failures['successful']}/{failures['total_requests']} successful"
@@ -562,6 +575,8 @@ def main():
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
     parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
+    parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
+    parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
     # Output configuration
@@ -632,6 +647,8 @@ def main():
         "num_runs": args.num_runs,
         "warmup_runs": args.warmup_runs,
         "temperature": args.temperature,
+        "num_completions": args.num_completions,
+        "stream": args.stream,
         "description": args.description,
         "seed": args.seed,
         "lora_config": {
@@ -696,7 +713,8 @@ def main():
 
             run_data = run_benchmark_batch(
                 user_requests, args.api_base, args.model, args.temperature, args.timeout,
-                max_concurrency=max_concurrency, api_key=args.api_key
+                max_concurrency=max_concurrency, api_key=args.api_key,
+                n=args.num_completions, stream=args.stream
             )
 
             runs_data.append(run_data)
