@@ -147,9 +147,9 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 
 ![Non-streaming example](assets/example_visualization_non_streaming.png)
 
-| Left | Right |
-|------|-------|
-| Output throughput | Per-request latency |
+| Top | Output throughput |
+|-----|-------------------|
+| **Bottom** | **Per-request latency** |
 
 **Streaming** (`--stream`) produces a 6-panel dashboard:
 

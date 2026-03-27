@@ -459,9 +459,9 @@ def plot_multiple_benchmarks(data_sources: List[str], output_image: str) -> None
             ax6 = fig.add_subplot(gs[2, 1])
             plot_phased_metrics_panel(ax6, benchmarks)
     else:
-        # Two-panel layout for non-streaming benchmarks: throughput + wall time
-        fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] * 0.5))
-        gs = GridSpec(1, 2, wspace=0.3)
+        # Two-panel layout for non-streaming benchmarks: throughput + latency stacked
+        fig = plt.figure(figsize=(FIGURE_SIZE[0], FIGURE_SIZE[1] * 0.9))
+        gs = GridSpec(2, 1, hspace=0.35)
 
         ax3 = fig.add_subplot(gs[0, 0])
         setup_line_plot(ax3, benchmarks, all_ticks, xlabel,
@@ -469,7 +469,7 @@ def plot_multiple_benchmarks(data_sources: List[str], output_image: str) -> None
                         'Output Throughput',
                         'Output Tokens/second', '{:.1f} tok/s')
 
-        ax4 = fig.add_subplot(gs[0, 1])
+        ax4 = fig.add_subplot(gs[1, 0])
         setup_line_plot(ax4, benchmarks, all_ticks, xlabel,
                         'decode_time_mean', 'decode_time_std',
                         'Per-Request Latency',
