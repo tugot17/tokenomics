@@ -5,13 +5,19 @@ OAI server benchmark with scenario-based sampling.
 import argparse
 import asyncio
 import aiohttp
+import socket
 import time
 import json
 import os
 import random
 import numpy as np
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Optional
+
+# Latency is measured with the monotonic perf_counter_ns clock and kept as
+# integer nanoseconds internally; values are converted to seconds only at the
+# return boundary. NEVER use time.time() for latency (wall clock can jump).
+NS_PER_SECOND = 1_000_000_000
 
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -91,11 +97,12 @@ async def _iter_sse_events(response):
     Robust to chunk boundaries: a single SSE event may span multiple TCP
     chunks, or multiple events may arrive in one chunk.
 
-    ``arrival_perf`` is ``time.perf_counter()`` stamped the instant the chunk
-    that completes the event lands off the socket, BEFORE any JSON parsing, so
-    first-token and per-token timing exclude client-side parse/event-loop
-    latency. ``event_name`` carries the SSE ``event:`` field (``None`` when
-    absent) so callers can detect mid-stream ``event: error`` frames.
+    ``arrival_perf`` is ``time.perf_counter_ns()`` (integer nanoseconds)
+    stamped the instant the chunk that completes the event lands off the
+    socket, BEFORE any JSON parsing, so first-token and per-token timing
+    exclude client-side parse/event-loop latency. ``event_name`` carries the
+    SSE ``event:`` field (``None`` when absent) so callers can detect
+    mid-stream ``event: error`` frames.
     """
     buffer = ""
     event_name = None
@@ -107,7 +114,7 @@ async def _iter_sse_events(response):
             continue
         # Stamp arrival before decoding/parsing so the timestamp reflects when
         # the bytes hit the socket, not when we finished processing them.
-        chunk_perf = time.perf_counter()
+        chunk_perf = time.perf_counter_ns()
         buffer += chunk.decode("utf-8", errors="replace")
         while "\n" in buffer:
             raw_line, buffer = buffer.split("\n", 1)
@@ -131,7 +138,7 @@ async def _iter_sse_events(response):
 
     # Flush remaining data
     if event_data_lines:
-        yield (chunk_perf if chunk_perf is not None else time.perf_counter()), event_name, "\n".join(event_data_lines)
+        yield (chunk_perf if chunk_perf is not None else time.perf_counter_ns()), event_name, "\n".join(event_data_lines)
 
 
 def _extract_text_from_delta(delta: Dict[str, Any]) -> str:
@@ -156,15 +163,68 @@ def _extract_text_from_delta(delta: Dict[str, Any]) -> str:
     return "".join(pieces)
 
 
+def _extract_output_text_from_delta(delta: Dict[str, Any]) -> str:
+    """Extract only the non-reasoning output text from a delta.
+
+    Same shape as ``_extract_text_from_delta`` but excludes the reasoning
+    fields, so callers can detect the first actual output token (TTFO) for
+    reasoning models, distinct from the first token overall (TTFT).
+    """
+    pieces = []
+    for key in ("content", "text", "output_text"):
+        value = delta.get(key)
+        if isinstance(value, str):
+            pieces.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    pieces.append(item)
+                elif isinstance(item, dict):
+                    for sub_key in ("content", "text", "output_text"):
+                        sub_val = item.get(sub_key)
+                        if isinstance(sub_val, str):
+                            pieces.append(sub_val)
+    return "".join(pieces)
+
+
+def _create_connector() -> aiohttp.TCPConnector:
+    """Build a TCPConnector with TCP_NODELAY for low-latency SSE delivery.
+
+    Disabling Nagle's algorithm stops small SSE frames from being coalesced,
+    which would smear per-token arrival timing. Uses aiohttp's socket_factory
+    (>=3.9) and falls back gracefully on older aiohttp.
+    """
+    def socket_factory(addr_info):
+        family, sock_type, proto = addr_info[0], addr_info[1], addr_info[2]
+        sock = socket.socket(family=family, type=sock_type, proto=proto)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock
+
+    try:
+        return aiohttp.TCPConnector(limit=0, socket_factory=socket_factory)
+    except TypeError:
+        # Older aiohttp without socket_factory support.
+        return aiohttp.TCPConnector(limit=0)
+
+
 async def single_request(session: aiohttp.ClientSession, api_base: str, model: str,
                         request_data: Dict[str, Any], temperature: float,
                         timeout: int, api_key: str = "dummy-key",
-                        n: int = 1, stream: bool = True) -> Dict:
-    """Make a single API request, returning per-request metrics."""
-    request_start = time.perf_counter()
+                        n: int = 1, stream: bool = True,
+                        token_counter: Optional[Callable[[str], int]] = None) -> Dict:
+    """Make a single API request, returning per-request metrics.
+
+    All internal timestamps are integer nanoseconds (perf_counter_ns); the
+    returned timing fields are seconds. ``token_counter``, when provided, is
+    used to count output tokens client-side when the server omits usage info,
+    instead of the crude one-chunk-per-token estimate.
+    """
+    request_start = time.perf_counter_ns()
     time_at_first_token = None
+    time_at_first_output_token = None
     last_content_perf = None
     chunk_timestamps = []
+    output_text_parts = []
 
     lora_name = request_data.get("lora_name")
     model_str = f"{model}:{lora_name}" if lora_name else model
@@ -219,30 +279,43 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                     if chunk_data.get("usage"):
                         api_usage = chunk_data["usage"]
 
-                    choices = chunk_data.get("choices", [])
-                    has_content = any(
-                        _extract_text_from_delta(choice.get("delta", {}))
-                        for choice in choices
-                    )
-                    if has_content:
+                    chunk_full_text = ""
+                    chunk_output_text = ""
+                    for choice in chunk_data.get("choices", []):
+                        delta = choice.get("delta", {})
+                        chunk_full_text += _extract_text_from_delta(delta)
+                        chunk_output_text += _extract_output_text_from_delta(delta)
+
+                    if chunk_full_text:
                         # arrival_perf was stamped at socket-arrival, before JSON
                         # parsing, so TTFT and per-token timing exclude parse cost.
                         if time_at_first_token is None:
                             time_at_first_token = arrival_perf
                         chunk_timestamps.append(arrival_perf)
                         last_content_perf = arrival_perf
+                        output_text_parts.append(chunk_full_text)
+                    # First non-reasoning output token (TTFO), distinct from TTFT.
+                    if chunk_output_text and time_at_first_output_token is None:
+                        time_at_first_output_token = arrival_perf
             else:
                 resp_data = json.loads(await response.read())
                 api_usage = resp_data.get("usage")
+                # Accumulate output text for the client-side token fallback.
+                for choice in resp_data.get("choices", []):
+                    output_text_parts.append(
+                        _extract_text_from_delta(choice.get("message", {}))
+                    )
 
-            request_end = time.perf_counter()
+            request_end = time.perf_counter_ns()
             # End the latency window at the last content token, not the trailing
             # usage/[DONE] chunk (which lands ~1 RTT later). Matches aiperf, where
             # request latency = timestamp of the last content response.
             content_end_perf = last_content_perf if last_content_perf is not None else request_end
 
-            ttft = time_at_first_token - request_start if time_at_first_token else 0
-            e2e_latency = content_end_perf - request_start
+            # Convert ns deltas to seconds at the boundary.
+            ttft = (time_at_first_token - request_start) / NS_PER_SECOND if time_at_first_token else 0
+            ttfo = (time_at_first_output_token - request_start) / NS_PER_SECOND if time_at_first_output_token else 0
+            e2e_latency = (content_end_perf - request_start) / NS_PER_SECOND
             output_latency = e2e_latency - ttft if ttft > 0 else e2e_latency
 
             if api_usage:
@@ -252,6 +325,12 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 # reasoning_tokens on top of completion_tokens, double-counting
                 # reasoning for models that fold it in (vLLM, OpenAI).
                 output_tokens = api_usage.get("completion_tokens", 0)
+            elif token_counter is not None:
+                # No server usage: tokenize the generated text client-side
+                # (OSL = output + reasoning tokens), matching aiperf's client-side
+                # fallback, instead of guessing 1 chunk ≈ 1 token.
+                input_tokens = request_data.get("target_input_tokens", 0)
+                output_tokens = token_counter("".join(output_text_parts))
             else:
                 input_tokens = request_data.get("target_input_tokens", 0)
                 output_tokens = len(chunk_timestamps)  # 1 chunk ≈ 1 token
@@ -266,14 +345,15 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
             return {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "start_time": request_start,
-                "end_time": content_end_perf,
+                "start_time": request_start / NS_PER_SECOND,
+                "end_time": content_end_perf / NS_PER_SECOND,
                 "ttft": ttft,
+                "ttfo": ttfo,
                 "output_latency": output_latency,
                 "input_throughput": input_throughput,
                 "output_throughput": output_throughput,
                 "tpot": tpot,
-                "chunk_timestamps": chunk_timestamps,
+                "chunk_timestamps": [t / NS_PER_SECOND for t in chunk_timestamps],
                 "status": response.status,
                 "success": True
             }
@@ -286,7 +366,8 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
                          temperature: float, timeout: int,
                          max_concurrency: Optional[int] = None,
                          api_key: str = "dummy-key",
-                         n: int = 1, stream: bool = True) -> Dict:
+                         n: int = 1, stream: bool = True,
+                         token_counter: Optional[Callable[[str], int]] = None) -> Dict:
     """Run batch of requests asynchronously.
 
     Args:
@@ -294,23 +375,29 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
             requests using a semaphore (sustained-load mode). When None, all
             requests are fired at once (burst mode).
         n: Number of completions per request.
+        token_counter: Optional client-side output-token counter used when the
+            server omits usage info.
     """
     semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
     start_time = time.perf_counter()
 
     async def send_request(session, req):
         if semaphore is None:
-            return await single_request(session, api_base, model, req, temperature, timeout, api_key, n=n, stream=stream)
+            return await single_request(session, api_base, model, req, temperature, timeout, api_key, n=n, stream=stream, token_counter=token_counter)
 
         async with semaphore:
-            return await single_request(session, api_base, model, req, temperature, timeout, api_key, n=n, stream=stream)
+            return await single_request(session, api_base, model, req, temperature, timeout, api_key, n=n, stream=stream, token_counter=token_counter)
 
-    # Match sglang's read_bufsize (10MB) to avoid event loop bottleneck at high concurrency.
-    # Default 64KB buffer can cause excessive read syscalls under pressure.
-    connector = aiohttp.TCPConnector(limit=0)
+    # TCP_NODELAY connector so small SSE frames aren't coalesced (distorting
+    # per-token timing). Match sglang's read_bufsize (10MB) to avoid an event
+    # loop bottleneck at high concurrency, and skip aiohttp's auto headers
+    # (User-Agent / Accept-Encoding) to keep the request minimal and avoid
+    # response gzip that would add decode latency to chunk timing.
+    connector = _create_connector()
     async with aiohttp.ClientSession(
         connector=connector,
         read_bufsize=10 * 1024**2,
+        skip_auto_headers=["User-Agent", "Accept-Encoding"],
     ) as session:
         tasks = [send_request(session, req) for req in user_requests]
         results = await asyncio.gather(*tasks)
@@ -330,6 +417,7 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
         "batch_total_seconds": batch_total_seconds,
         "prefill_metrics": {
             "ttft_per_request": [r["ttft"] for r in successful_results if r["ttft"] > 0],
+            "ttfo_per_request": [r["ttfo"] for r in successful_results if r.get("ttfo", 0) > 0],
             "input_throughput_per_request": [r["input_throughput"] for r in successful_results if r["input_throughput"] > 0],
         },
         "decode_metrics": {
@@ -360,10 +448,12 @@ def run_benchmark_batch(user_requests: List[Dict], api_base: str, model: str,
                         temperature: float, timeout: int,
                         max_concurrency: Optional[int] = None,
                         api_key: str = "dummy-key",
-                        n: int = 1, stream: bool = True) -> Dict:
+                        n: int = 1, stream: bool = True,
+                        token_counter: Optional[Callable[[str], int]] = None) -> Dict:
     """Run a batch of requests and return results."""
     result = asyncio.run(run_batch_async(user_requests, api_base, model, temperature, timeout,
-                                         max_concurrency=max_concurrency, api_key=api_key, n=n, stream=stream))
+                                         max_concurrency=max_concurrency, api_key=api_key, n=n, stream=stream,
+                                         token_counter=token_counter))
 
     failures = result["failures"]
     print(f"    📊 {failures['successful']}/{failures['total_requests']} successful"
@@ -480,6 +570,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
     
     # Individual request metrics (flattened across runs)
     all_ttft = []
+    all_ttfo = []
     all_input_throughput = []
     all_output_throughput = []
     all_tpot = []
@@ -504,6 +595,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
         # Prefill metrics
         prefill_metrics = run_data.get("prefill_metrics", {})
         all_ttft.extend(prefill_metrics.get("ttft_per_request", []))
+        all_ttfo.extend(prefill_metrics.get("ttfo_per_request", []))
         all_input_throughput.extend(prefill_metrics.get("input_throughput_per_request", []))
         
         # Decode metrics
@@ -545,6 +637,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
         },
         "prefill_metrics": {
             "ttft": {"mean": _safe_mean(all_ttft), "std": _safe_std(all_ttft)},
+            "ttfo": {"mean": _safe_mean(all_ttfo), "std": _safe_std(all_ttfo)},
             "input_throughput": {"mean": _safe_mean(all_input_throughput), "std": _safe_std(all_input_throughput)},
         },
         "decode_metrics": {
@@ -668,6 +761,15 @@ def main():
 
     text_sampler = TextSampler(tokenizer_name, dataset_loader)
 
+    def count_output_tokens(text: str) -> int:
+        """Client-side output-token count used when the server omits usage."""
+        if not text:
+            return 0
+        try:
+            return len(text_sampler.tokenizer.encode(text).ids)
+        except Exception:
+            return int(len(text.split()) * 1.3)
+
     print(f"📊 Initialized benchmark with scenario: {args.scenario}")
     print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
     print(f"⚙️  Execution mode: {execution_mode}")
@@ -753,7 +855,8 @@ def main():
             run_data = run_benchmark_batch(
                 user_requests, args.api_base, args.model, args.temperature, args.timeout,
                 max_concurrency=max_concurrency, api_key=args.api_key,
-                n=args.num_completions, stream=args.stream
+                n=args.num_completions, stream=args.stream,
+                token_counter=count_output_tokens
             )
 
             runs_data.append(run_data)
