@@ -11,6 +11,7 @@ import json
 import os
 import random
 import numpy as np
+from collections import Counter
 from datetime import datetime
 from typing import Callable, List, Dict, Any, Optional
 
@@ -187,6 +188,40 @@ def _extract_output_text_from_delta(delta: Dict[str, Any]) -> str:
     return "".join(pieces)
 
 
+def _parse_usage_extras(api_usage: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract extended usage fields that OpenAI-compatible servers report
+    (OpenRouter, vLLM, ...): reasoning/cached token counts, totals, and cost.
+
+    Robust to the fields being absent or nested. On OpenRouter, reasoning lives
+    under ``completion_tokens_details`` and cached tokens under
+    ``prompt_tokens_details``; other servers report them top-level, so both
+    locations are checked. Only present fields are returned.
+    """
+    if not api_usage:
+        return {}
+    ctd = api_usage.get("completion_tokens_details") or {}
+    ptd = api_usage.get("prompt_tokens_details") or {}
+    extras: Dict[str, Any] = {}
+
+    reasoning = ctd.get("reasoning_tokens")
+    if reasoning is None:
+        reasoning = api_usage.get("reasoning_tokens")
+    if reasoning is not None:
+        extras["reasoning_tokens"] = reasoning
+
+    cached = ptd.get("cached_tokens")
+    if cached is None:
+        cached = api_usage.get("cached_tokens")
+    if cached is not None:
+        extras["cached_tokens"] = cached
+
+    if api_usage.get("total_tokens") is not None:
+        extras["total_tokens"] = api_usage["total_tokens"]
+    if api_usage.get("cost") is not None:
+        extras["cost"] = api_usage["cost"]
+    return extras
+
+
 def _create_connector() -> aiohttp.TCPConnector:
     """Build a TCPConnector with TCP_NODELAY for low-latency SSE delivery.
 
@@ -225,6 +260,9 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
     last_content_perf = None
     chunk_timestamps = []
     output_text_parts = []
+    provider = None
+    finish_reason = None
+    native_finish_reason = None
 
     lora_name = request_data.get("lora_name")
     model_str = f"{model}:{lora_name}" if lora_name else model
@@ -278,6 +316,8 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                     # Only latch non-empty usage; an empty `{}` is not usage info.
                     if chunk_data.get("usage"):
                         api_usage = chunk_data["usage"]
+                    if chunk_data.get("provider"):
+                        provider = chunk_data["provider"]
 
                     chunk_full_text = ""
                     chunk_output_text = ""
@@ -285,6 +325,10 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                         delta = choice.get("delta", {})
                         chunk_full_text += _extract_text_from_delta(delta)
                         chunk_output_text += _extract_output_text_from_delta(delta)
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                        if choice.get("native_finish_reason"):
+                            native_finish_reason = choice["native_finish_reason"]
 
                     if chunk_full_text:
                         # arrival_perf was stamped at socket-arrival, before JSON
@@ -300,11 +344,16 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
             else:
                 resp_data = json.loads(await response.read())
                 api_usage = resp_data.get("usage")
+                provider = resp_data.get("provider")
                 # Accumulate output text for the client-side token fallback.
                 for choice in resp_data.get("choices", []):
                     output_text_parts.append(
                         _extract_text_from_delta(choice.get("message", {}))
                     )
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+                    if choice.get("native_finish_reason"):
+                        native_finish_reason = choice["native_finish_reason"]
 
             request_end = time.perf_counter_ns()
             # End the latency window at the last content token, not the trailing
@@ -342,6 +391,16 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
             output_throughput = (tokens_per_seq - 1) / output_latency if output_latency > 0 and tokens_per_seq > 1 else 0
             tpot = output_latency / (tokens_per_seq - 1) if tokens_per_seq > 1 and output_latency > 0 else 0
 
+            # Extended server-reported fields (reasoning/cached tokens, cost,
+            # provider, finish reason). Useful but absent on many servers.
+            usage_extras = _parse_usage_extras(api_usage)
+            if provider is not None:
+                usage_extras["provider"] = provider
+            if finish_reason is not None:
+                usage_extras["finish_reason"] = finish_reason
+            if native_finish_reason is not None:
+                usage_extras["native_finish_reason"] = native_finish_reason
+
             return {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -355,6 +414,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 "tpot": tpot,
                 "chunk_timestamps": [t / NS_PER_SECOND for t in chunk_timestamps],
                 "status": response.status,
+                "usage_extras": usage_extras,
                 "success": True
             }
 
@@ -409,10 +469,26 @@ async def run_batch_async(user_requests: List[Dict], api_base: str, model: str,
     success_count = len(successful_results)
     failure_count = total_requests - success_count
 
+    # Aggregate extended usage fields (present only on servers that report them).
+    def _extras_list(key):
+        return [r["usage_extras"][key] for r in successful_results
+                if r.get("usage_extras", {}).get(key) is not None]
+
     return {
         "tokens": {
             "input_per_request": [r["input_tokens"] for r in successful_results],
             "output_per_request": [r["output_tokens"] for r in successful_results],
+        },
+        "usage_extras": {
+            "reasoning_tokens_per_request": _extras_list("reasoning_tokens"),
+            "cached_tokens_per_request": _extras_list("cached_tokens"),
+            "cost_per_request": _extras_list("cost"),
+            "finish_reasons": dict(Counter(
+                r["usage_extras"]["finish_reason"] for r in successful_results
+                if r.get("usage_extras", {}).get("finish_reason"))),
+            "providers": dict(Counter(
+                r["usage_extras"]["provider"] for r in successful_results
+                if r.get("usage_extras", {}).get("provider"))),
         },
         "batch_total_seconds": batch_total_seconds,
         "prefill_metrics": {
@@ -588,9 +664,23 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
     # Per-run phased metrics
     all_run_phased_metrics = []
 
+    # Extended usage fields (present only on servers that report them)
+    all_reasoning_tokens = []
+    all_cached_tokens = []
+    all_cost = []
+    finish_reasons = Counter()
+    providers = Counter()
+
     for run_data in runs_data:
         all_input_tokens.extend(run_data["tokens"]["input_per_request"])
         all_output_tokens.extend(run_data["tokens"]["output_per_request"])
+
+        ue = run_data.get("usage_extras", {})
+        all_reasoning_tokens.extend(ue.get("reasoning_tokens_per_request", []))
+        all_cached_tokens.extend(ue.get("cached_tokens_per_request", []))
+        all_cost.extend(ue.get("cost_per_request", []))
+        finish_reasons.update(ue.get("finish_reasons", {}))
+        providers.update(ue.get("providers", {}))
         
         # Prefill metrics
         prefill_metrics = run_data.get("prefill_metrics", {})
@@ -630,6 +720,33 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
     # Aggregate phased metrics across runs
     phased_metrics = _aggregate_phased_metrics(all_run_phased_metrics)
 
+    # Summarize extended usage fields; only include sub-keys that have data so
+    # servers that report nothing extra don't litter the output with empties.
+    usage_extras_summary: Dict[str, Any] = {}
+    if all_reasoning_tokens:
+        usage_extras_summary["reasoning_tokens"] = {
+            "mean": _safe_mean(all_reasoning_tokens),
+            "std": _safe_std(all_reasoning_tokens),
+            "total": int(sum(all_reasoning_tokens)),
+        }
+    if all_cached_tokens:
+        total_cached = int(sum(all_cached_tokens))
+        total_input = int(sum(all_input_tokens))
+        usage_extras_summary["cached_tokens"] = {
+            "mean": _safe_mean(all_cached_tokens),
+            "total": total_cached,
+            "cache_hit_rate": (total_cached / total_input) if total_input > 0 else 0,
+        }
+    if all_cost:
+        usage_extras_summary["cost"] = {
+            "mean": _safe_mean(all_cost),
+            "total": float(sum(all_cost)),
+        }
+    if finish_reasons:
+        usage_extras_summary["finish_reasons"] = dict(finish_reasons)
+    if providers:
+        usage_extras_summary["providers"] = dict(providers)
+
     return {
         "tokens": {
             "input_per_request": {"mean": _safe_mean(all_input_tokens), "std": _safe_std(all_input_tokens)},
@@ -654,6 +771,7 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
             "successful": total_successful,
             "failed": total_failed,
         },
+        "usage_extras": usage_extras_summary,
         "phased_metrics": phased_metrics,
     }
 
@@ -889,6 +1007,21 @@ def main():
             print(f"    Steady-state TPS (median): {steady_state['median']:.1f}{std_str} tok/s")
             print(f"    End-to-end TPS:            {wall_tps:.1f} tok/s")
             print(f"    Peak active requests:      {pm['peak_active_requests']}")
+
+        # Print extended server-reported usage (only what the server returned)
+        ue = batch_stats.get("usage_extras", {})
+        if ue:
+            print(f"  Server Usage Extras:")
+            if "reasoning_tokens" in ue:
+                print(f"    Reasoning tokens (mean):   {ue['reasoning_tokens']['mean']:.1f}")
+            if "cached_tokens" in ue:
+                print(f"    Cache hit rate:            {ue['cached_tokens']['cache_hit_rate'] * 100:.1f}%")
+            if "cost" in ue:
+                print(f"    Cost (total):              ${ue['cost']['total']:.6f}")
+            if ue.get("finish_reasons"):
+                print(f"    Finish reasons:            {ue['finish_reasons']}")
+            if ue.get("providers"):
+                print(f"    Providers:                 {ue['providers']}")
 
         # Write per-sweep-value result file atomically
         result_entry = {
