@@ -85,18 +85,29 @@ class LoRAConfig:
         return self._apply_base_model_ratio(raw_assignments)
 
 
-async def _iter_sse_data(response):
-    """Yield SSE data payloads, robust to chunk boundaries.
+async def _iter_sse_events(response):
+    """Yield ``(arrival_perf, event_name, data_payload)`` for each SSE event.
 
-    Properly handles cases where a single SSE event spans multiple TCP chunks,
-    or multiple events arrive in a single chunk.
+    Robust to chunk boundaries: a single SSE event may span multiple TCP
+    chunks, or multiple events may arrive in one chunk.
+
+    ``arrival_perf`` is ``time.perf_counter()`` stamped the instant the chunk
+    that completes the event lands off the socket, BEFORE any JSON parsing, so
+    first-token and per-token timing exclude client-side parse/event-loop
+    latency. ``event_name`` carries the SSE ``event:`` field (``None`` when
+    absent) so callers can detect mid-stream ``event: error`` frames.
     """
     buffer = ""
+    event_name = None
     event_data_lines = []
+    chunk_perf = None
 
     async for chunk in response.content.iter_any():
         if not chunk:
             continue
+        # Stamp arrival before decoding/parsing so the timestamp reflects when
+        # the bytes hit the socket, not when we finished processing them.
+        chunk_perf = time.perf_counter()
         buffer += chunk.decode("utf-8", errors="replace")
         while "\n" in buffer:
             raw_line, buffer = buffer.split("\n", 1)
@@ -105,19 +116,22 @@ async def _iter_sse_data(response):
             if line == "":
                 # Empty line = end of SSE event
                 if event_data_lines:
-                    yield "\n".join(event_data_lines)
+                    yield chunk_perf, event_name, "\n".join(event_data_lines)
                     event_data_lines = []
+                    event_name = None
                 continue
 
             if line.startswith(":"):
                 # SSE comment, skip
                 continue
-            if line.startswith("data:"):
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
                 event_data_lines.append(line[5:].lstrip())
 
     # Flush remaining data
     if event_data_lines:
-        yield "\n".join(event_data_lines)
+        yield (chunk_perf if chunk_perf is not None else time.perf_counter()), event_name, "\n".join(event_data_lines)
 
 
 def _extract_text_from_delta(delta: Dict[str, Any]) -> str:
@@ -149,6 +163,7 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
     """Make a single API request, returning per-request metrics."""
     request_start = time.perf_counter()
     time_at_first_token = None
+    last_content_perf = None
     chunk_timestamps = []
 
     lora_name = request_data.get("lora_name")
@@ -174,46 +189,69 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
             timeout=aiohttp.ClientTimeout(total=timeout)
         ) as response:
 
-            if response.status != 200:
-                return {"error": f"API error {response.status}: {await response.text()}", "success": False}
+            # Accept the full 2xx range as success (async job APIs may return
+            # 201/202), matching aiperf's status handling.
+            if not (200 <= response.status < 300):
+                return {"error": f"API error {response.status}: {await response.text()}",
+                        "success": False, "status": response.status}
 
             api_usage = None
 
             if stream:
-                async for data_text in _iter_sse_data(response):
+                async for arrival_perf, event_name, data_text in _iter_sse_events(response):
                     if data_text == "[DONE]":
                         break
+
+                    # A mid-stream `event: error` frame is a failure, not a short
+                    # successful response. Without this, an error frame parses as a
+                    # normal (contentless) chunk and the request is scored as a
+                    # success with a truncated token count.
+                    if event_name == "error":
+                        return {"error": f"SSE error event: {data_text}", "success": False,
+                                "status": response.status}
 
                     try:
                         chunk_data = json.loads(data_text)
                     except json.JSONDecodeError:
                         continue
 
-                    if "usage" in chunk_data:
+                    # Only latch non-empty usage; an empty `{}` is not usage info.
+                    if chunk_data.get("usage"):
                         api_usage = chunk_data["usage"]
 
                     choices = chunk_data.get("choices", [])
-                    for choice in choices:
-                        delta = choice.get("delta", {})
-                        text = _extract_text_from_delta(delta)
-
-                        if text:
-                            if time_at_first_token is None:
-                                time_at_first_token = time.perf_counter()
-                            chunk_timestamps.append(time.perf_counter())
+                    has_content = any(
+                        _extract_text_from_delta(choice.get("delta", {}))
+                        for choice in choices
+                    )
+                    if has_content:
+                        # arrival_perf was stamped at socket-arrival, before JSON
+                        # parsing, so TTFT and per-token timing exclude parse cost.
+                        if time_at_first_token is None:
+                            time_at_first_token = arrival_perf
+                        chunk_timestamps.append(arrival_perf)
+                        last_content_perf = arrival_perf
             else:
                 resp_data = json.loads(await response.read())
                 api_usage = resp_data.get("usage")
 
             request_end = time.perf_counter()
+            # End the latency window at the last content token, not the trailing
+            # usage/[DONE] chunk (which lands ~1 RTT later). Matches aiperf, where
+            # request latency = timestamp of the last content response.
+            content_end_perf = last_content_perf if last_content_perf is not None else request_end
 
             ttft = time_at_first_token - request_start if time_at_first_token else 0
-            e2e_latency = request_end - request_start
+            e2e_latency = content_end_perf - request_start
             output_latency = e2e_latency - ttft if ttft > 0 else e2e_latency
 
             if api_usage:
                 input_tokens = api_usage.get("prompt_tokens", 0)
-                output_tokens = api_usage.get("reasoning_tokens", 0) + api_usage.get("completion_tokens", 0)
+                # aiperf semantic: the server's completion_tokens already includes
+                # reasoning tokens, so OSL == completion_tokens. The old code added
+                # reasoning_tokens on top of completion_tokens, double-counting
+                # reasoning for models that fold it in (vLLM, OpenAI).
+                output_tokens = api_usage.get("completion_tokens", 0)
             else:
                 input_tokens = request_data.get("target_input_tokens", 0)
                 output_tokens = len(chunk_timestamps)  # 1 chunk ≈ 1 token
@@ -229,13 +267,14 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "start_time": request_start,
-                "end_time": request_end,
+                "end_time": content_end_perf,
                 "ttft": ttft,
                 "output_latency": output_latency,
                 "input_throughput": input_throughput,
                 "output_throughput": output_throughput,
                 "tpot": tpot,
                 "chunk_timestamps": chunk_timestamps,
+                "status": response.status,
                 "success": True
             }
 
