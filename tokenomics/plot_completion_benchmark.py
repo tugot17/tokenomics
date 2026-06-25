@@ -123,6 +123,7 @@ def extract_metrics(data: Dict) -> Dict:
         'sweep_values': sweep_values,
         'sweep_label': sweep_label,
         'ttft_mean': [], 'ttft_std': [],
+        'ttfo_mean': [], 'ttfo_std': [],
         'output_throughput_mean': [], 'output_throughput_std': [],
         'e2e_tps_mean': [], 'e2e_tps_std': [],
         'steady_state_median_mean': [], 'steady_state_median_std': [],
@@ -139,6 +140,8 @@ def extract_metrics(data: Dict) -> Dict:
 
         metrics['ttft_mean'].append(_get(prefill, "ttft", "mean"))
         metrics['ttft_std'].append(_get(prefill, "ttft", "std"))
+        metrics['ttfo_mean'].append(_get(prefill, "ttfo", "mean"))
+        metrics['ttfo_std'].append(_get(prefill, "ttfo", "std"))
         metrics['output_throughput_mean'].append(_get(decode, "output_throughput", "mean"))
         metrics['output_throughput_std'].append(_get(decode, "output_throughput", "std"))
         metrics['decode_time_mean'].append(_get(decode, "decode_time", "mean"))
@@ -214,6 +217,48 @@ def setup_line_plot(ax, benchmarks, all_ticks: List[int], xlabel: str,
 
     ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
     ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    _configure_log_xticks(ax, all_ticks)
+
+
+def setup_ttft_ttfo_panel(ax, benchmarks, all_ticks: List[int], xlabel: str) -> None:
+    """TTFT panel, with TTFO (time to first output token) overlaid as a dashed
+    line when it meaningfully diverges from TTFT.
+
+    For non-reasoning models TTFO == TTFT, so the overlay is suppressed to avoid
+    drawing a redundant coincident line. For reasoning models the gap between the
+    solid (TTFT) and dashed (TTFO) lines is exactly the reasoning-preamble time.
+    """
+    def _diverges(b) -> bool:
+        for ttft, ttfo in zip(b.metrics['ttft_mean'], b.metrics['ttfo_mean']):
+            if ttfo > 0 and ttft > 0 and abs(ttfo - ttft) / ttft > 0.02:
+                return True
+        return False
+
+    show_ttfo = any(_diverges(b) for b in benchmarks)
+
+    for idx, benchmark in enumerate(benchmarks):
+        color = COLOR_PALETTE[idx % len(COLOR_PALETTE)]
+        marker = MARKER_STYLES[idx % len(MARKER_STYLES)]
+        x_values = benchmark.metrics['sweep_values']
+
+        ttft_label = f"{benchmark.label} TTFT" if show_ttfo else benchmark.label
+        plot_line_with_errorband(ax, x_values, benchmark.metrics['ttft_mean'],
+                                 benchmark.metrics['ttft_std'], color, marker, ttft_label)
+        add_annotations(ax, x_values, benchmark.metrics['ttft_mean'], idx,
+                       format_string='{:.2f}s')
+
+        if show_ttfo:
+            ax.plot(x_values, benchmark.metrics['ttfo_mean'], color=color, marker=marker,
+                    linestyle='--', markerfacecolor='none', alpha=0.9,
+                    label=f"{benchmark.label} TTFO")
+
+    title = ('Prefill Phase: TTFT (solid) vs TTFO (dashed)'
+             if show_ttfo else 'Prefill Phase: Time to First Token')
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+    ax.set_ylabel('Seconds', fontsize=11)
     ax.set_xlabel(xlabel, fontsize=11)
     ax.legend(fontsize=9, loc='best')
     ax.grid(True, alpha=0.3)
@@ -429,10 +474,7 @@ def plot_multiple_benchmarks(data_sources: List[str], output_image: str) -> None
         gs = GridSpec(3, 2, hspace=0.35, wspace=0.3, height_ratios=[1, 1, 1])
 
         ax1 = fig.add_subplot(gs[0, 0])
-        setup_line_plot(ax1, benchmarks, all_ticks, xlabel,
-                        'ttft_mean', 'ttft_std',
-                        'Prefill Phase: Time to First Token',
-                        'TTFT (seconds)', '{:.2f}s')
+        setup_ttft_ttfo_panel(ax1, benchmarks, all_ticks, xlabel)
 
         ax2 = fig.add_subplot(gs[0, 1])
         setup_line_plot(ax2, benchmarks, all_ticks, xlabel,

@@ -155,7 +155,7 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 
 | | Left | Right |
 |---|------|-------|
-| **Row 1** | TTFT | Decode throughput per request |
+| **Row 1** | TTFT (with TTFO overlaid when it diverges, i.e. reasoning models) | Decode throughput per request |
 | **Row 2** | End-to-end output throughput | Latency breakdown (prefill vs decode) |
 | **Row 3** | Steady-state output throughput | Time-series token buckets |
 
