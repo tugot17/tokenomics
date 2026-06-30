@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "math-ai/aime25",
+    "huggingface_kwargs": { "split": "test" }
+  },
+  "prompt_column": "problem",
+  "description": "AIME 2025 competition math problems (30 problems). Each problem statement is sent verbatim. Use with --replay-dataset."
+}

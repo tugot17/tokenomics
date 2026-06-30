@@ -53,6 +53,14 @@ tokenomics completion \
   --model your-model \
   --max-concurrency 1,2,4,8 \
   --stream
+
+# Dataset-replay mode — walk a real dataset example by example (no --scenario)
+tokenomics completion \
+  --replay-dataset \
+  --dataset-config examples/dataset_configs/humaneval.json \
+  --model your-model \
+  --max-concurrency 1,2,4,8,16,32 \
+  --max-tokens 1024
 ```
 
 The two execution modes (`--batch-sizes` and `--max-concurrency`) are mutually exclusive. Burst is good for peak throughput; sustained gives realistic production numbers.
@@ -105,11 +113,45 @@ File paths are resolved relative to the config file.
 
 See `examples/dataset_configs/` for more examples.
 
+### Dataset Replay Mode
+
+`--replay-dataset` sends each dataset row **verbatim as one request** and walks the dataset in order at each concurrency level, instead of synthesizing prompts to the scenario's token budget. Use it to benchmark on real examples and compare datasets. The prompt set is pinned (same rows, same order across every concurrency and run), so results line up example by example.
+
+```bash
+tokenomics completion \
+  --replay-dataset \
+  --dataset-config examples/dataset_configs/humaneval.json \
+  --model your-model \
+  --max-concurrency 1,2,4,8,16,32 --max-tokens 1024 \
+  --results-dir results/humaneval/
+```
+
+- Sustained mode only (`--max-concurrency`); `--scenario` is ignored.
+- `--num-prompts N` caps the walk to the first N rows (default: whole dataset).
+- List prompt columns (MT-Bench `prompt`, Arena-Hard `turns`) are reduced to the first turn's string — MT-Bench runs single-turn.
+
+Bundled configs under `examples/dataset_configs/`:
+
+| Config | Dataset | Domain |
+|--------|---------|--------|
+| `gsm8k.json` | `openai/gsm8k` main (test) | grade-school math |
+| `math500.json` | `HuggingFaceH4/MATH-500` (test) | competition math (MATH) |
+| `aime25.json` | `math-ai/aime25` (test) | competition math (AIME 2025) |
+| `mbpp.json` | `google-research-datasets/mbpp` sanitized (test) | code generation |
+| `humaneval.json` | `openai/openai_humaneval` (test) | code completion |
+| `lcb.json` | `livecodebench/code_generation_lite` release_v1 (test) | code generation (LiveCodeBench) |
+| `mtbench.json` | `HuggingFaceH4/mt_bench_prompts` (train) | multi-turn chat (first turn) |
+| `alpaca.json` | `tatsu-lab/alpaca_eval` (eval) | instruction following (AlpacaEval) |
+| `arena_hard.json` | `lmarena-ai/arena-hard-auto-v0.1` (train) | hard instruction following (Arena-Hard) |
+
+**`--ignore-eos`** makes every request generate exactly `--max-tokens` (EOS ignored), fixing output length so throughput isn't skewed by content-dependent token counts. Add it when comparing harnesses, servers, or configs; omit it for realistic, content-driven lengths. Supported by SGLang and vLLM — servers that don't implement it ignore the field, so it silently has no effect there.
+
 ### Key Options
 
 | Flag | Description |
 |------|-------------|
-| `--scenario` | Traffic pattern (required) |
+| `--scenario` | Traffic pattern (required unless `--replay-dataset`) |
+| `--replay-dataset` | Send each dataset row verbatim and walk the dataset at each concurrency level (ignores `--scenario`; sustained mode only) |
 | `--model` | Model name (required) |
 | `--api-base` | Server URL (default: `http://localhost:8000/v1`) |
 | `--batch-sizes` | Burst mode sweep points |
@@ -117,6 +159,7 @@ See `examples/dataset_configs/` for more examples.
 | `--num-prompts` | Prompts per sweep point in sustained mode |
 | `--num-runs` | Runs per sweep point (default: 3) |
 | `--max-tokens` | Max output tokens (default: 4096) |
+| `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang/vLLM). Fixes output length for clean cross-harness throughput comparison |
 | `-n` | Completions per request (default: 1) |
 | `--stream` | Enable SSE streaming for TTFT/per-token metrics |
 | `--dataset-config` | Path to dataset config (default: bundled AIME) |

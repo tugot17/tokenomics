@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "tatsu-lab/alpaca_eval",
+    "huggingface_kwargs": { "name": "alpaca_eval", "split": "eval", "trust_remote_code": true }
+  },
+  "prompt_column": "instruction",
+  "description": "AlpacaEval instructions (805 instruction-following prompts). Each instruction is sent verbatim. Use with --replay-dataset."
+}

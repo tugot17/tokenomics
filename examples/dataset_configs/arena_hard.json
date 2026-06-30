@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "lmarena-ai/arena-hard-auto-v0.1",
+    "huggingface_kwargs": { "split": "train", "trust_remote_code": true }
+  },
+  "prompt_column": "turns",
+  "description": "Arena-Hard-Auto v0.1 prompts (500 hard questions). The turns column is a list of {content}; the first turn's content is sent. Use with --replay-dataset."
+}

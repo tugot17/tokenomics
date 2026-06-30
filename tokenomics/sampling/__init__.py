@@ -6,7 +6,7 @@ statistical parameter generation from content sampling.
 """
 
 from .scenarios import Scenario, NormalDistribution, DeterministicDistribution, UniformDistribution
-from .sampler import TextSampler, UserRequest, use_seed, derive_seed
+from .sampler import TextSampler, DatasetReplaySampler, UserRequest, use_seed, derive_seed
 from .dataset import DatasetConfig, DatasetLoader
 
 __all__ = [
@@ -15,6 +15,7 @@ __all__ = [
     'DeterministicDistribution',
     'UniformDistribution',
     'TextSampler',
+    'DatasetReplaySampler',
     'UserRequest',
     'use_seed',
     'derive_seed',

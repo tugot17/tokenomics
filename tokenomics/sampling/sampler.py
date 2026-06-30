@@ -72,8 +72,53 @@ class TextSampler:
             return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
         except Exception:
             return int(len(text.split()) * 1.3)
-    
-    
+
+
+class DatasetReplaySampler:
+    """Sends each dataset row verbatim as one request, walking the dataset in order.
+
+    The prompt *is* the dataset row
+    (no scenario-driven length padding, no concatenation of random snippets), and
+    generation runs to natural EOS capped by ``max_tokens``. Rows are returned
+    deterministically in dataset order, so the prompt set is identical across every
+    concurrency level and run -- which is what makes throughput comparable example
+    by example. It implements the same ``sample_batch`` / ``tokenizer`` surface as
+    :class:`TextSampler`, so it is a drop-in replacement in the benchmark loop.
+    """
+
+    def __init__(self, tokenizer_name: str, dataset_loader: DatasetLoader, max_tokens: int):
+        self.tokenizer = Tokenizer.from_pretrained(tokenizer_name)
+        self.dataset_loader = dataset_loader
+        self.max_tokens = max_tokens
+        self.rows = dataset_loader.get_all_texts()
+        if not self.rows:
+            raise ValueError("Dataset is empty")
+
+    def _count_tokens(self, text: str) -> int:
+        try:
+            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
+        except Exception:
+            return int(len(text.split()) * 1.3)
+
+    def sample_batch(self, scenario: Scenario, batch_size: int) -> List[UserRequest]:
+        """Return the first ``batch_size`` rows verbatim, in dataset order.
+
+        ``scenario`` is accepted for interface compatibility with
+        :class:`TextSampler` but ignored -- the row content defines the prompt.
+        If ``batch_size`` exceeds the dataset size it is capped (we walk the
+        dataset once, never cycle). ``target_output_tokens`` carries max_tokens
+        so the benchmark loop's ``min(args.max_tokens, target_output_tokens)``
+        resolves to max_tokens; generation still stops at EOS (unless
+        --ignore-eos).
+        """
+        out = []
+        for i in range(min(batch_size, len(self.rows))):
+            text = self.rows[i]
+            n_tok = self._count_tokens(text)
+            out.append(UserRequest(text, self.max_tokens, n_tok, n_tok, self.max_tokens))
+        return out
+
+
 @contextlib.contextmanager
 def use_seed(seed: int):
     state = random.getstate()

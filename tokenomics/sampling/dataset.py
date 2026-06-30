@@ -13,6 +13,25 @@ from typing import List, Dict, Any, Optional, Union
 from datasets import load_dataset
 
 
+def _coerce_prompt(value: Any) -> str:
+    """Reduce a prompt-column value to a single string.
+
+    Handles plain strings, multi-turn list columns (e.g. MT-Bench ``prompt`` is
+    a list of turn strings -> first turn), and list-of-dict columns (e.g.
+    Arena-Hard ``turns`` is ``[{"content": ...}]`` -> first turn's content).
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("content") or value.get("value") or value.get("text") or ""
+    if isinstance(value, list) and value:
+        first = value[0]
+        if isinstance(first, dict):
+            return first.get("content") or first.get("value") or first.get("text") or ""
+        return str(first)
+    return str(value) if value is not None else ""
+
+
 class DatasetConfig:
     """Configuration for dataset loading."""
     
@@ -108,17 +127,23 @@ class DatasetLoader:
         
         try:
             dataset = load_dataset(dataset_name, **kwargs)
-            
-            # Handle different dataset structures
-            if "train" in dataset:
-                data_split = dataset["train"]
+
+            # load_dataset returns a bare Dataset when `split` is given, or a
+            # DatasetDict (split name -> Dataset) otherwise. Handle both.
+            if hasattr(dataset, "keys"):
+                if "train" in dataset:
+                    data_split = dataset["train"]
+                else:
+                    data_split = dataset[list(dataset.keys())[0]]
             else:
-                data_split = dataset[list(dataset.keys())[0]]
-            
+                data_split = dataset
+
             for item in data_split:
                 if self.config.prompt_column in item:
-                    self.data.append(item[self.config.prompt_column])
-                    
+                    text = _coerce_prompt(item[self.config.prompt_column])
+                    if text:
+                        self.data.append(text)
+
         except Exception as e:
             raise RuntimeError(f"Failed to load HuggingFace dataset: {e}")
     
