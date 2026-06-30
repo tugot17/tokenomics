@@ -115,25 +115,22 @@ See `examples/dataset_configs/` for more examples.
 
 ### Dataset Replay Mode
 
-By default the benchmark *synthesizes* prompts — it concatenates random dataset snippets until it hits the scenario's input-token budget. That's fine for raw throughput curves at controlled input/output lengths, but the prompts are stitched-together fragments, so the generated content isn't representative of any real workload. When you want throughput on the *actual* examples in a dataset — and to compare one dataset against another — use replay mode.
-
-`--replay-dataset` sends real examples one at a time:
-
-- Each dataset row is sent **verbatim as one request** — no concatenation, no length padding.
-- The benchmark **walks the dataset in order**, generating to natural EOS capped by `--max-tokens`.
-- The prompt set is **pinned**: identical rows in the same order across every concurrency level and run, so results are comparable example by example.
+`--replay-dataset` sends each dataset row **verbatim as one request** and walks the dataset in order at each concurrency level, instead of synthesizing prompts to the scenario's token budget. Use it to benchmark on real examples and compare datasets. The prompt set is pinned (same rows, same order across every concurrency and run), so results line up example by example.
 
 ```bash
 tokenomics completion \
   --replay-dataset \
   --dataset-config examples/dataset_configs/humaneval.json \
   --model your-model \
-  --max-concurrency 1,2,4,8,16,32 \
-  --max-tokens 1024 \
+  --max-concurrency 1,2,4,8,16,32 --max-tokens 1024 \
   --results-dir results/humaneval/
 ```
 
-Bundled real-dataset configs for replay (under `examples/dataset_configs/`) — common code, math, and QA evaluation sets, each sending its prompt column verbatim:
+- Sustained mode only (`--max-concurrency`); `--scenario` is ignored.
+- `--num-prompts N` caps the walk to the first N rows (default: whole dataset).
+- List prompt columns (MT-Bench `prompt`, Arena-Hard `turns`) are reduced to the first turn's string — MT-Bench runs single-turn.
+
+Bundled configs under `examples/dataset_configs/`:
 
 | Config | Dataset | Domain |
 |--------|---------|--------|
@@ -147,32 +144,7 @@ Bundled real-dataset configs for replay (under `examples/dataset_configs/`) — 
 | `alpaca.json` | `tatsu-lab/alpaca_eval` (eval) | instruction following (AlpacaEval) |
 | `arena_hard.json` | `lmarena-ai/arena-hard-auto-v0.1` (train) | hard instruction following (Arena-Hard) |
 
-A prompt column that holds a list (MT-Bench's `prompt`, Arena-Hard's `turns`) is reduced to a single string — the first turn (and its `content` field, for turn-dicts). MT-Bench is therefore benchmarked single-turn.
-
-Notes:
-
-- `--scenario` is **not used** in this mode (input length comes from the data); only `--max-tokens` bounds the output.
-- Requires `--max-concurrency` (sustained mode). Burst mode is rejected — it would walk a different slice of the dataset at each sweep point and break the comparison.
-- `--num-prompts N` caps the walk to the first `N` rows; the default is the whole dataset.
-- To compare datasets, run once per config and overlay the results with `tokenomics plot-completion ...`. To compare two servers or server configs, run the same matrix against each and overlay — tokenomics stays a pure OpenAI client and measures only what it observes over the wire.
-
-#### Fixed-length comparison (`--ignore-eos`)
-
-Natural-EOS replay (above) is the realistic measurement — report it as the model's throughput on a dataset. But it's the wrong tool when you need to **compare two harnesses, servers, or configs**: the *total* output token count then depends on the generated content, which drifts between runs. On models with **batch-non-invariant decode** (e.g. bf16 MoE on AMD), the same prompt set even produces different total tokens depending on how requests happen to batch — so two tools can report throughputs ~15–20% apart purely from generating different *amounts*, not from measuring differently.
-
-`--ignore-eos` removes that variable: every request generates **exactly `--max-tokens`**, so the workload is identical run-to-run and throughput reflects pure serving speed. Validated against [SpecForge](https://github.com/sgl-project/SpecForge)'s `bench_eagle3.py` on the same SGLang server (LFM2.5-8B-A1B, MI325X): with `--ignore-eos` the two agree within **1–3%** across concurrency 8/16/32; without it they diverged ~17%, entirely from batch-non-invariant token counts.
-
-```bash
-tokenomics completion \
-  --replay-dataset \
-  --dataset-config examples/dataset_configs/humaneval.json \
-  --model your-model \
-  --max-concurrency 8,16,32 \
-  --max-tokens 1024 --ignore-eos --temperature 0 \
-  --results-dir results/humaneval/
-```
-
-`--ignore-eos` is SGLang-specific (sent as a top-level request field). Use it for apples-to-apples throughput; omit it when you want realistic, content-driven generation lengths.
+**`--ignore-eos`** generates exactly `--max-tokens` per request (SGLang). Add it when comparing harnesses, servers, or configs: it fixes output length so throughput isn't skewed by content-dependent token counts — which, on batch-non-invariant models (bf16 MoE on AMD), can differ ~15–20% between runs. With it, tokenomics matches SpecForge's `bench_eagle3.py` within 1–3% (LFM2.5-8B-A1B, MI325X, concurrency 8/16/32). Omit it for realistic, content-driven lengths.
 
 ### Key Options
 
