@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "google-research-datasets/mbpp",
+    "huggingface_kwargs": { "name": "sanitized", "split": "test" }
+  },
+  "prompt_column": "prompt",
+  "description": "MBPP sanitized split. Each row's natural-language task prompt is sent verbatim. Use with --replay-dataset."
+}

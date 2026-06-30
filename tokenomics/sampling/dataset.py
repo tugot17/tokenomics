@@ -108,13 +108,17 @@ class DatasetLoader:
         
         try:
             dataset = load_dataset(dataset_name, **kwargs)
-            
-            # Handle different dataset structures
-            if "train" in dataset:
-                data_split = dataset["train"]
+
+            # load_dataset returns a bare Dataset when `split` is given, or a
+            # DatasetDict (split name -> Dataset) otherwise. Handle both.
+            if hasattr(dataset, "keys"):
+                if "train" in dataset:
+                    data_split = dataset["train"]
+                else:
+                    data_split = dataset[list(dataset.keys())[0]]
             else:
-                data_split = dataset[list(dataset.keys())[0]]
-            
+                data_split = dataset
+
             for item in data_split:
                 if self.config.prompt_column in item:
                     self.data.append(item[self.config.prompt_column])

@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "HuggingFaceH4/MATH-500",
+    "huggingface_kwargs": { "split": "test" }
+  },
+  "prompt_column": "problem",
+  "description": "MATH-500 competition math problems (test split). Each row's problem statement is sent verbatim. Pair with --replay-dataset."
+}

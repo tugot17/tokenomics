@@ -23,7 +23,7 @@ NS_PER_SECOND = 1_000_000_000
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from .sampling import Scenario, TextSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .sampling import Scenario, TextSampler, DatasetReplaySampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
 from .io import round_floats, atomic_write_json
 
 
@@ -274,6 +274,10 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
         "temperature": temperature,
         "stream": stream,
     }
+    if request_data.get("ignore_eos"):
+        # SGLang-specific: generate exactly max_tokens, ignoring EOS. Makes the
+        # output length fixed/identical across runs for clean throughput parity.
+        payload["ignore_eos"] = True
     if stream:
         payload["stream_options"] = {"include_usage": True}
     if n > 1:
@@ -810,7 +814,9 @@ def main():
     parser.add_argument("--model", required=True, help="Model name")
     
     # Scenario configuration
-    parser.add_argument("--scenario", required=True, help="Scenario string (e.g., 'N(480,240)/(300,150)', 'D(100,100)')")
+    parser.add_argument("--scenario", default=None, help="Scenario string (e.g., 'N(480,240)/(300,150)', 'D(100,100)'). Required unless --replay-dataset is set.")
+    parser.add_argument("--replay-dataset", action="store_true",
+                        help="Send each dataset row verbatim as one request and walk the whole dataset at each concurrency level, instead of synthesizing prompts to the scenario's token budget. Ignores the scenario's input length; output is capped by --max-tokens and otherwise runs to natural EOS. Requires --max-concurrency (sustained mode).")
     parser.add_argument("--dataset-config", default=None, help="Path to dataset configuration JSON (defaults to bundled AIME dataset)")
     parser.add_argument("--tokenizer", help="Tokenizer name (defaults to model name)")
     parser.add_argument("--seed", type=int, default=42, help="Base seed for deterministic sampling")
@@ -825,6 +831,7 @@ def main():
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
     parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
+    parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
@@ -855,6 +862,15 @@ def main():
         execution_mode = "burst"
         sweep_values = [int(x.strip()) for x in (args.batch_sizes or "1,2,4,8").split(",")]
 
+    # Replay mode walks a fixed dataset at each concurrency level; the scenario is
+    # irrelevant (the row content is the prompt) and burst mode would walk a
+    # different prefix per sweep value, breaking the apples-to-apples comparison.
+    if args.replay_dataset:
+        if execution_mode != "sustained":
+            parser.error("--replay-dataset requires --max-concurrency (sustained mode)")
+    elif args.scenario is None:
+        parser.error("--scenario is required unless --replay-dataset is set")
+
     # Create LoRA config from command-line arguments
     lora_config = None
     if args.lora_strategy and args.lora_names:
@@ -868,7 +884,7 @@ def main():
         print(f"🔧 LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs, base_model_ratio={lora_config.base_model_ratio}")
 
     # Initialize scenario and dataset
-    scenario = Scenario.from_string(args.scenario)
+    scenario = None if args.replay_dataset else Scenario.from_string(args.scenario)
     if args.dataset_config is None:
         from tokenomics import EXAMPLES_DIR
         args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
@@ -877,7 +893,10 @@ def main():
 
     tokenizer_name = args.tokenizer or args.model
 
-    text_sampler = TextSampler(tokenizer_name, dataset_loader)
+    if args.replay_dataset:
+        text_sampler = DatasetReplaySampler(tokenizer_name, dataset_loader, args.max_tokens)
+    else:
+        text_sampler = TextSampler(tokenizer_name, dataset_loader)
 
     def count_output_tokens(text: str) -> int:
         """Client-side output-token count used when the server omits usage."""
@@ -888,7 +907,10 @@ def main():
         except Exception:
             return int(len(text.split()) * 1.3)
 
-    print(f"📊 Initialized benchmark with scenario: {args.scenario}")
+    if args.replay_dataset:
+        print(f"📊 Initialized benchmark in dataset-replay mode (max_tokens={args.max_tokens})")
+    else:
+        print(f"📊 Initialized benchmark with scenario: {args.scenario}")
     print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
     print(f"⚙️  Execution mode: {execution_mode}")
     if lora_config:
@@ -900,6 +922,8 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "scenario": args.scenario,
+        "prompt_source": "dataset_replay" if args.replay_dataset else "scenario",
+        "max_tokens": args.max_tokens,
         "dataset_config": dataset_config.config,
         "api_base": args.api_base,
         "execution_mode": execution_mode,
@@ -931,7 +955,12 @@ def main():
     # Run benchmark for each sweep value
     for sweep_value in sweep_values:
         if execution_mode == "sustained":
-            num_prompts = args.num_prompts or max(64, 8 * sweep_value)
+            if args.replay_dataset:
+                # Fixed prompt set = the dataset (or first --num-prompts rows),
+                # identical across every concurrency level for a fair comparison.
+                num_prompts = min(args.num_prompts or len(dataset_loader), len(dataset_loader))
+            else:
+                num_prompts = args.num_prompts or max(64, 8 * sweep_value)
             max_concurrency = sweep_value
             print(f"\n🔄 Testing concurrency: {sweep_value} ({num_prompts} prompts)")
         else:
@@ -968,6 +997,8 @@ def main():
                 }
                 if lora_assignments:
                     request_dict["lora_name"] = lora_assignments[idx]
+                if args.ignore_eos:
+                    request_dict["ignore_eos"] = True
                 user_requests.append(request_dict)
 
             run_data = run_benchmark_batch(

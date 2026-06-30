@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "openai/openai_humaneval",
+    "huggingface_kwargs": { "split": "test" }
+  },
+  "prompt_column": "prompt",
+  "description": "HumanEval code-completion prompts. Use with --replay-dataset to benchmark on real examples one at a time."
+}

@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "openai/gsm8k",
+    "huggingface_kwargs": { "name": "main", "split": "test" }
+  },
+  "prompt_column": "question",
+  "description": "GSM8K grade-school math word problems (test split). Each row's question is sent verbatim. Pair with --replay-dataset."
+}
