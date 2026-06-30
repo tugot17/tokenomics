@@ -275,8 +275,9 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
         "stream": stream,
     }
     if request_data.get("ignore_eos"):
-        # SGLang-specific: generate exactly max_tokens, ignoring EOS. Makes the
-        # output length fixed/identical across runs for clean throughput parity.
+        # Generate exactly max_tokens, ignoring EOS (supported by SGLang/vLLM;
+        # ignored by servers that don't implement it). Fixes output length so
+        # throughput comparisons aren't skewed by content-dependent token counts.
         payload["ignore_eos"] = True
     if stream:
         payload["stream_options"] = {"include_usage": True}
@@ -831,7 +832,7 @@ def main():
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
     parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
     parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
-    parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang). Fixes output length for clean throughput comparison.")
+    parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")

@@ -144,7 +144,7 @@ Bundled configs under `examples/dataset_configs/`:
 | `alpaca.json` | `tatsu-lab/alpaca_eval` (eval) | instruction following (AlpacaEval) |
 | `arena_hard.json` | `lmarena-ai/arena-hard-auto-v0.1` (train) | hard instruction following (Arena-Hard) |
 
-**`--ignore-eos`** generates exactly `--max-tokens` per request (SGLang). Add it when comparing harnesses, servers, or configs: it fixes output length so throughput isn't skewed by content-dependent token counts — which, on batch-non-invariant models (bf16 MoE on AMD), can differ ~15–20% between runs. With it, tokenomics matches SpecForge's `bench_eagle3.py` within 1–3% (LFM2.5-8B-A1B, MI325X, concurrency 8/16/32). Omit it for realistic, content-driven lengths.
+**`--ignore-eos`** makes every request generate exactly `--max-tokens` (EOS ignored), fixing output length so throughput isn't skewed by content-dependent token counts. Add it when comparing harnesses, servers, or configs; omit it for realistic, content-driven lengths. Supported by SGLang and vLLM — servers that don't implement it ignore the field, so it silently has no effect there.
 
 ### Key Options
 
@@ -159,7 +159,7 @@ Bundled configs under `examples/dataset_configs/`:
 | `--num-prompts` | Prompts per sweep point in sustained mode |
 | `--num-runs` | Runs per sweep point (default: 3) |
 | `--max-tokens` | Max output tokens (default: 4096) |
-| `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang). Fixes output length for clean cross-harness throughput comparison |
+| `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang/vLLM). Fixes output length for clean cross-harness throughput comparison |
 | `-n` | Completions per request (default: 1) |
 | `--stream` | Enable SSE streaming for TTFT/per-token metrics |
 | `--dataset-config` | Path to dataset config (default: bundled AIME) |
