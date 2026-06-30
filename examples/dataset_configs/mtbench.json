@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "HuggingFaceH4/mt_bench_prompts",
+    "huggingface_kwargs": { "split": "train" }
+  },
+  "prompt_column": "prompt",
+  "description": "MT-Bench prompts (80 multi-turn questions). The prompt column is a list of turns; the first turn is sent (single-turn benchmark). Use with --replay-dataset."
+}

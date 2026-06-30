@@ -1,0 +1,9 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "livecodebench/code_generation_lite",
+    "huggingface_kwargs": { "name": "release_v1", "split": "test", "trust_remote_code": true }
+  },
+  "prompt_column": "question_content",
+  "description": "LiveCodeBench code-generation problems (release_v1). Each problem statement is sent verbatim. Use with --replay-dataset."
+}

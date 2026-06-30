@@ -137,10 +137,17 @@ Bundled real-dataset configs for replay (under `examples/dataset_configs/`) — 
 
 | Config | Dataset | Domain |
 |--------|---------|--------|
-| `humaneval.json` | `openai/openai_humaneval` (test) | code completion |
-| `mbpp.json` | `google-research-datasets/mbpp` sanitized (test) | code generation |
 | `gsm8k.json` | `openai/gsm8k` main (test) | grade-school math |
-| `math500.json` | `HuggingFaceH4/MATH-500` (test) | competition math |
+| `math500.json` | `HuggingFaceH4/MATH-500` (test) | competition math (MATH) |
+| `aime25.json` | `math-ai/aime25` (test) | competition math (AIME 2025) |
+| `mbpp.json` | `google-research-datasets/mbpp` sanitized (test) | code generation |
+| `humaneval.json` | `openai/openai_humaneval` (test) | code completion |
+| `lcb.json` | `livecodebench/code_generation_lite` release_v1 (test) | code generation (LiveCodeBench) |
+| `mtbench.json` | `HuggingFaceH4/mt_bench_prompts` (train) | multi-turn chat (first turn) |
+| `alpaca.json` | `tatsu-lab/alpaca_eval` (eval) | instruction following (AlpacaEval) |
+| `arena_hard.json` | `lmarena-ai/arena-hard-auto-v0.1` (train) | hard instruction following (Arena-Hard) |
+
+A prompt column that holds a list (MT-Bench's `prompt`, Arena-Hard's `turns`) is reduced to a single string — the first turn (and its `content` field, for turn-dicts). MT-Bench is therefore benchmarked single-turn.
 
 Notes:
 
