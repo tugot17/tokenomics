@@ -929,7 +929,11 @@ def main():
             from tokenomics import EXAMPLES_DIR
             args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
         dataset_config = DatasetConfig.from_file(args.dataset_config)
-        dataset_loader = DatasetLoader(dataset_config)
+        # In replay mode we walk the first --num-prompts rows, so cap loading
+        # there (avoids encoding a whole large vision dataset). Scenario mode
+        # samples randomly and keeps the full dataset.
+        loader_limit = args.num_prompts if args.replay_dataset else None
+        dataset_loader = DatasetLoader(dataset_config, limit=loader_limit)
 
     tokenizer_name = args.tokenizer or args.model
 
