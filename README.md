@@ -158,7 +158,7 @@ tokenomics completion \
   --results-dir results/vl_512x5/
 ```
 
-Image runs use short, deterministic defaults (the images dominate, the text is padding): a fixed filler prompt of `--input-tokens` (default 32), `--max-tokens` 32 output, and greedy decoding (temperature 0). Override any of them explicitly.
+Image runs default to a short workload (the images dominate, the text is padding): a fixed filler prompt of `--input-tokens` (default 32) and `--max-tokens` 32 output. Override either explicitly, and add `--temperature 0` / `--ignore-eos` if you want fully reproducible generation.
 
 - `--input-tokens` sets the filler length (`0` = images only). `--image-size` is `N` for a square or `WxH` for a rectangle — e.g. `--image-size 512` (512×512) or `--image-size 1024x768` (width × height, lowercase `x`, no spaces).
 - Synthetic images are random-noise PNGs built on the fly, seeded per request so they're **unique** (defeating the server's prefix/multimodal caches) yet reproducible. Note noise is nearly incompressible (~MBs at 1024×1024), so keep image size/count sane or the payload dominates.
@@ -182,7 +182,7 @@ Image runs use short, deterministic defaults (the images dominate, the text is p
 | `--num-images` | Attach N synthetic (random-noise) images to each request (0 = text-only, default) |
 | `--image-size` | Synthetic image size: `N` or `WxH` (default: 512; used when `--num-images` > 0) |
 | `--input-tokens` | Filler-text length for image runs without `--scenario` (default: 32; 0 = images only) |
-| `--temperature` | Sampling temperature (default: 0.7; 0.0 for image runs) |
+| `--temperature` | Sampling temperature (default: 0.7) |
 | `-n` | Completions per request (default: 1) |
 | `--stream` | Enable SSE streaming for TTFT/per-token metrics |
 | `--dataset-config` | Path to dataset config (default: bundled AIME) |

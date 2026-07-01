@@ -23,50 +23,8 @@ NS_PER_SECOND = 1_000_000_000
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from .sampling import Scenario, TextSampler, DatasetReplaySampler, FixedFillerSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .sampling import Scenario, TextSampler, DatasetReplaySampler, FixedFillerSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed, build_synthetic_image_uris
 from .io import round_floats, atomic_write_json
-
-
-def _parse_image_size(spec: str) -> tuple:
-    """Parse an image size spec: '512' -> (512, 512), '640x480' -> (640, 480)."""
-    parts = str(spec).lower().split("x")
-    if len(parts) == 1:
-        w = h = int(parts[0])
-    elif len(parts) == 2:
-        w, h = int(parts[0]), int(parts[1])
-    else:
-        raise ValueError(f"Invalid --image-size '{spec}'; use N or WxH")
-    return w, h
-
-
-def build_synthetic_image_uris(size: str, count: int, start_id: int = 0) -> List[str]:
-    """Return `count` random-noise PNG images (as base64 ``data:`` URIs).
-
-    Each image is filled with random pixels seeded by a unique id (``start_id +
-    k``), so it is deterministic (reproducible across runs) yet unique across the
-    whole benchmark — which keeps the server's prefix and multimodal caches from
-    deduplicating requests and undercounting vision-encoder compute. Pixel
-    *content* doesn't change VL compute (patch count is fixed by size), but note
-    noise is nearly incompressible, so payloads are much larger than a flat
-    image (~MBs at 1024x1024) — keep image size/count sane for the transport.
-    """
-    if count <= 0:
-        return []
-    import base64
-    import io as _io
-    import numpy as np
-    from PIL import Image
-
-    w, h = _parse_image_size(size)
-    uris = []
-    for k in range(count):
-        rng = np.random.default_rng(start_id + k)  # deterministic, unique per image
-        arr = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
-        buf = _io.BytesIO()
-        Image.fromarray(arr, "RGB").save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-        uris.append(f"data:image/png;base64,{b64}")
-    return uris
 
 
 def _safe_mean(values):
@@ -886,7 +844,7 @@ def main():
                         help="Total prompts per sweep point in sustained mode (default: max(64, 8*concurrency))")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
-    parser.add_argument("--temperature", type=float, default=None, help="Temperature (default: 0.7, or 0.0 for image runs)")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (default: 0.7)")
     parser.add_argument("--max-tokens", type=int, default=None, help="Upper bound on max_tokens per request (default: 4096, or 32 for image runs)")
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
@@ -933,13 +891,11 @@ def main():
     elif args.scenario is None and args.num_images == 0:
         parser.error("--scenario is required unless --replay-dataset or --num-images is set")
 
-    # Image runs default to short, deterministic settings (the text is just
-    # padding and the images dominate): a fixed filler prompt of --input-tokens,
-    # 32 output tokens, and greedy decoding. Text-only runs keep their defaults.
+    # Image runs default to short output (the text is just padding and the
+    # images dominate): 32 tokens vs 4096 for text-only. Temperature is not
+    # mode-dependent — pass --temperature 0 / --ignore-eos for reproducibility.
     if args.max_tokens is None:
         args.max_tokens = 32 if args.num_images > 0 else 4096
-    if args.temperature is None:
-        args.temperature = 0.0 if args.num_images > 0 else 0.7
 
     # Create LoRA config from command-line arguments
     lora_config = None

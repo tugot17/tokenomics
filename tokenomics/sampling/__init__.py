@@ -8,6 +8,7 @@ statistical parameter generation from content sampling.
 from .scenarios import Scenario, NormalDistribution, DeterministicDistribution, UniformDistribution
 from .sampler import TextSampler, DatasetReplaySampler, FixedFillerSampler, UserRequest, use_seed, derive_seed
 from .dataset import DatasetConfig, DatasetLoader
+from .images import build_synthetic_image_uris, parse_image_size
 
 __all__ = [
     'Scenario',
@@ -21,5 +22,7 @@ __all__ = [
     'use_seed',
     'derive_seed',
     'DatasetConfig',
-    'DatasetLoader'
+    'DatasetLoader',
+    'build_synthetic_image_uris',
+    'parse_image_size',
 ]
