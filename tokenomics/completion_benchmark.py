@@ -819,6 +819,49 @@ def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
     print(" done")
 
 
+def build_prompt_source(args):
+    """Resolve the prompt source and build the sampler (+ dataset/scenario).
+
+    Returns ``(prompt_source, text_sampler, scenario, dataset_loader,
+    dataset_config)`` where ``prompt_source`` is one of ``dataset_replay``,
+    ``fixed_filler`` (image runs without an explicit --scenario), or
+    ``scenario``. Centralizes the mode decision so the rest of main() reads one
+    value instead of re-deriving the condition.
+    """
+    if args.replay_dataset:
+        prompt_source = "dataset_replay"
+    elif args.num_images > 0 and args.scenario is None:
+        prompt_source = "fixed_filler"
+    else:
+        prompt_source = "scenario"
+
+    scenario = Scenario.from_string(args.scenario) if prompt_source == "scenario" else None
+
+    # Fixed-filler runs need no dataset; the others load one (default: AIME).
+    dataset_config = None
+    dataset_loader = None
+    if prompt_source != "fixed_filler":
+        if args.dataset_config is None:
+            from tokenomics import EXAMPLES_DIR
+            args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
+        dataset_config = DatasetConfig.from_file(args.dataset_config)
+        # Replay walks the first --num-prompts rows, so cap loading there (avoids
+        # encoding a whole large vision dataset). Scenario mode samples randomly
+        # and keeps the full dataset.
+        limit = args.num_prompts if prompt_source == "dataset_replay" else None
+        dataset_loader = DatasetLoader(dataset_config, limit=limit)
+
+    tokenizer_name = args.tokenizer or args.model
+    if prompt_source == "dataset_replay":
+        text_sampler = DatasetReplaySampler(tokenizer_name, dataset_loader, args.max_tokens)
+    elif prompt_source == "fixed_filler":
+        text_sampler = FixedFillerSampler(tokenizer_name, args.input_tokens, args.max_tokens)
+    else:
+        text_sampler = TextSampler(tokenizer_name, dataset_loader)
+
+    return prompt_source, text_sampler, scenario, dataset_loader, dataset_config
+
+
 def main():
     """Main function to run the enhanced benchmark."""
     parser = argparse.ArgumentParser(description="OAI server benchmark with scenario-based sampling")
@@ -916,33 +959,7 @@ def main():
         )
         print(f"🔧 LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs, base_model_ratio={lora_config.base_model_ratio}")
 
-    # Image runs with no explicit --scenario use a deterministic fixed filler
-    # (no dataset needed); a given --scenario still routes through TextSampler.
-    use_filler = args.num_images > 0 and args.scenario is None and not args.replay_dataset
-
-    # Initialize scenario and dataset
-    scenario = None if (args.replay_dataset or use_filler) else Scenario.from_string(args.scenario)
-    dataset_config = None
-    dataset_loader = None
-    if not use_filler:
-        if args.dataset_config is None:
-            from tokenomics import EXAMPLES_DIR
-            args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
-        dataset_config = DatasetConfig.from_file(args.dataset_config)
-        # In replay mode we walk the first --num-prompts rows, so cap loading
-        # there (avoids encoding a whole large vision dataset). Scenario mode
-        # samples randomly and keeps the full dataset.
-        loader_limit = args.num_prompts if args.replay_dataset else None
-        dataset_loader = DatasetLoader(dataset_config, limit=loader_limit)
-
-    tokenizer_name = args.tokenizer or args.model
-
-    if args.replay_dataset:
-        text_sampler = DatasetReplaySampler(tokenizer_name, dataset_loader, args.max_tokens)
-    elif use_filler:
-        text_sampler = FixedFillerSampler(tokenizer_name, args.input_tokens, args.max_tokens)
-    else:
-        text_sampler = TextSampler(tokenizer_name, dataset_loader)
+    prompt_source, text_sampler, scenario, dataset_loader, dataset_config = build_prompt_source(args)
 
     def count_output_tokens(text: str) -> int:
         """Client-side output-token count used when the server omits usage."""
@@ -951,12 +968,12 @@ def main():
     if args.num_images > 0:
         print(f"🖼️  Attaching {args.num_images} synthetic image(s) of size {args.image_size} to each request (unique per request)")
 
-    if args.replay_dataset:
-        print(f"📊 Initialized benchmark in dataset-replay mode (max_tokens={args.max_tokens})")
-    elif use_filler:
-        print(f"📊 Initialized benchmark with fixed filler ({args.input_tokens} input tokens, max_tokens={args.max_tokens}, temperature={args.temperature})")
-    else:
-        print(f"📊 Initialized benchmark with scenario: {args.scenario}")
+    source_msg = {
+        "dataset_replay": f"dataset-replay mode (max_tokens={args.max_tokens})",
+        "fixed_filler": f"fixed filler ({args.input_tokens} input tokens, max_tokens={args.max_tokens}, temperature={args.temperature})",
+        "scenario": f"scenario: {args.scenario}",
+    }[prompt_source]
+    print(f"📊 Initialized benchmark with {source_msg}")
     if dataset_loader is not None:
         print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
     print(f"⚙️  Execution mode: {execution_mode}")
@@ -969,11 +986,11 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "scenario": args.scenario,
-        "prompt_source": "dataset_replay" if args.replay_dataset else ("fixed_filler" if use_filler else "scenario"),
+        "prompt_source": prompt_source,
         "max_tokens": args.max_tokens,
         "num_images": args.num_images,
         "image_size": args.image_size if args.num_images > 0 else None,
-        "input_tokens": args.input_tokens if use_filler else None,
+        "input_tokens": args.input_tokens if prompt_source == "fixed_filler" else None,
         "dataset_config": dataset_config.config if dataset_config is not None else None,
         "api_base": args.api_base,
         "execution_mode": execution_mode,
