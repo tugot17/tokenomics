@@ -86,6 +86,20 @@ Bundled configs under `examples/dataset_configs/`:
 | `alpaca.json` | `tatsu-lab/alpaca_eval` (eval) | instruction following (AlpacaEval) |
 | `arena_hard.json` | `lmarena-ai/arena-hard-auto-v0.1` (train) | hard instruction following (Arena-Hard) |
 
+**Vision replay:** a config with an `image_column` (in addition to `prompt_column`) replays real image+text examples — each row's image(s) are attached to the request. This is the realistic VL workload (real prompts + real images, generating to natural EOS), e.g. for speculative-decoding evaluation. Bundled vision configs:
+
+| Config | Dataset | Domain |
+|--------|---------|--------|
+| `chartqa.json` | `lmms-lab/ChartQA` (test) | chart question answering |
+| `vqa_rad.json` | `flaviagiammarino/vqa-rad` (test) | radiology visual QA |
+| `docvqa.json` | `lmms-lab/DocVQA` (validation) | document-image QA |
+
+```bash
+tokenomics completion --model your-vl-model \
+  --replay-dataset --dataset-config examples/dataset_configs/chartqa.json \
+  --max-concurrency 1,2,4,8,16 --results-dir results/chartqa/
+```
+
 #### Images (`--num-images`)
 
 Attach images to any run — sent as OpenAI content parts (`image_url` base64 `data:` URIs, accepted by SGLang and vLLM) — turning it into a VL benchmark. Metrics and plotting are unchanged.
@@ -114,7 +128,7 @@ A JSON file with a `source` and (usually) a `prompt_column`. File paths are reso
   "prompt_column": "question" }
 ```
 
-`source.type` is `huggingface`, `file` (`.txt`/`.csv`/`.json`), or `aime` (bundled shortcut). See `examples/dataset_configs/` for more.
+`source.type` is `huggingface`, `file` (`.txt`/`.csv`/`.json`), or `aime` (bundled shortcut). Add an `image_column` (alongside `prompt_column`) to replay a vision dataset — its images (embedded PIL, `{bytes/path}`, or file paths) are encoded and attached per request. See `examples/dataset_configs/` for more.
 
 ### Output length & reproducibility
 

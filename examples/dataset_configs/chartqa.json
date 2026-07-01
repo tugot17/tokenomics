@@ -1,0 +1,10 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "lmms-lab/ChartQA",
+    "huggingface_kwargs": { "split": "test" }
+  },
+  "prompt_column": "question",
+  "image_column": "image",
+  "description": "ChartQA (chart question answering), one chart image + question per row. Vision replay: use with --replay-dataset."
+}

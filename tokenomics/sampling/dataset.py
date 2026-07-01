@@ -41,6 +41,8 @@ class DatasetConfig:
         self.source_type = config_dict.get("source", {}).get("type", "file")
         self.source_path = config_dict.get("source", {}).get("path", "")
         self.prompt_column = config_dict.get("prompt_column", "text")
+        # Optional image column for multimodal (VL) replay datasets.
+        self.image_column = config_dict.get("image_column")
 
     @classmethod
     def from_file(cls, config_path: str) -> "DatasetConfig":
@@ -62,6 +64,8 @@ class DatasetLoader:
     def __init__(self, config: DatasetConfig):
         self.config = config
         self.data: List[str] = []
+        # Per-row image data URIs, aligned with self.data (empty for text datasets).
+        self.images: List[List[str]] = []
         self._load_data()
     
     def _load_data(self) -> None:
@@ -138,11 +142,17 @@ class DatasetLoader:
             else:
                 data_split = dataset
 
+            img_col = self.config.image_column
+            if img_col:
+                from .images import image_value_to_uris
             for item in data_split:
                 if self.config.prompt_column in item:
                     text = _coerce_prompt(item[self.config.prompt_column])
-                    if text:
-                        self.data.append(text)
+                    if not text and not img_col:
+                        continue
+                    self.data.append(text)
+                    if img_col:
+                        self.images.append(image_value_to_uris(item.get(img_col)))
 
         except Exception as e:
             raise RuntimeError(f"Failed to load HuggingFace dataset: {e}")
@@ -168,7 +178,11 @@ class DatasetLoader:
     def get_all_texts(self) -> List[str]:
         """Get all texts from the dataset."""
         return self.data.copy()
-    
+
+    def get_all_images(self) -> List[List[str]]:
+        """Per-row image ``data:`` URIs, aligned with get_all_texts (empty if none)."""
+        return self.images.copy()
+
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
         return len(self.data)

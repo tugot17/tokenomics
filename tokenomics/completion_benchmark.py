@@ -1059,7 +1059,10 @@ def main():
                     request_dict["lora_name"] = lora_assignments[idx]
                 if args.ignore_eos:
                     request_dict["ignore_eos"] = True
-                if args.num_images > 0:
+                if request.images:
+                    # Real images from a vision replay dataset (already unique).
+                    request_dict["images"] = request.images
+                elif args.num_images > 0:
                     uid = req_uid
                     req_uid += 1
                     # Unique text prefix + unique images so each request is a

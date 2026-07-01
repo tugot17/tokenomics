@@ -7,7 +7,7 @@ import warnings
 import hashlib
 import contextlib
 import numpy as np
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 from tokenizers import Tokenizer
 
 from .scenarios import Scenario
@@ -20,6 +20,7 @@ class UserRequest(NamedTuple):
     actual_input_tokens: int
     target_input_tokens: int
     target_output_tokens: int
+    images: Optional[List[str]] = None  # per-request image data URIs (VL replay)
 
 
 class TextSampler:
@@ -91,6 +92,7 @@ class DatasetReplaySampler:
         self.dataset_loader = dataset_loader
         self.max_tokens = max_tokens
         self.rows = dataset_loader.get_all_texts()
+        self.images = dataset_loader.get_all_images()  # [] for text-only datasets
         if not self.rows:
             raise ValueError("Dataset is empty")
 
@@ -115,7 +117,8 @@ class DatasetReplaySampler:
         for i in range(min(batch_size, len(self.rows))):
             text = self.rows[i]
             n_tok = self._count_tokens(text)
-            out.append(UserRequest(text, self.max_tokens, n_tok, n_tok, self.max_tokens))
+            imgs = self.images[i] if i < len(self.images) else None
+            out.append(UserRequest(text, self.max_tokens, n_tok, n_tok, self.max_tokens, imgs))
         return out
 
 

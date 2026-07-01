@@ -8,10 +8,47 @@ form of synthetic request content.
 
 import base64
 import io
-from typing import List, Tuple
+import os
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+
+def _pil_to_uri(img: "Image.Image") -> str:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def image_value_to_uris(value: Any) -> List[str]:
+    """Coerce a dataset image-column value into a list of ``data:`` URIs.
+
+    Handles the shapes HuggingFace vision datasets produce: a decoded PIL image,
+    a ``{"bytes"/"path"}`` dict, a filesystem path, or a list of any of these
+    (multi-image rows). Unrecognized/empty values yield an empty list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        out: List[str] = []
+        for v in value:
+            out.extend(image_value_to_uris(v))
+        return out
+    # Decoded PIL image (the common HF Image-feature case)
+    if hasattr(value, "save"):
+        return [_pil_to_uri(value)]
+    # HF Image dict: {"bytes": ..., "path": ...}
+    if isinstance(value, dict):
+        if value.get("bytes"):
+            return [_pil_to_uri(Image.open(io.BytesIO(value["bytes"])))]
+        if value.get("path") and os.path.exists(value["path"]):
+            return [_pil_to_uri(Image.open(value["path"]))]
+        return []
+    # Filesystem path
+    if isinstance(value, str) and os.path.exists(value):
+        return [_pil_to_uri(Image.open(value))]
+    return []
 
 
 def parse_image_size(spec: str) -> Tuple[int, int]:
