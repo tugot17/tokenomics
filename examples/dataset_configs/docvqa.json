@@ -1,0 +1,10 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "lmms-lab/DocVQA",
+    "huggingface_kwargs": { "name": "DocVQA", "split": "validation" }
+  },
+  "prompt_column": "question",
+  "image_column": "image",
+  "description": "DocVQA (document-image visual QA), one document image + question per row. Vision replay: use with --replay-dataset."
+}

@@ -7,6 +7,7 @@ to work with the scenario-based parameter generation.
 
 import json
 import csv
+import itertools
 import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
@@ -41,6 +42,8 @@ class DatasetConfig:
         self.source_type = config_dict.get("source", {}).get("type", "file")
         self.source_path = config_dict.get("source", {}).get("path", "")
         self.prompt_column = config_dict.get("prompt_column", "text")
+        # Optional image column for multimodal (VL) replay datasets.
+        self.image_column = config_dict.get("image_column")
 
     @classmethod
     def from_file(cls, config_path: str) -> "DatasetConfig":
@@ -59,10 +62,19 @@ class DatasetConfig:
 class DatasetLoader:
     """Loads and manages dataset content for sampling."""
     
-    def __init__(self, config: DatasetConfig):
+    def __init__(self, config: DatasetConfig, limit: Optional[int] = None):
         self.config = config
+        # Stop after `limit` rows instead of materializing the whole dataset —
+        # avoids eagerly base64-encoding every image of a large vision dataset
+        # when the run only replays the first N rows. None = load everything.
+        self.limit = limit
         self.data: List[str] = []
+        # Per-row image data URIs, aligned with self.data (empty for text datasets).
+        self.images: List[List[str]] = []
         self._load_data()
+
+    def _reached_limit(self) -> bool:
+        return self.limit is not None and len(self.data) >= self.limit
     
     def _load_data(self) -> None:
         """Load data based on configuration."""
@@ -98,23 +110,31 @@ class DatasetLoader:
             for row in reader:
                 if self.config.prompt_column in row:
                     self.data.append(row[self.config.prompt_column])
-    
+                    if self._reached_limit():
+                        break
+
     def _load_from_json(self, file_path: Path) -> None:
         """Load data from JSON file."""
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
         if isinstance(data, list):
             for item in data:
                 if isinstance(item, dict) and self.config.prompt_column in item:
                     self.data.append(item[self.config.prompt_column])
                 elif isinstance(item, str):
                     self.data.append(item)
-    
+                if self._reached_limit():
+                    break
+
     def _load_from_text(self, file_path: Path) -> None:
         """Load data from text file (one line per sample)."""
         with open(file_path, 'r', encoding='utf-8') as f:
-            self.data = [line.strip() for line in f if line.strip()]
+            lines = (line.strip() for line in f if line.strip())
+            if self.limit is not None:
+                self.data = list(itertools.islice(lines, self.limit))
+            else:
+                self.data = list(lines)
     
     def _load_from_huggingface(self) -> None:
         """Load data from HuggingFace dataset."""
@@ -138,11 +158,19 @@ class DatasetLoader:
             else:
                 data_split = dataset
 
+            img_col = self.config.image_column
+            if img_col:
+                from .images import image_value_to_uris
             for item in data_split:
                 if self.config.prompt_column in item:
                     text = _coerce_prompt(item[self.config.prompt_column])
-                    if text:
-                        self.data.append(text)
+                    if not text and not img_col:
+                        continue
+                    self.data.append(text)
+                    if img_col:
+                        self.images.append(image_value_to_uris(item.get(img_col)))
+                    if self._reached_limit():
+                        break
 
         except Exception as e:
             raise RuntimeError(f"Failed to load HuggingFace dataset: {e}")
@@ -155,6 +183,8 @@ class DatasetLoader:
                 # Create a system + user prompt like in the original
                 prompt = f"You are an assistant that helps students solve challenging problems.\n\n{item['Question']}"
                 self.data.append(prompt)
+                if self._reached_limit():
+                    break
         except Exception as e:
             raise RuntimeError(f"Failed to load AIME dataset: {e}")
     
@@ -168,7 +198,11 @@ class DatasetLoader:
     def get_all_texts(self) -> List[str]:
         """Get all texts from the dataset."""
         return self.data.copy()
-    
+
+    def get_all_images(self) -> List[List[str]]:
+        """Per-row image ``data:`` URIs, aligned with get_all_texts (empty if none)."""
+        return self.images.copy()
+
     def __len__(self) -> int:
         """Return the number of samples in the dataset."""
         return len(self.data)

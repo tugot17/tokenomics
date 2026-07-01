@@ -21,51 +21,33 @@ uv pip install -e .
 
 ## Completion Benchmark
 
-Sends chat completion requests to any OpenAI-compatible server and records per-request and system-wide metrics.
+Sends chat completion requests to any OpenAI-compatible server and records per-request and system-wide metrics. Requests are non-streaming by default (max throughput); `--stream` adds TTFT and per-token metrics.
 
-By default, requests are non-streaming for maximum throughput. Use `--stream` to enable SSE streaming for TTFT and per-token latency metrics.
+Every run **sweeps concurrency** and writes one result JSON per sweep point. Two execution modes, mutually exclusive:
 
-### Usage
+- `--max-concurrency 1,2,4,…` — **sustained**: holds concurrency constant (realistic production numbers).
+- `--batch-sizes 1,2,4,…` — **burst**: fires each batch at once (peak throughput).
 
 ```bash
-# Sustained mode — maintains constant concurrency (recommended)
-tokenomics completion \
+tokenomics completion --model your-model \
   --scenario "D(1024,256)" \
-  --model your-model \
-  --max-concurrency 1,2,4,8,16,32,64,128,256,512,1024
-
-# Burst mode — fires all requests at once
-tokenomics completion \
-  --scenario "D(1024,256)" \
-  --model your-model \
-  --batch-sizes 1,2,4,8
-
-# Multiple completions per request (e.g. for RL rollouts)
-tokenomics completion \
-  --scenario "D(1024,256)" \
-  --model your-model \
-  --max-concurrency 1,2,4,8,16 \
-  -n 16
-
-# Streaming mode — enables TTFT and per-token metrics
-tokenomics completion \
-  --scenario "D(1024,256)" \
-  --model your-model \
-  --max-concurrency 1,2,4,8 \
-  --stream
-
-# Dataset-replay mode — walk a real dataset example by example (no --scenario)
-tokenomics completion \
-  --replay-dataset \
-  --dataset-config examples/dataset_configs/humaneval.json \
-  --model your-model \
-  --max-concurrency 1,2,4,8,16,32 \
-  --max-tokens 1024
+  --max-concurrency 1,2,4,8,16,32,64,128 \
+  --results-dir results/
 ```
 
-The two execution modes (`--batch-sizes` and `--max-concurrency`) are mutually exclusive. Burst is good for peak throughput; sustained gives realistic production numbers.
+### Building requests
 
-### Traffic Scenarios
+Three ways to produce request content, all swept over concurrency the same way:
+
+| Mode | Enable with | Text | Use for |
+|------|-------------|------|---------|
+| **Synthetic** | `--scenario` | random dataset snippets padded to a token budget | throughput curves at controlled input/output lengths |
+| **Dataset replay** | `--replay-dataset` | each dataset row, verbatim | real examples; comparing datasets |
+| **Images (VL)** | `--num-images` | fixed filler (or `--scenario`) + synthetic images | vision inference speed |
+
+#### Synthetic (`--scenario`)
+
+A scenario sets input/output token counts; the prompt is built by concatenating random dataset snippets (with replacement) until it reaches the input budget.
 
 | Pattern | Example | Description |
 |---------|---------|-------------|
@@ -73,62 +55,22 @@ The two execution modes (`--batch-sizes` and `--max-concurrency`) are mutually e
 | `N(mu,sigma)/(mu,sigma)` | `N(100,50)/(50,0)` | Normal distribution |
 | `U(min,max)/(min,max)` | `U(50,150)/(20,80)` | Uniform distribution |
 
-### Datasets
+The snippet source defaults to a bundled AIME dataset; override with `--dataset-config` (see [Dataset config](#dataset-config)).
 
-The benchmark uses a bundled AIME dataset by default. You can specify a custom dataset with `--dataset-config`.
+#### Dataset replay (`--replay-dataset`)
 
-The benchmark concatenates random text snippets from the dataset until it reaches the input token count specified by the scenario. Snippets are picked with replacement, so even a small dataset can produce long prompts.
-
-#### Dataset config format
-
-A dataset config is a JSON file with a `source` section:
-
-**Local file** (TXT, CSV, or JSON):
-```json
-{
-  "source": { "type": "file", "path": "../data/prompts.txt" },
-  "prompt_column": "text"
-}
-```
-File paths are resolved relative to the config file.
-
-**HuggingFace dataset:**
-```json
-{
-  "source": {
-    "type": "huggingface",
-    "path": "squad",
-    "huggingface_kwargs": { "split": "train" }
-  },
-  "prompt_column": "question"
-}
-```
-
-**AIME** (built-in shortcut):
-```json
-{
-  "source": { "type": "aime" }
-}
-```
-
-See `examples/dataset_configs/` for more examples.
-
-### Dataset Replay Mode
-
-`--replay-dataset` sends each dataset row **verbatim as one request** and walks the dataset in order at each concurrency level, instead of synthesizing prompts to the scenario's token budget. Use it to benchmark on real examples and compare datasets. The prompt set is pinned (same rows, same order across every concurrency and run), so results line up example by example.
+Sends each dataset row **verbatim as one request** and walks the dataset in order, instead of synthesizing prompts. The prompt set is pinned (same rows, same order across every concurrency level and run), so results line up example by example.
 
 ```bash
-tokenomics completion \
-  --replay-dataset \
-  --dataset-config examples/dataset_configs/humaneval.json \
-  --model your-model \
+tokenomics completion --model your-model \
+  --replay-dataset --dataset-config examples/dataset_configs/humaneval.json \
   --max-concurrency 1,2,4,8,16,32 --max-tokens 1024 \
   --results-dir results/humaneval/
 ```
 
-- Sustained mode only (`--max-concurrency`); `--scenario` is ignored.
+- Sustained mode only; `--scenario` is ignored.
 - `--num-prompts N` caps the walk to the first N rows (default: whole dataset).
-- List prompt columns (MT-Bench `prompt`, Arena-Hard `turns`) are reduced to the first turn's string — MT-Bench runs single-turn.
+- List prompt columns (MT-Bench `prompt`, Arena-Hard `turns`) are reduced to the first turn — MT-Bench runs single-turn.
 
 Bundled configs under `examples/dataset_configs/`:
 
@@ -144,25 +86,77 @@ Bundled configs under `examples/dataset_configs/`:
 | `alpaca.json` | `tatsu-lab/alpaca_eval` (eval) | instruction following (AlpacaEval) |
 | `arena_hard.json` | `lmarena-ai/arena-hard-auto-v0.1` (train) | hard instruction following (Arena-Hard) |
 
-**`--ignore-eos`** makes every request generate exactly `--max-tokens` (EOS ignored), fixing output length so throughput isn't skewed by content-dependent token counts. Add it when comparing harnesses, servers, or configs; omit it for realistic, content-driven lengths. Supported by SGLang and vLLM — servers that don't implement it ignore the field, so it silently has no effect there.
+**Vision replay:** a config with an `image_column` (in addition to `prompt_column`) replays real image+text examples — each row's image(s) are attached to the request. This is the realistic VL workload (real prompts + real images, generating to natural EOS), e.g. for speculative-decoding evaluation. Bundled vision configs:
+
+| Config | Dataset | Domain |
+|--------|---------|--------|
+| `chartqa.json` | `lmms-lab/ChartQA` (test) | chart question answering |
+| `vqa_rad.json` | `flaviagiammarino/vqa-rad` (test) | radiology visual QA |
+| `docvqa.json` | `lmms-lab/DocVQA` (validation) | document-image QA |
+
+```bash
+tokenomics completion --model your-vl-model \
+  --replay-dataset --dataset-config examples/dataset_configs/chartqa.json \
+  --max-concurrency 1,2,4,8,16 --results-dir results/chartqa/
+```
+
+#### Images (`--num-images`)
+
+Attach images to any run — sent as OpenAI content parts (`image_url` base64 `data:` URIs, accepted by SGLang and vLLM) — turning it into a VL benchmark. Metrics and plotting are unchanged.
+
+```bash
+tokenomics completion --model your-vl-model \
+  --num-images 5 --image-size 512x512 \
+  --max-concurrency 1,2,4,8,16 \
+  --results-dir results/vl_512x5/
+```
+
+Image runs default to a short workload (the images dominate, the text is padding): a fixed filler of `--input-tokens` (default 32) and `--max-tokens` 32 output.
+
+- `--image-size` is `N` (square) or `WxH` (e.g. `1024x768`, lowercase `x`); `--input-tokens 0` = images only.
+- Synthetic images are random-noise PNGs, seeded per request → **unique** (defeats the server's prefix/multimodal caches) yet reproducible. Noise is nearly incompressible (~MBs at 1024×1024), so keep size/count modest or the payload dominates.
+- `--input-tokens` and `--scenario` are mutually exclusive; pass `--scenario` to put images on dataset-driven text instead.
+- Sweep size/count/length by looping the command (one `--results-dir` each) and overlaying with `plot-completion`.
+
+### Dataset config
+
+A JSON file with a `source` and (usually) a `prompt_column`. File paths are resolved relative to the config file.
+
+```json
+{ "source": { "type": "huggingface", "path": "openai/gsm8k",
+              "huggingface_kwargs": { "name": "main", "split": "test" } },
+  "prompt_column": "question" }
+```
+
+`source.type` is `huggingface`, `file` (`.txt`/`.csv`/`.json`), or `aime` (bundled shortcut). Add an `image_column` (alongside `prompt_column`) to replay a vision dataset — its images (embedded PIL, `{bytes/path}`, or file paths) are encoded and attached per request. See `examples/dataset_configs/` for more.
+
+### Output length & reproducibility
+
+`--ignore-eos` makes every request generate exactly `--max-tokens` (EOS ignored), fixing output length so throughput isn't skewed by content-dependent token counts. Add it when comparing harnesses, servers, or configs; omit it for realistic, content-driven lengths. Supported by SGLang and vLLM — a no-op on servers that ignore the field.
+
+`--max-tokens` defaults to 4096 (32 for image runs) and `--temperature` to 0.7. For fully reproducible runs, use `--temperature 0` with `--ignore-eos`.
 
 ### Key Options
 
 | Flag | Description |
 |------|-------------|
-| `--scenario` | Traffic pattern (required unless `--replay-dataset`) |
-| `--replay-dataset` | Send each dataset row verbatim and walk the dataset at each concurrency level (ignores `--scenario`; sustained mode only) |
 | `--model` | Model name (required) |
+| `--scenario` | Traffic pattern (required unless `--replay-dataset` or `--num-images`) |
 | `--api-base` | Server URL (default: `http://localhost:8000/v1`) |
-| `--batch-sizes` | Burst mode sweep points |
 | `--max-concurrency` | Sustained mode sweep points |
+| `--batch-sizes` | Burst mode sweep points |
 | `--num-prompts` | Prompts per sweep point in sustained mode |
 | `--num-runs` | Runs per sweep point (default: 3) |
-| `--max-tokens` | Max output tokens (default: 4096) |
-| `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang/vLLM). Fixes output length for clean cross-harness throughput comparison |
-| `-n` | Completions per request (default: 1) |
+| `--max-tokens` | Max output tokens (default: 4096; 32 for image runs) |
+| `--temperature` | Sampling temperature (default: 0.7) |
+| `--ignore-eos` | Generate exactly `--max-tokens`, ignoring EOS (SGLang/vLLM) — fixes output length for clean comparisons |
 | `--stream` | Enable SSE streaming for TTFT/per-token metrics |
+| `-n` | Completions per request (default: 1) |
 | `--dataset-config` | Path to dataset config (default: bundled AIME) |
+| `--replay-dataset` | Send each dataset row verbatim (sustained only; ignores `--scenario`) |
+| `--num-images` | Attach N synthetic random-noise images per request (0 = text-only) |
+| `--image-size` | Synthetic image size: `N` or `WxH` (default: 512) |
+| `--input-tokens` | Filler-text length for image runs (default: 32; 0 = images only) |
 | `--results-dir` | Output directory (one JSON per sweep value) |
 | `--lora-strategy` | LoRA distribution: single, uniform, zipf, mixed, all-unique |
 | `--lora-names` | Comma-separated LoRA adapter names |
@@ -182,7 +176,7 @@ Bundled configs under `examples/dataset_configs/`:
 ### Plotting
 
 ```bash
-# Compare multiple benchmarks
+# Compare multiple benchmarks (overlays each results dir as its own line)
 tokenomics plot-completion output.png results_dir1/ results_dir2/
 ```
 

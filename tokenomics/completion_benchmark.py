@@ -23,7 +23,7 @@ NS_PER_SECOND = 1_000_000_000
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from .sampling import Scenario, TextSampler, DatasetReplaySampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .sampling import Scenario, TextSampler, DatasetReplaySampler, FixedFillerSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed, build_synthetic_image_uris, count_tokens
 from .io import round_floats, atomic_write_json
 
 
@@ -267,9 +267,20 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
     lora_name = request_data.get("lora_name")
     model_str = f"{model}:{lora_name}" if lora_name else model
 
+    # Multimodal: when the request carries images, send OpenAI content parts
+    # (text + image_url data URIs); otherwise a plain string (unchanged path).
+    prompt = request_data["prompt"]
+    images = request_data.get("images")
+    if images:
+        message_content = ([{"type": "text", "text": prompt}] if prompt else []) + [
+            {"type": "image_url", "image_url": {"url": u}} for u in images
+        ]
+    else:
+        message_content = prompt
+
     payload = {
         "model": model_str,
-        "messages": [{"role": "user", "content": request_data["prompt"]}],
+        "messages": [{"role": "user", "content": message_content}],
         "max_tokens": request_data["max_tokens"],
         "temperature": temperature,
         "stream": stream,
@@ -782,7 +793,8 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
 
 
 def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
-                  text_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key"):
+                  text_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key",
+                  image_uris: Optional[List[str]] = None):
     """Perform warmup runs to prepare the server before benchmarking."""
     print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
 
@@ -796,6 +808,8 @@ def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
                     "prompt": req.prompt,
                     "max_tokens": max(1, min(4096, int(req.target_output_tokens))),
                 }
+                if image_uris:
+                    warmup_data["images"] = image_uris
                 try:
                     await single_request(session, api_base, model, warmup_data, temperature, timeout, api_key)
                 except Exception:
@@ -803,6 +817,49 @@ def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
 
     asyncio.run(run_warmup())
     print(" done")
+
+
+def build_prompt_source(args):
+    """Resolve the prompt source and build the sampler (+ dataset/scenario).
+
+    Returns ``(prompt_source, text_sampler, scenario, dataset_loader,
+    dataset_config)`` where ``prompt_source`` is one of ``dataset_replay``,
+    ``fixed_filler`` (image runs without an explicit --scenario), or
+    ``scenario``. Centralizes the mode decision so the rest of main() reads one
+    value instead of re-deriving the condition.
+    """
+    if args.replay_dataset:
+        prompt_source = "dataset_replay"
+    elif args.num_images > 0 and args.scenario is None:
+        prompt_source = "fixed_filler"
+    else:
+        prompt_source = "scenario"
+
+    scenario = Scenario.from_string(args.scenario) if prompt_source == "scenario" else None
+
+    # Fixed-filler runs need no dataset; the others load one (default: AIME).
+    dataset_config = None
+    dataset_loader = None
+    if prompt_source != "fixed_filler":
+        if args.dataset_config is None:
+            from tokenomics import EXAMPLES_DIR
+            args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
+        dataset_config = DatasetConfig.from_file(args.dataset_config)
+        # Replay walks the first --num-prompts rows, so cap loading there (avoids
+        # encoding a whole large vision dataset). Scenario mode samples randomly
+        # and keeps the full dataset.
+        limit = args.num_prompts if prompt_source == "dataset_replay" else None
+        dataset_loader = DatasetLoader(dataset_config, limit=limit)
+
+    tokenizer_name = args.tokenizer or args.model
+    if prompt_source == "dataset_replay":
+        text_sampler = DatasetReplaySampler(tokenizer_name, dataset_loader, args.max_tokens)
+    elif prompt_source == "fixed_filler":
+        text_sampler = FixedFillerSampler(tokenizer_name, args.input_tokens, args.max_tokens)
+    else:
+        text_sampler = TextSampler(tokenizer_name, dataset_loader)
+
+    return prompt_source, text_sampler, scenario, dataset_loader, dataset_config
 
 
 def main():
@@ -830,10 +887,15 @@ def main():
                         help="Total prompts per sweep point in sustained mode (default: max(64, 8*concurrency))")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (default: 0.7)")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Upper bound on max_tokens per request (default: 4096, or 32 for image runs)")
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
+
+    # Vision/multimodal: attach synthetic random-noise images to every request
+    parser.add_argument("--num-images", type=int, default=0, help="Attach this many synthetic (random-noise) images to each request. 0 = text-only (default).")
+    parser.add_argument("--image-size", type=str, default="512", help="Synthetic image size as N (square) or WxH, e.g. 512 or 1024x768 (default: 512). Only used when --num-images > 0.")
+    parser.add_argument("--input-tokens", type=int, default=None, help="Length of the deterministic filler text for image runs (default: 32; 0 = images only). Mutually exclusive with --scenario.")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
@@ -869,8 +931,21 @@ def main():
     if args.replay_dataset:
         if execution_mode != "sustained":
             parser.error("--replay-dataset requires --max-concurrency (sustained mode)")
-    elif args.scenario is None:
-        parser.error("--scenario is required unless --replay-dataset is set")
+    elif args.scenario is None and args.num_images == 0:
+        parser.error("--scenario is required unless --replay-dataset or --num-images is set")
+
+    # --scenario and --input-tokens both set the text length, two different ways.
+    if args.scenario is not None and args.input_tokens is not None:
+        parser.error("--input-tokens and --scenario are mutually exclusive (both set text length); "
+                     "--scenario drives text via its input value, --input-tokens is for image runs without --scenario")
+
+    # Image runs default to short output (the text is just padding and the
+    # images dominate): 32 tokens vs 4096 for text-only. Temperature is not
+    # mode-dependent — pass --temperature 0 / --ignore-eos for reproducibility.
+    if args.max_tokens is None:
+        args.max_tokens = 32 if args.num_images > 0 else 4096
+    if args.input_tokens is None:
+        args.input_tokens = 32
 
     # Create LoRA config from command-line arguments
     lora_config = None
@@ -884,35 +959,23 @@ def main():
         )
         print(f"🔧 LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs, base_model_ratio={lora_config.base_model_ratio}")
 
-    # Initialize scenario and dataset
-    scenario = None if args.replay_dataset else Scenario.from_string(args.scenario)
-    if args.dataset_config is None:
-        from tokenomics import EXAMPLES_DIR
-        args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
-    dataset_config = DatasetConfig.from_file(args.dataset_config)
-    dataset_loader = DatasetLoader(dataset_config)
-
-    tokenizer_name = args.tokenizer or args.model
-
-    if args.replay_dataset:
-        text_sampler = DatasetReplaySampler(tokenizer_name, dataset_loader, args.max_tokens)
-    else:
-        text_sampler = TextSampler(tokenizer_name, dataset_loader)
+    prompt_source, text_sampler, scenario, dataset_loader, dataset_config = build_prompt_source(args)
 
     def count_output_tokens(text: str) -> int:
         """Client-side output-token count used when the server omits usage."""
-        if not text:
-            return 0
-        try:
-            return len(text_sampler.tokenizer.encode(text).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
+        return count_tokens(text_sampler.tokenizer, text) if text else 0
 
-    if args.replay_dataset:
-        print(f"📊 Initialized benchmark in dataset-replay mode (max_tokens={args.max_tokens})")
-    else:
-        print(f"📊 Initialized benchmark with scenario: {args.scenario}")
-    print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
+    if args.num_images > 0:
+        print(f"🖼️  Attaching {args.num_images} synthetic image(s) of size {args.image_size} to each request (unique per request)")
+
+    source_msg = {
+        "dataset_replay": f"dataset-replay mode (max_tokens={args.max_tokens})",
+        "fixed_filler": f"fixed filler ({args.input_tokens} input tokens, max_tokens={args.max_tokens}, temperature={args.temperature})",
+        "scenario": f"scenario: {args.scenario}",
+    }[prompt_source]
+    print(f"📊 Initialized benchmark with {source_msg}")
+    if dataset_loader is not None:
+        print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
     print(f"⚙️  Execution mode: {execution_mode}")
     if lora_config:
         print(f"🎯 LoRA strategy: {lora_config.strategy} with {len(lora_config.lora_names)} adapters")
@@ -923,9 +986,12 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "scenario": args.scenario,
-        "prompt_source": "dataset_replay" if args.replay_dataset else "scenario",
+        "prompt_source": prompt_source,
         "max_tokens": args.max_tokens,
-        "dataset_config": dataset_config.config,
+        "num_images": args.num_images,
+        "image_size": args.image_size if args.num_images > 0 else None,
+        "input_tokens": args.input_tokens if prompt_source == "fixed_filler" else None,
+        "dataset_config": dataset_config.config if dataset_config is not None else None,
         "api_base": args.api_base,
         "execution_mode": execution_mode,
         "num_runs": args.num_runs,
@@ -953,6 +1019,11 @@ def main():
     # Create results directory
     os.makedirs(args.results_dir, exist_ok=True)
 
+    # Monotonic per-request id (image runs only), so every request across the
+    # whole benchmark gets a unique prompt prefix + unique images -> defeats the
+    # server's prefix and multimodal caches. Deterministic (fixed iteration order).
+    req_uid = 0
+
     # Run benchmark for each sweep value
     for sweep_value in sweep_values:
         if execution_mode == "sustained":
@@ -969,10 +1040,14 @@ def main():
             max_concurrency = None
             print(f"\n🔄 Testing batch size: {sweep_value}")
 
+        # Warmup images use a disjoint id range so they don't cache-collide with
+        # the measured requests (whose ids start at 0).
+        warmup_images = build_synthetic_image_uris(args.image_size, args.num_images, start_id=2**31) if args.num_images > 0 else None
         warmup_seed = derive_seed(args.seed, sweep_value, -1)
         with use_seed(warmup_seed):
             warmup_server(args.api_base, args.model, args.temperature, args.timeout,
-                         text_sampler, args.warmup_runs, api_key=args.api_key)
+                         text_sampler, args.warmup_runs, api_key=args.api_key,
+                         image_uris=warmup_images)
 
         runs_data = []
         for run_idx in range(args.num_runs):
@@ -1000,6 +1075,19 @@ def main():
                     request_dict["lora_name"] = lora_assignments[idx]
                 if args.ignore_eos:
                     request_dict["ignore_eos"] = True
+                if request.images:
+                    # Real images from a vision replay dataset (already unique).
+                    request_dict["images"] = request.images
+                elif args.num_images > 0:
+                    uid = req_uid
+                    req_uid += 1
+                    # Unique text prefix + unique images so each request is a
+                    # cache miss (prefix + multimodal caches), while staying
+                    # deterministic (uid is derived from fixed iteration order).
+                    base = request_dict["prompt"]
+                    request_dict["prompt"] = f"{uid} {base}" if base else str(uid)
+                    request_dict["images"] = build_synthetic_image_uris(
+                        args.image_size, args.num_images, start_id=uid * args.num_images)
                 user_requests.append(request_dict)
 
             run_data = run_benchmark_batch(

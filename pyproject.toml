@@ -24,6 +24,7 @@ dependencies = [
     "aiohttp",
     "numpy",
     "tokenizers",
+    "pillow",
 ]
 
 [project.urls]

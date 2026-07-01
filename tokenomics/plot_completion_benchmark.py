@@ -72,6 +72,15 @@ def generate_label_from_metadata(metadata: Dict, json_file: str) -> str:
     if "baseline" in desc.lower() or "no lora" in desc.lower():
         return "Baseline (No LoRA)"
 
+    # Image runs self-label by shape (count/size/filler length) when no custom
+    # --description was given, so overlaid VL configs are distinguishable.
+    num_images = metadata.get("num_images", 0)
+    if num_images and desc in ("", "Benchmark"):
+        label = f"{num_images}img@{metadata.get('image_size')}"
+        if metadata.get("input_tokens") is not None:
+            label += f" {metadata['input_tokens']}tok"
+        return label
+
     return desc or Path(json_file).stem
 
 

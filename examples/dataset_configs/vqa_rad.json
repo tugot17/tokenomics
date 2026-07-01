@@ -1,0 +1,10 @@
+{
+  "source": {
+    "type": "huggingface",
+    "path": "flaviagiammarino/vqa-rad",
+    "huggingface_kwargs": { "split": "test" }
+  },
+  "prompt_column": "question",
+  "image_column": "image",
+  "description": "VQA-RAD (radiology visual QA, 451 rows), one image + question per row. Vision replay: use with --replay-dataset."
+}

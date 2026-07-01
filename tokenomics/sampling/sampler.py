@@ -3,15 +3,22 @@ Text sampler that combines statistical scenarios with dataset content.
 """
 
 import random
-import warnings
 import hashlib
 import contextlib
 import numpy as np
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 from tokenizers import Tokenizer
 
 from .scenarios import Scenario
 from .dataset import DatasetLoader
+
+
+def count_tokens(tokenizer: Tokenizer, text: str) -> int:
+    """Token count for ``text``, with a rough word-based fallback on failure."""
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=True).ids)
+    except Exception:
+        return int(len(text.split()) * 1.3)
 
 
 class UserRequest(NamedTuple):
@@ -20,6 +27,7 @@ class UserRequest(NamedTuple):
     actual_input_tokens: int
     target_input_tokens: int
     target_output_tokens: int
+    images: Optional[List[str]] = None  # per-request image data URIs (VL replay)
 
 
 class TextSampler:
@@ -33,7 +41,7 @@ class TextSampler:
         print(f"Pre-tokenizing {len(dataset_loader)} dataset texts...")
         t0 = time.time()
         self.text_token_cache = [
-            (text, self._count_tokens(text))
+            (text, count_tokens(self.tokenizer, text))
             for text in dataset_loader.get_all_texts()
         ]
         total_tokens = sum(count for _, count in self.text_token_cache)
@@ -66,13 +74,6 @@ class TextSampler:
 
         return " ".join(texts), current_tokens
 
-    def _count_tokens(self, text: str) -> int:
-        """Count tokens in text using the tokenizer."""
-        try:
-            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
-
 
 class DatasetReplaySampler:
     """Sends each dataset row verbatim as one request, walking the dataset in order.
@@ -91,14 +92,9 @@ class DatasetReplaySampler:
         self.dataset_loader = dataset_loader
         self.max_tokens = max_tokens
         self.rows = dataset_loader.get_all_texts()
+        self.images = dataset_loader.get_all_images()  # [] for text-only datasets
         if not self.rows:
             raise ValueError("Dataset is empty")
-
-    def _count_tokens(self, text: str) -> int:
-        try:
-            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
 
     def sample_batch(self, scenario: Scenario, batch_size: int) -> List[UserRequest]:
         """Return the first ``batch_size`` rows verbatim, in dataset order.
@@ -114,9 +110,41 @@ class DatasetReplaySampler:
         out = []
         for i in range(min(batch_size, len(self.rows))):
             text = self.rows[i]
-            n_tok = self._count_tokens(text)
-            out.append(UserRequest(text, self.max_tokens, n_tok, n_tok, self.max_tokens))
+            n_tok = count_tokens(self.tokenizer, text)
+            imgs = self.images[i] if i < len(self.images) else None
+            out.append(UserRequest(text, self.max_tokens, n_tok, n_tok, self.max_tokens, imgs))
         return out
+
+
+class FixedFillerSampler:
+    """Deterministic fixed-length filler text, same base prompt for every request.
+
+    For image/VL runs the text is just padding to a target input length and its
+    content doesn't affect speed, so we use a reproducible fixed filler of
+    ~``input_tokens`` tokens (0 -> empty). The benchmark loop makes each request
+    unique (it prefixes a request id) to avoid server-side prefix caching, so the
+    identical base prompt here is fine. Same ``sample_batch`` / ``tokenizer``
+    surface as :class:`TextSampler`, so it is a drop-in replacement.
+    """
+
+    def __init__(self, tokenizer_name: str, input_tokens: int, max_tokens: int):
+        self.tokenizer = Tokenizer.from_pretrained(tokenizer_name)
+        self.max_tokens = max_tokens
+        self.prompt = self._build_filler(input_tokens)
+
+    def _build_filler(self, n_tokens: int) -> str:
+        if n_tokens <= 0:
+            return ""
+        seed_text = "The quick brown fox jumps over the lazy dog. "
+        ids = self.tokenizer.encode(seed_text * (n_tokens // 8 + 2), add_special_tokens=False).ids
+        while len(ids) < n_tokens:
+            ids = ids + ids
+        return self.tokenizer.decode(ids[:n_tokens])
+
+    def sample_batch(self, scenario: Scenario, batch_size: int) -> List[UserRequest]:
+        it = count_tokens(self.tokenizer, self.prompt) if self.prompt else 0
+        return [UserRequest(self.prompt, self.max_tokens, it, it, self.max_tokens)
+                for _ in range(batch_size)]
 
 
 @contextlib.contextmanager
