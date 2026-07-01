@@ -146,6 +146,23 @@ Bundled configs under `examples/dataset_configs/`:
 
 **`--ignore-eos`** makes every request generate exactly `--max-tokens` (EOS ignored), fixing output length so throughput isn't skewed by content-dependent token counts. Add it when comparing harnesses, servers, or configs; omit it for realistic, content-driven lengths. Supported by SGLang and vLLM — servers that don't implement it ignore the field, so it silently has no effect there.
 
+### Vision / multimodal
+
+Attach images to every request with `--num-images` and `--image-size`, turning any completion run into a VL benchmark. Images are sent as OpenAI content parts (`image_url` base64 `data:` URIs, accepted by SGLang and vLLM). Everything else is orthogonal: text length comes from `--scenario` (or `--replay-dataset`), output from `--max-tokens`, and you sweep concurrency as usual — so latency/throughput vs concurrency plots via `plot-completion` unchanged.
+
+```bash
+tokenomics completion \
+  --model your-vl-model \
+  --scenario "D(1024,32)" \
+  --num-images 5 --image-size 512 \
+  --max-concurrency 1,2,4,8,16 \
+  --results-dir results/vl_512x5/
+```
+
+- Synthetic images are plain white PNGs built on the fly (content doesn't affect VL speed), each stamped with its index so the server's multimodal cache can't dedupe them.
+- `--image-size` accepts `N` (square) or `WxH`.
+- Sweeping image size/count is external composition — loop the command over `--image-size`/`--num-images` values, one `--results-dir` each, then overlay with `plot-completion`.
+
 ### Key Options
 
 | Flag | Description |
@@ -160,6 +177,8 @@ Bundled configs under `examples/dataset_configs/`:
 | `--num-runs` | Runs per sweep point (default: 3) |
 | `--max-tokens` | Max output tokens (default: 4096) |
 | `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang/vLLM). Fixes output length for clean cross-harness throughput comparison |
+| `--num-images` | Attach N synthetic (white) images to each request (0 = text-only, default) |
+| `--image-size` | Synthetic image size: `N` or `WxH` (default: 512; used when `--num-images` > 0) |
 | `-n` | Completions per request (default: 1) |
 | `--stream` | Enable SSE streaming for TTFT/per-token metrics |
 | `--dataset-config` | Path to dataset config (default: bundled AIME) |

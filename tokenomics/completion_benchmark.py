@@ -27,6 +27,45 @@ from .sampling import Scenario, TextSampler, DatasetReplaySampler, DatasetConfig
 from .io import round_floats, atomic_write_json
 
 
+def _parse_image_size(spec: str) -> tuple:
+    """Parse an image size spec: '512' -> (512, 512), '640x480' -> (640, 480)."""
+    parts = str(spec).lower().split("x")
+    if len(parts) == 1:
+        w = h = int(parts[0])
+    elif len(parts) == 2:
+        w, h = int(parts[0]), int(parts[1])
+    else:
+        raise ValueError(f"Invalid --image-size '{spec}'; use N or WxH")
+    return w, h
+
+
+def build_synthetic_image_uris(size: str, count: int) -> List[str]:
+    """Return `count` white PNG images (as base64 ``data:`` URIs) of the given size.
+
+    Each image is stamped with its index (one pixel) so they hash differently,
+    preventing the server's multimodal cache from deduplicating them and
+    undercounting prefill compute. Image *content* is otherwise irrelevant to
+    VL model speed, so all-white is fine.
+    """
+    if count <= 0:
+        return []
+    import base64
+    import io as _io
+    from PIL import Image
+
+    w, h = _parse_image_size(size)
+    uris = []
+    for i in range(count):
+        img = Image.new("RGB", (w, h), (255, 255, 255))
+        # Stamp the index into the top-left pixel to make each image unique.
+        img.putpixel((0, 0), (i % 256, (i // 256) % 256, 254))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        uris.append(f"data:image/png;base64,{b64}")
+    return uris
+
+
 def _safe_mean(values):
     """Return the mean of values, or 0 if empty."""
     return float(np.mean(values)) if values else 0
@@ -267,9 +306,20 @@ async def single_request(session: aiohttp.ClientSession, api_base: str, model: s
     lora_name = request_data.get("lora_name")
     model_str = f"{model}:{lora_name}" if lora_name else model
 
+    # Multimodal: when the request carries images, send OpenAI content parts
+    # (text + image_url data URIs); otherwise a plain string (unchanged path).
+    prompt = request_data["prompt"]
+    images = request_data.get("images")
+    if images:
+        message_content = ([{"type": "text", "text": prompt}] if prompt else []) + [
+            {"type": "image_url", "image_url": {"url": u}} for u in images
+        ]
+    else:
+        message_content = prompt
+
     payload = {
         "model": model_str,
-        "messages": [{"role": "user", "content": request_data["prompt"]}],
+        "messages": [{"role": "user", "content": message_content}],
         "max_tokens": request_data["max_tokens"],
         "temperature": temperature,
         "stream": stream,
@@ -782,7 +832,8 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
 
 
 def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
-                  text_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key"):
+                  text_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key",
+                  image_uris: Optional[List[str]] = None):
     """Perform warmup runs to prepare the server before benchmarking."""
     print(f"Performing {num_warmup_runs} warmup runs...", end="", flush=True)
 
@@ -796,6 +847,8 @@ def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
                     "prompt": req.prompt,
                     "max_tokens": max(1, min(4096, int(req.target_output_tokens))),
                 }
+                if image_uris:
+                    warmup_data["images"] = image_uris
                 try:
                     await single_request(session, api_base, model, warmup_data, temperature, timeout, api_key)
                 except Exception:
@@ -834,6 +887,10 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
+
+    # Vision/multimodal: attach synthetic white images to every request
+    parser.add_argument("--num-images", type=int, default=0, help="Attach this many synthetic (white) images to each request. 0 = text-only (default).")
+    parser.add_argument("--image-size", type=str, default="512", help="Synthetic image size as N (square) or WxH, e.g. 512 or 1024x768 (default: 512). Only used when --num-images > 0.")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
@@ -908,6 +965,11 @@ def main():
         except Exception:
             return int(len(text.split()) * 1.3)
 
+    # Synthetic images (built once; content-independent, so shared by every request)
+    image_uris = build_synthetic_image_uris(args.image_size, args.num_images)
+    if image_uris:
+        print(f"🖼️  Attaching {args.num_images} synthetic image(s) of size {args.image_size} to each request")
+
     if args.replay_dataset:
         print(f"📊 Initialized benchmark in dataset-replay mode (max_tokens={args.max_tokens})")
     else:
@@ -925,6 +987,8 @@ def main():
         "scenario": args.scenario,
         "prompt_source": "dataset_replay" if args.replay_dataset else "scenario",
         "max_tokens": args.max_tokens,
+        "num_images": args.num_images,
+        "image_size": args.image_size if args.num_images > 0 else None,
         "dataset_config": dataset_config.config,
         "api_base": args.api_base,
         "execution_mode": execution_mode,
@@ -972,7 +1036,8 @@ def main():
         warmup_seed = derive_seed(args.seed, sweep_value, -1)
         with use_seed(warmup_seed):
             warmup_server(args.api_base, args.model, args.temperature, args.timeout,
-                         text_sampler, args.warmup_runs, api_key=args.api_key)
+                         text_sampler, args.warmup_runs, api_key=args.api_key,
+                         image_uris=image_uris)
 
         runs_data = []
         for run_idx in range(args.num_runs):
@@ -1000,6 +1065,8 @@ def main():
                     request_dict["lora_name"] = lora_assignments[idx]
                 if args.ignore_eos:
                     request_dict["ignore_eos"] = True
+                if image_uris:
+                    request_dict["images"] = image_uris
                 user_requests.append(request_dict)
 
             run_data = run_benchmark_batch(
