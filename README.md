@@ -161,7 +161,7 @@ tokenomics completion \
 Image runs use short, deterministic defaults (the images dominate, the text is padding): a fixed filler prompt of `--input-tokens` (default 32), `--max-tokens` 32 output, and greedy decoding (temperature 0). Override any of them explicitly.
 
 - `--input-tokens` sets the filler length (`0` = images only); `--image-size` is `N` or `WxH`.
-- Synthetic images are white PNGs built on the fly (content doesn't affect VL speed). Every request gets a **unique** prompt id and **unique** images, so the server's prefix and multimodal caches can't dedupe them and undercount compute — while staying fully reproducible.
+- Synthetic images are random-noise PNGs built on the fly, seeded per request so they're **unique** (defeating the server's prefix/multimodal caches) yet reproducible. Note noise is nearly incompressible (~MBs at 1024×1024), so keep image size/count sane or the payload dominates.
 - Sweep image size/count/text-length by looping the command (one `--results-dir` each) and overlaying with `plot-completion` — nothing is baked in.
 - Pass an explicit `--scenario` instead to drive the text from the dataset sampler (e.g. images on top of realistic prompts).
 
@@ -179,7 +179,7 @@ Image runs use short, deterministic defaults (the images dominate, the text is p
 | `--num-runs` | Runs per sweep point (default: 3) |
 | `--max-tokens` | Max output tokens (default: 4096; 32 for image runs) |
 | `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang/vLLM). Fixes output length for clean cross-harness throughput comparison |
-| `--num-images` | Attach N synthetic (white) images to each request (0 = text-only, default) |
+| `--num-images` | Attach N synthetic (random-noise) images to each request (0 = text-only, default) |
 | `--image-size` | Synthetic image size: `N` or `WxH` (default: 512; used when `--num-images` > 0) |
 | `--input-tokens` | Filler-text length for image runs without `--scenario` (default: 32; 0 = images only) |
 | `--temperature` | Sampling temperature (default: 0.7; 0.0 for image runs) |

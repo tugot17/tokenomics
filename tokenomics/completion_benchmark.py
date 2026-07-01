@@ -40,31 +40,30 @@ def _parse_image_size(spec: str) -> tuple:
 
 
 def build_synthetic_image_uris(size: str, count: int, start_id: int = 0) -> List[str]:
-    """Return `count` white PNG images (as base64 ``data:`` URIs) of the given size.
+    """Return `count` random-noise PNG images (as base64 ``data:`` URIs).
 
-    Each image is stamped with a unique 32-bit id (``start_id + k``, across four
-    pixels) so every image hashes differently — preventing the server's
-    multimodal cache from deduplicating identical images and undercounting the
-    vision-encoder compute. Callers pass a per-request ``start_id`` so images are
-    unique across the whole benchmark, not just within one request. Image
-    *content* is otherwise irrelevant to VL model speed, so all-white is fine.
+    Each image is filled with random pixels seeded by a unique id (``start_id +
+    k``), so it is deterministic (reproducible across runs) yet unique across the
+    whole benchmark — which keeps the server's prefix and multimodal caches from
+    deduplicating requests and undercounting vision-encoder compute. Pixel
+    *content* doesn't change VL compute (patch count is fixed by size), but note
+    noise is nearly incompressible, so payloads are much larger than a flat
+    image (~MBs at 1024x1024) — keep image size/count sane for the transport.
     """
     if count <= 0:
         return []
     import base64
     import io as _io
+    import numpy as np
     from PIL import Image
 
     w, h = _parse_image_size(size)
     uris = []
     for k in range(count):
-        uid = start_id + k
-        img = Image.new("RGB", (w, h), (255, 255, 255))
-        for px in range(4):  # encode uid over 4 pixels -> 2^32 distinct images
-            b = (uid >> (8 * px)) & 0xFF
-            img.putpixel((px, 0), (b, b, b))
+        rng = np.random.default_rng(start_id + k)  # deterministic, unique per image
+        arr = rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
         buf = _io.BytesIO()
-        img.save(buf, format="PNG")
+        Image.fromarray(arr, "RGB").save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         uris.append(f"data:image/png;base64,{b64}")
     return uris
@@ -892,8 +891,8 @@ def main():
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
 
-    # Vision/multimodal: attach synthetic white images to every request
-    parser.add_argument("--num-images", type=int, default=0, help="Attach this many synthetic (white) images to each request. 0 = text-only (default).")
+    # Vision/multimodal: attach synthetic random-noise images to every request
+    parser.add_argument("--num-images", type=int, default=0, help="Attach this many synthetic (random-noise) images to each request. 0 = text-only (default).")
     parser.add_argument("--image-size", type=str, default="512", help="Synthetic image size as N (square) or WxH, e.g. 512 or 1024x768 (default: 512). Only used when --num-images > 0.")
     parser.add_argument("--input-tokens", type=int, default=32, help="Length of the deterministic filler text for image runs when --scenario is not given (default: 32; 0 = images only).")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
