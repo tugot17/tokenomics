@@ -23,7 +23,7 @@ NS_PER_SECOND = 1_000_000_000
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from .sampling import Scenario, TextSampler, DatasetReplaySampler, FixedFillerSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed, build_synthetic_image_uris
+from .sampling import Scenario, TextSampler, DatasetReplaySampler, FixedFillerSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed, build_synthetic_image_uris, count_tokens
 from .io import round_floats, atomic_write_json
 
 
@@ -946,12 +946,7 @@ def main():
 
     def count_output_tokens(text: str) -> int:
         """Client-side output-token count used when the server omits usage."""
-        if not text:
-            return 0
-        try:
-            return len(text_sampler.tokenizer.encode(text).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
+        return count_tokens(text_sampler.tokenizer, text) if text else 0
 
     if args.num_images > 0:
         print(f"🖼️  Attaching {args.num_images} synthetic image(s) of size {args.image_size} to each request (unique per request)")

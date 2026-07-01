@@ -3,7 +3,6 @@ Text sampler that combines statistical scenarios with dataset content.
 """
 
 import random
-import warnings
 import hashlib
 import contextlib
 import numpy as np
@@ -12,6 +11,14 @@ from tokenizers import Tokenizer
 
 from .scenarios import Scenario
 from .dataset import DatasetLoader
+
+
+def count_tokens(tokenizer: Tokenizer, text: str) -> int:
+    """Token count for ``text``, with a rough word-based fallback on failure."""
+    try:
+        return len(tokenizer.encode(text, add_special_tokens=True).ids)
+    except Exception:
+        return int(len(text.split()) * 1.3)
 
 
 class UserRequest(NamedTuple):
@@ -34,7 +41,7 @@ class TextSampler:
         print(f"Pre-tokenizing {len(dataset_loader)} dataset texts...")
         t0 = time.time()
         self.text_token_cache = [
-            (text, self._count_tokens(text))
+            (text, count_tokens(self.tokenizer, text))
             for text in dataset_loader.get_all_texts()
         ]
         total_tokens = sum(count for _, count in self.text_token_cache)
@@ -67,13 +74,6 @@ class TextSampler:
 
         return " ".join(texts), current_tokens
 
-    def _count_tokens(self, text: str) -> int:
-        """Count tokens in text using the tokenizer."""
-        try:
-            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
-
 
 class DatasetReplaySampler:
     """Sends each dataset row verbatim as one request, walking the dataset in order.
@@ -96,12 +96,6 @@ class DatasetReplaySampler:
         if not self.rows:
             raise ValueError("Dataset is empty")
 
-    def _count_tokens(self, text: str) -> int:
-        try:
-            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
-
     def sample_batch(self, scenario: Scenario, batch_size: int) -> List[UserRequest]:
         """Return the first ``batch_size`` rows verbatim, in dataset order.
 
@@ -116,7 +110,7 @@ class DatasetReplaySampler:
         out = []
         for i in range(min(batch_size, len(self.rows))):
             text = self.rows[i]
-            n_tok = self._count_tokens(text)
+            n_tok = count_tokens(self.tokenizer, text)
             imgs = self.images[i] if i < len(self.images) else None
             out.append(UserRequest(text, self.max_tokens, n_tok, n_tok, self.max_tokens, imgs))
         return out
@@ -147,14 +141,8 @@ class FixedFillerSampler:
             ids = ids + ids
         return self.tokenizer.decode(ids[:n_tokens])
 
-    def _count_tokens(self, text: str) -> int:
-        try:
-            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
-        except Exception:
-            return int(len(text.split()) * 1.3)
-
     def sample_batch(self, scenario: Scenario, batch_size: int) -> List[UserRequest]:
-        it = self._count_tokens(self.prompt) if self.prompt else 0
+        it = count_tokens(self.tokenizer, self.prompt) if self.prompt else 0
         return [UserRequest(self.prompt, self.max_tokens, it, it, self.max_tokens)
                 for _ in range(batch_size)]
 
