@@ -153,7 +153,7 @@ Attach images to every request with `--num-images` (and `--image-size`), turning
 ```bash
 tokenomics completion \
   --model your-vl-model \
-  --num-images 5 --image-size 512 \
+  --num-images 5 --image-size 512x512 \
   --max-concurrency 1,2,4,8,16 \
   --results-dir results/vl_512x5/
 ```
