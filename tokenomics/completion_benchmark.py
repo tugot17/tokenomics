@@ -23,7 +23,7 @@ NS_PER_SECOND = 1_000_000_000
 os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-from .sampling import Scenario, TextSampler, DatasetReplaySampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
+from .sampling import Scenario, TextSampler, DatasetReplaySampler, FixedFillerSampler, DatasetConfig, DatasetLoader, use_seed, derive_seed
 from .io import round_floats, atomic_write_json
 
 
@@ -39,13 +39,15 @@ def _parse_image_size(spec: str) -> tuple:
     return w, h
 
 
-def build_synthetic_image_uris(size: str, count: int) -> List[str]:
+def build_synthetic_image_uris(size: str, count: int, start_id: int = 0) -> List[str]:
     """Return `count` white PNG images (as base64 ``data:`` URIs) of the given size.
 
-    Each image is stamped with its index (one pixel) so they hash differently,
-    preventing the server's multimodal cache from deduplicating them and
-    undercounting prefill compute. Image *content* is otherwise irrelevant to
-    VL model speed, so all-white is fine.
+    Each image is stamped with a unique 32-bit id (``start_id + k``, across four
+    pixels) so every image hashes differently — preventing the server's
+    multimodal cache from deduplicating identical images and undercounting the
+    vision-encoder compute. Callers pass a per-request ``start_id`` so images are
+    unique across the whole benchmark, not just within one request. Image
+    *content* is otherwise irrelevant to VL model speed, so all-white is fine.
     """
     if count <= 0:
         return []
@@ -55,10 +57,12 @@ def build_synthetic_image_uris(size: str, count: int) -> List[str]:
 
     w, h = _parse_image_size(size)
     uris = []
-    for i in range(count):
+    for k in range(count):
+        uid = start_id + k
         img = Image.new("RGB", (w, h), (255, 255, 255))
-        # Stamp the index into the top-left pixel to make each image unique.
-        img.putpixel((0, 0), (i % 256, (i // 256) % 256, 254))
+        for px in range(4):  # encode uid over 4 pixels -> 2^32 distinct images
+            b = (uid >> (8 * px)) & 0xFF
+            img.putpixel((px, 0), (b, b, b))
         buf = _io.BytesIO()
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -883,14 +887,15 @@ def main():
                         help="Total prompts per sweep point in sustained mode (default: max(64, 8*concurrency))")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
     parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Temperature parameter")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="Upper bound on max_tokens per request (default: 4096)")
+    parser.add_argument("--temperature", type=float, default=None, help="Temperature (default: 0.7, or 0.0 for image runs)")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Upper bound on max_tokens per request (default: 4096, or 32 for image runs)")
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
     parser.add_argument("-n", "--num-completions", type=int, default=1, help="Number of completions per request (default: 1)")
 
     # Vision/multimodal: attach synthetic white images to every request
     parser.add_argument("--num-images", type=int, default=0, help="Attach this many synthetic (white) images to each request. 0 = text-only (default).")
     parser.add_argument("--image-size", type=str, default="512", help="Synthetic image size as N (square) or WxH, e.g. 512 or 1024x768 (default: 512). Only used when --num-images > 0.")
+    parser.add_argument("--input-tokens", type=int, default=32, help="Length of the deterministic filler text for image runs when --scenario is not given (default: 32; 0 = images only).")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
@@ -926,8 +931,16 @@ def main():
     if args.replay_dataset:
         if execution_mode != "sustained":
             parser.error("--replay-dataset requires --max-concurrency (sustained mode)")
-    elif args.scenario is None:
-        parser.error("--scenario is required unless --replay-dataset is set")
+    elif args.scenario is None and args.num_images == 0:
+        parser.error("--scenario is required unless --replay-dataset or --num-images is set")
+
+    # Image runs default to short, deterministic settings (the text is just
+    # padding and the images dominate): a fixed filler prompt of --input-tokens,
+    # 32 output tokens, and greedy decoding. Text-only runs keep their defaults.
+    if args.max_tokens is None:
+        args.max_tokens = 32 if args.num_images > 0 else 4096
+    if args.temperature is None:
+        args.temperature = 0.0 if args.num_images > 0 else 0.7
 
     # Create LoRA config from command-line arguments
     lora_config = None
@@ -941,18 +954,27 @@ def main():
         )
         print(f"🔧 LoRA config: strategy={lora_config.strategy}, {len(lora_config.lora_names)} LoRAs, base_model_ratio={lora_config.base_model_ratio}")
 
+    # Image runs with no explicit --scenario use a deterministic fixed filler
+    # (no dataset needed); a given --scenario still routes through TextSampler.
+    use_filler = args.num_images > 0 and args.scenario is None and not args.replay_dataset
+
     # Initialize scenario and dataset
-    scenario = None if args.replay_dataset else Scenario.from_string(args.scenario)
-    if args.dataset_config is None:
-        from tokenomics import EXAMPLES_DIR
-        args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
-    dataset_config = DatasetConfig.from_file(args.dataset_config)
-    dataset_loader = DatasetLoader(dataset_config)
+    scenario = None if (args.replay_dataset or use_filler) else Scenario.from_string(args.scenario)
+    dataset_config = None
+    dataset_loader = None
+    if not use_filler:
+        if args.dataset_config is None:
+            from tokenomics import EXAMPLES_DIR
+            args.dataset_config = str(EXAMPLES_DIR / "dataset_configs" / "aime_simple.json")
+        dataset_config = DatasetConfig.from_file(args.dataset_config)
+        dataset_loader = DatasetLoader(dataset_config)
 
     tokenizer_name = args.tokenizer or args.model
 
     if args.replay_dataset:
         text_sampler = DatasetReplaySampler(tokenizer_name, dataset_loader, args.max_tokens)
+    elif use_filler:
+        text_sampler = FixedFillerSampler(tokenizer_name, args.input_tokens, args.max_tokens)
     else:
         text_sampler = TextSampler(tokenizer_name, dataset_loader)
 
@@ -965,16 +987,17 @@ def main():
         except Exception:
             return int(len(text.split()) * 1.3)
 
-    # Synthetic images (built once; content-independent, so shared by every request)
-    image_uris = build_synthetic_image_uris(args.image_size, args.num_images)
-    if image_uris:
-        print(f"🖼️  Attaching {args.num_images} synthetic image(s) of size {args.image_size} to each request")
+    if args.num_images > 0:
+        print(f"🖼️  Attaching {args.num_images} synthetic image(s) of size {args.image_size} to each request (unique per request)")
 
     if args.replay_dataset:
         print(f"📊 Initialized benchmark in dataset-replay mode (max_tokens={args.max_tokens})")
+    elif use_filler:
+        print(f"📊 Initialized benchmark with fixed filler ({args.input_tokens} input tokens, max_tokens={args.max_tokens}, temperature={args.temperature})")
     else:
         print(f"📊 Initialized benchmark with scenario: {args.scenario}")
-    print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
+    if dataset_loader is not None:
+        print(f"📚 Loaded dataset: {len(dataset_loader)} samples")
     print(f"⚙️  Execution mode: {execution_mode}")
     if lora_config:
         print(f"🎯 LoRA strategy: {lora_config.strategy} with {len(lora_config.lora_names)} adapters")
@@ -985,11 +1008,12 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "scenario": args.scenario,
-        "prompt_source": "dataset_replay" if args.replay_dataset else "scenario",
+        "prompt_source": "dataset_replay" if args.replay_dataset else ("fixed_filler" if use_filler else "scenario"),
         "max_tokens": args.max_tokens,
         "num_images": args.num_images,
         "image_size": args.image_size if args.num_images > 0 else None,
-        "dataset_config": dataset_config.config,
+        "input_tokens": args.input_tokens if use_filler else None,
+        "dataset_config": dataset_config.config if dataset_config is not None else None,
         "api_base": args.api_base,
         "execution_mode": execution_mode,
         "num_runs": args.num_runs,
@@ -1017,6 +1041,11 @@ def main():
     # Create results directory
     os.makedirs(args.results_dir, exist_ok=True)
 
+    # Monotonic per-request id (image runs only), so every request across the
+    # whole benchmark gets a unique prompt prefix + unique images -> defeats the
+    # server's prefix and multimodal caches. Deterministic (fixed iteration order).
+    req_uid = 0
+
     # Run benchmark for each sweep value
     for sweep_value in sweep_values:
         if execution_mode == "sustained":
@@ -1033,11 +1062,14 @@ def main():
             max_concurrency = None
             print(f"\n🔄 Testing batch size: {sweep_value}")
 
+        # Warmup images use a disjoint id range so they don't cache-collide with
+        # the measured requests (whose ids start at 0).
+        warmup_images = build_synthetic_image_uris(args.image_size, args.num_images, start_id=2**31) if args.num_images > 0 else None
         warmup_seed = derive_seed(args.seed, sweep_value, -1)
         with use_seed(warmup_seed):
             warmup_server(args.api_base, args.model, args.temperature, args.timeout,
                          text_sampler, args.warmup_runs, api_key=args.api_key,
-                         image_uris=image_uris)
+                         image_uris=warmup_images)
 
         runs_data = []
         for run_idx in range(args.num_runs):
@@ -1065,8 +1097,16 @@ def main():
                     request_dict["lora_name"] = lora_assignments[idx]
                 if args.ignore_eos:
                     request_dict["ignore_eos"] = True
-                if image_uris:
-                    request_dict["images"] = image_uris
+                if args.num_images > 0:
+                    uid = req_uid
+                    req_uid += 1
+                    # Unique text prefix + unique images so each request is a
+                    # cache miss (prefix + multimodal caches), while staying
+                    # deterministic (uid is derived from fixed iteration order).
+                    base = request_dict["prompt"]
+                    request_dict["prompt"] = f"{uid} {base}" if base else str(uid)
+                    request_dict["images"] = build_synthetic_image_uris(
+                        args.image_size, args.num_images, start_id=uid * args.num_images)
                 user_requests.append(request_dict)
 
             run_data = run_benchmark_batch(

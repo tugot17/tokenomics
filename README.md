@@ -148,20 +148,22 @@ Bundled configs under `examples/dataset_configs/`:
 
 ### Vision / multimodal
 
-Attach images to every request with `--num-images` and `--image-size`, turning any completion run into a VL benchmark. Images are sent as OpenAI content parts (`image_url` base64 `data:` URIs, accepted by SGLang and vLLM). Everything else is orthogonal: text length comes from `--scenario` (or `--replay-dataset`), output from `--max-tokens`, and you sweep concurrency as usual — so latency/throughput vs concurrency plots via `plot-completion` unchanged.
+Attach images to every request with `--num-images` (and `--image-size`), turning any completion run into a VL benchmark. Images are sent as OpenAI content parts (`image_url` base64 `data:` URIs, accepted by SGLang and vLLM), and you sweep concurrency as usual — so latency/throughput vs concurrency via `plot-completion` is unchanged.
 
 ```bash
 tokenomics completion \
   --model your-vl-model \
-  --scenario "D(1024,32)" \
   --num-images 5 --image-size 512 \
   --max-concurrency 1,2,4,8,16 \
   --results-dir results/vl_512x5/
 ```
 
-- Synthetic images are plain white PNGs built on the fly (content doesn't affect VL speed), each stamped with its index so the server's multimodal cache can't dedupe them.
-- `--image-size` accepts `N` (square) or `WxH`.
-- Sweeping image size/count is external composition — loop the command over `--image-size`/`--num-images` values, one `--results-dir` each, then overlay with `plot-completion`.
+Image runs use short, deterministic defaults (the images dominate, the text is padding): a fixed filler prompt of `--input-tokens` (default 32), `--max-tokens` 32 output, and greedy decoding (temperature 0). Override any of them explicitly.
+
+- `--input-tokens` sets the filler length (`0` = images only); `--image-size` is `N` or `WxH`.
+- Synthetic images are white PNGs built on the fly (content doesn't affect VL speed). Every request gets a **unique** prompt id and **unique** images, so the server's prefix and multimodal caches can't dedupe them and undercount compute — while staying fully reproducible.
+- Sweep image size/count/text-length by looping the command (one `--results-dir` each) and overlaying with `plot-completion` — nothing is baked in.
+- Pass an explicit `--scenario` instead to drive the text from the dataset sampler (e.g. images on top of realistic prompts).
 
 ### Key Options
 
@@ -175,10 +177,12 @@ tokenomics completion \
 | `--max-concurrency` | Sustained mode sweep points |
 | `--num-prompts` | Prompts per sweep point in sustained mode |
 | `--num-runs` | Runs per sweep point (default: 3) |
-| `--max-tokens` | Max output tokens (default: 4096) |
+| `--max-tokens` | Max output tokens (default: 4096; 32 for image runs) |
 | `--ignore-eos` | Generate exactly `--max-tokens` per request, ignoring EOS (SGLang/vLLM). Fixes output length for clean cross-harness throughput comparison |
 | `--num-images` | Attach N synthetic (white) images to each request (0 = text-only, default) |
 | `--image-size` | Synthetic image size: `N` or `WxH` (default: 512; used when `--num-images` > 0) |
+| `--input-tokens` | Filler-text length for image runs without `--scenario` (default: 32; 0 = images only) |
+| `--temperature` | Sampling temperature (default: 0.7; 0.0 for image runs) |
 | `-n` | Completions per request (default: 1) |
 | `--stream` | Enable SSE streaming for TTFT/per-token metrics |
 | `--dataset-config` | Path to dataset config (default: bundled AIME) |

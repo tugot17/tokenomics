@@ -119,6 +119,43 @@ class DatasetReplaySampler:
         return out
 
 
+class FixedFillerSampler:
+    """Deterministic fixed-length filler text, same base prompt for every request.
+
+    For image/VL runs the text is just padding to a target input length and its
+    content doesn't affect speed, so we use a reproducible fixed filler of
+    ~``input_tokens`` tokens (0 -> empty). The benchmark loop makes each request
+    unique (it prefixes a request id) to avoid server-side prefix caching, so the
+    identical base prompt here is fine. Same ``sample_batch`` / ``tokenizer``
+    surface as :class:`TextSampler`, so it is a drop-in replacement.
+    """
+
+    def __init__(self, tokenizer_name: str, input_tokens: int, max_tokens: int):
+        self.tokenizer = Tokenizer.from_pretrained(tokenizer_name)
+        self.max_tokens = max_tokens
+        self.prompt = self._build_filler(input_tokens)
+
+    def _build_filler(self, n_tokens: int) -> str:
+        if n_tokens <= 0:
+            return ""
+        seed_text = "The quick brown fox jumps over the lazy dog. "
+        ids = self.tokenizer.encode(seed_text * (n_tokens // 8 + 2), add_special_tokens=False).ids
+        while len(ids) < n_tokens:
+            ids = ids + ids
+        return self.tokenizer.decode(ids[:n_tokens])
+
+    def _count_tokens(self, text: str) -> int:
+        try:
+            return len(self.tokenizer.encode(text, add_special_tokens=True).ids)
+        except Exception:
+            return int(len(text.split()) * 1.3)
+
+    def sample_batch(self, scenario: Scenario, batch_size: int) -> List[UserRequest]:
+        it = self._count_tokens(self.prompt) if self.prompt else 0
+        return [UserRequest(self.prompt, self.max_tokens, it, it, self.max_tokens)
+                for _ in range(batch_size)]
+
+
 @contextlib.contextmanager
 def use_seed(seed: int):
     state = random.getstate()
