@@ -163,7 +163,7 @@ Image runs default to a short workload (the images dominate, the text is padding
 - `--input-tokens` sets the filler length (`0` = images only). `--image-size` is `N` for a square or `WxH` for a rectangle — e.g. `--image-size 512` (512×512) or `--image-size 1024x768` (width × height, lowercase `x`, no spaces).
 - Synthetic images are random-noise PNGs built on the fly, seeded per request so they're **unique** (defeating the server's prefix/multimodal caches) yet reproducible. Note noise is nearly incompressible (~MBs at 1024×1024), so keep image size/count sane or the payload dominates.
 - Sweep image size/count/text-length by looping the command (one `--results-dir` each) and overlaying with `plot-completion` — nothing is baked in.
-- Pass an explicit `--scenario` instead to drive the text from the dataset sampler (e.g. images on top of realistic prompts).
+- `--input-tokens` and `--scenario` are mutually exclusive (both set text length) — pass `--scenario` instead to drive the text from the dataset sampler (e.g. images on top of realistic prompts).
 
 ### Key Options
 

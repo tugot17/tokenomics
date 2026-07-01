@@ -852,7 +852,7 @@ def main():
     # Vision/multimodal: attach synthetic random-noise images to every request
     parser.add_argument("--num-images", type=int, default=0, help="Attach this many synthetic (random-noise) images to each request. 0 = text-only (default).")
     parser.add_argument("--image-size", type=str, default="512", help="Synthetic image size as N (square) or WxH, e.g. 512 or 1024x768 (default: 512). Only used when --num-images > 0.")
-    parser.add_argument("--input-tokens", type=int, default=32, help="Length of the deterministic filler text for image runs when --scenario is not given (default: 32; 0 = images only).")
+    parser.add_argument("--input-tokens", type=int, default=None, help="Length of the deterministic filler text for image runs (default: 32; 0 = images only). Mutually exclusive with --scenario.")
     parser.add_argument("--stream", action="store_true", help="Enable streaming (for TTFT/per-token metrics, lower throughput)")
     parser.add_argument("--description", default="Benchmark", help="Description of the benchmark")
     
@@ -891,11 +891,18 @@ def main():
     elif args.scenario is None and args.num_images == 0:
         parser.error("--scenario is required unless --replay-dataset or --num-images is set")
 
+    # --scenario and --input-tokens both set the text length, two different ways.
+    if args.scenario is not None and args.input_tokens is not None:
+        parser.error("--input-tokens and --scenario are mutually exclusive (both set text length); "
+                     "--scenario drives text via its input value, --input-tokens is for image runs without --scenario")
+
     # Image runs default to short output (the text is just padding and the
     # images dominate): 32 tokens vs 4096 for text-only. Temperature is not
     # mode-dependent — pass --temperature 0 / --ignore-eos for reproducibility.
     if args.max_tokens is None:
         args.max_tokens = 32 if args.num_images > 0 else 4096
+    if args.input_tokens is None:
+        args.input_tokens = 32
 
     # Create LoRA config from command-line arguments
     lora_config = None
