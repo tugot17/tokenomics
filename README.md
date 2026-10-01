@@ -212,3 +212,17 @@ tokenomics plot-embedding embedding_results/ embedding_plot.png
 ```
 
 ![Embedding performance](assets/embeddings_speed.png)
+
+## Scoring Benchmark
+
+Benchmark SGLang's `/v1/score` with explicit label token IDs, using SIS or shared-query MIS. Sweeps query length, items per request and concurrent requests; reports decisions/s, processed input tokens/s, and burst latency.
+
+```bash
+tokenomics score --model your-model --mode mis --workload workload.json \
+  --query-lengths 260,1040,5200 --items 1,2 \
+  --batch-sizes 1,2,4,8,16,32 --results-dir score_results/
+
+tokenomics plot-score score_results/ score.png
+```
+
+Start the server with radix caching disabled and the matching SIS/MIS configuration. See [scoring benchmarks](docs/scoring.md) for workload preparation, server requirements and metric definitions.
