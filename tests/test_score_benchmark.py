@@ -1,191 +1,249 @@
 import argparse
-import asyncio
 import contextlib
+import copy
 import io
 import json
 import tempfile
+from unittest.mock import patch
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from aiohttp import web
+from tokenomics.score_benchmark import (
+    main, benchmark, build_request, load_records, parse_response, summarize,
+    validate_config,
+)
 
-from tokenomics.score_benchmark import benchmark, load_workload, payloads, positive_ints, validate_response
-
-WORKLOAD = {"query_prefix": [10], "query_suffix": [11], "filler_token_ids": [12, 13, 14],
-            "items": [[20, 21], [22, 23, 24]], "label_token_ids": [30, 31]}
+EXAMPLES = Path(__file__).resolve().parents[1] / 'examples' / 'scoring'
 
 
-class WorkloadTests(unittest.TestCase):
-    def test_states_match_across_concurrency_and_item_count(self):
-        first = payloads(WORKLOAD, "test", (10, 1, 2), 0, 42)
-        more = payloads(WORKLOAD, "test", (10, 2, 4), 0, 42)
-        for a, b in zip(first, more):
-            a, b = json.loads(a), json.loads(b)
-            self.assertEqual(a["query"], b["query"])
-            self.assertEqual(len(a["query"]), 10)
-            self.assertEqual(a["items"], b["items"][:1])
-        self.assertNotEqual(first, payloads(WORKLOAD, "test", (10, 1, 2), 1, 42))
+def config(name='pointwise'):
+    return dict(json.loads((EXAMPLES / f'{name}.json').read_text()), formulation=name)
 
-    def test_invalid_workload(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "workload.json"
-            for key, value in [("label_token_ids", [1, 1]), ("items", [[]]),
-                               ("filler_token_ids", []), ("query_prefix", [True])]:
-                with self.subTest(key=key):
-                    path.write_text(json.dumps({**WORKLOAD, key: value}))
-                    with self.assertRaises(ValueError):
-                        load_workload(path)
-        for text in ["0,1", "1,1", "-2"]:
-            with self.assertRaises(argparse.ArgumentTypeError):
-                positive_ints(text)
 
-    def test_invalid_responses(self):
-        for scores in [[], [[1]], [[float("nan"), 0]], [[-.1, 1.1]], [[.2, .2]]]:
-            with self.subTest(scores=scores), self.assertRaises(ValueError):
-                validate_response({"scores": scores, "usage": {"prompt_tokens": 10}}, 1, 2, 10)
+class RequestTests(unittest.TestCase):
+    def setUp(self):
+        self.record = load_records(EXAMPLES / 'candidate_sets.jsonl')[0]
+
+    def test_pointwise_isolation(self):
+        original = build_request(self.record, config(), 'model')
+        changed = copy.deepcopy(self.record)
+        changed['candidates'][1] = 'UNIQUE REPLACEMENT'
+        updated = build_request(changed, config(), 'model')
+        self.assertEqual(original['query'], updated['query'])
+        self.assertEqual(original['items'][0], updated['items'][0])
+        self.assertEqual(original['items'][2], updated['items'][2])
+        self.assertNotEqual(original['items'][1], updated['items'][1])
+        for candidate in self.record['candidates']:
+            self.assertNotIn(candidate, original['query'])
+
+    def test_setwise_joint_choice(self):
+        cfg = config('setwise')
+        for count in (2, 3):
+            record = dict(self.record, candidates=self.record['candidates'][:count])
+            body = build_request(record, cfg, 'model')
+            self.assertEqual(len(body['items']), 1)
+            self.assertEqual(len(body['label_token_ids']), count)
+            for candidate in record['candidates']:
+                self.assertIn(candidate, body['items'][0])
         with self.assertRaises(ValueError):
-            validate_response({"scores": [[.5, .5]], "usage": {"prompt_tokens": 9}}, 1, 2, 10)
+            build_request(dict(self.record, candidates=['x'] * 4), cfg, 'model')
+
+    def test_invalid_configs(self):
+        invalid = [[], dict(config(), formulation='unknown'),
+                   dict(config(), item_template='{options}'),
+                   dict(config(), positive_label_index=True)]
+        duplicate = config()
+        duplicate['labels'][1]['token_id'] = duplicate['labels'][0]['token_id']
+        invalid.append(duplicate)
+        for cfg in invalid:
+            with self.subTest(cfg=cfg), self.assertRaises(ValueError):
+                validate_config(cfg)
+
+    def test_response_selection_and_validation(self):
+        for name, scores in [('pointwise', [[.1, .9], [.8, .2], [.2, .8]]),
+                             ('setwise', [[.1, .8, .1]])]:
+            cfg = config(name)
+            body = build_request(self.record, cfg, 'model')
+            response = {'scores': scores, 'usage': {'prompt_tokens': 30}}
+            self.assertEqual(parse_response(response, body, cfg, 3), (1, 30))
+            invalid = [[], dict(response, usage=None), dict(response, scores=[]),
+                       dict(response, scores=[[float('nan')] * len(row) for row in scores]),
+                       dict(response, scores=[[.1] * len(row) for row in scores])]
+            for value in invalid:
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    parse_response(value, body, cfg, 3)
+
+    def test_metrics_count_complete_sets_and_include_failure_time(self):
+        success = dict(success=True, candidate_count=16, prompt_tokens=100, correct=True, latency_ms=10)
+        result = summarize([{'wall_seconds': 2, 'requests': [success]},
+                            {'wall_seconds': 3, 'requests': [{'success': False}]}])
+        self.assertEqual(result['decisions_per_second'], .2)
+        self.assertEqual(result['completed_candidates'], 16)
+        self.assertEqual(result['failed_candidate_sets'], 1)
+        self.assertEqual(result['input_tokens_per_second'], 20)
+        self.assertEqual(result['accuracy_on_successful_labelled_sets'], 1)
+
+    def test_invalid_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'dataset.jsonl'
+            for record in ([], {'state': 'x', 'candidates': ['a']},
+                           {'state': 'x', 'candidates': ['a', 'b'], 'expected_index': 2}):
+                path.write_text(json.dumps(record))
+                with self.assertRaises(ValueError):
+                    load_records(path)
 
 
-class ServerTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.workload = self.root / "workload.json"
-        self.workload.write_text(json.dumps(WORKLOAD))
-        self.mode = "mis"
-        self.cache_disabled = True
-        self.failure = None
-        self.calls = self.active = self.peak = 0
+class CLITests(unittest.TestCase):
+    def test_formulation_is_required_and_validated(self):
+        # Even an old config containing a formulation cannot replace the CLI flag.
+        for extra in ([], ['--formulation', 'unknown']):
+            argv = ['score', '--model', 'test', '--config', 'unused.json',
+                    '--dataset', 'unused.jsonl', '--results-dir', 'unused', *extra]
+            with patch('sys.argv', argv), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as exited:
+                    main()
+                self.assertEqual(exited.exception.code, 2)
+                self.assertIn('--formulation', err.getvalue())
 
-        async def info(request):
-            return web.json_response({"enable_mis": self.mode == "mis",
-                                      "disable_radix_cache": self.cache_disabled})
-
-        async def score(request):
-            body = await request.json()
-            self.calls += 1
-            self.active += 1
-            self.peak = max(self.peak, self.active)
-            await asyncio.sleep(.002)
-            self.active -= 1
-            if self.failure == "http":
-                return web.Response(status=500, text="injected failure")
-            query, items = body["query"], body["items"]
-            sequences = [query + item for item in items]
-            tokens = sum(map(len, sequences))
-            if self.mode == "mis":
-                tokens = len(query) + sum(map(len, items)) + len(items) + 1
-            if self.failure == "tokens":
-                tokens += 1
-            return web.json_response({"scores": [[.25, .75] for _ in items],
-                                      "usage": {"prompt_tokens": tokens}})
-
-        app = web.Application()
-        app.router.add_get("/get_server_info", info)
-        app.router.add_post("/v1/score", score)
-        self.runner = web.AppRunner(app)
-        await self.runner.setup()
-        site = web.TCPSite(self.runner, "127.0.0.1", 0)
-        await site.start()
-        self.url = f"http://127.0.0.1:{self.runner.addresses[0][1]}/v1"
-
-    async def asyncTearDown(self):
-        await self.runner.cleanup()
-        self.temp.cleanup()
-
-    def args(self, name="results"):
-        return SimpleNamespace(workload=str(self.workload), model="test", mode=self.mode,
-                               api_base=self.url, query_lengths=[10], items=[1, 2],
-                               batch_sizes=[1, 3], num_runs=2, warmup_runs=1, seed=42,
-                               timeout=5, results_dir=str(self.root / name))
-
-    async def test_sis_and_mis_accounting(self):
-        for mode in ["sis", "mis"]:
-            self.mode = mode
-            args = self.args(mode)
-            with contextlib.redirect_stdout(io.StringIO()):
-                await benchmark(args)
-            out = Path(args.results_dir)
-            self.assertEqual(json.loads((out / "metadata.json").read_text())["status"], "complete")
-            raw = [json.loads(line) for line in (out / "bursts.jsonl").read_text().splitlines()]
-            self.assertEqual(len(raw), 12)
-            self.assertEqual(sum(row["warmup"] for row in raw), 4)
-            for row in raw:
-                n, c = row["items"], row["concurrency"]
-                suffixes = 2 if n == 1 else 5
-                processed = c * (10 + suffixes + n + 1) if mode == "mis" else c * (10 * n + suffixes)
-                self.assertEqual(row["input_tokens"], processed)
-                self.assertAlmostEqual(row["decisions_per_second"], c * n * 1000 / row["burst_latency_ms"])
-                self.assertEqual(len(row["requests"]), c)
-            summary = json.loads((out / "summary.json").read_text())
-            self.assertEqual(len(summary), 4)
-            self.assertTrue(all(row["runs"] == 2 for row in summary))
-            self.assertTrue((out / "summary.csv").is_file())
-            with self.assertRaises(FileExistsError):
-                await benchmark(args)
-        self.assertEqual(self.peak, 3)
-
-    async def test_failures_preserve_burst_without_retry_or_summary(self):
-        for failure in ["http", "tokens"]:
-            self.failure = failure
-            before = self.calls
-            args = self.args(failure)
-            args.batch_sizes, args.items, args.warmup_runs = [3], [2], 0
-            warning = io.StringIO()
-            with contextlib.redirect_stderr(warning), self.assertRaises(RuntimeError):
-                await benchmark(args)
-            self.assertIn("WARNING: 3/3 requests failed", warning.getvalue())
-            out = Path(args.results_dir)
-            self.assertEqual(self.calls - before, 3)
-            self.assertEqual(json.loads((out / "metadata.json").read_text())["status"], "failed")
-            raw = [json.loads(line) for line in (out / "bursts.jsonl").read_text().splitlines()]
-            self.assertEqual(len(raw), 1)
-            self.assertEqual(raw[0]["errors"], 3)
-            self.assertNotIn("decisions_per_second", raw[0])
-            self.assertFalse((out / "summary.json").exists())
-
-    async def test_server_configuration_is_checked(self):
-        args = self.args("mode")
-        args.mode = "sis"
-        with self.assertRaisesRegex(ValueError, "enable_mis"):
-            await benchmark(args)
-        self.cache_disabled = False
-        with self.assertRaisesRegex(ValueError, "radix"):
-            await benchmark(self.args("cache"))
-        self.assertEqual(self.calls, 0)
+    def test_explicit_formulations_are_saved_by_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for mode in ('pointwise', 'setwise'):
+                out = Path(tmp) / mode
+                argv = ['score', '--model', 'test', '--formulation', mode,
+                        '--config', str(EXAMPLES / f'{mode}.json'),
+                        '--dataset', str(EXAMPLES / 'candidate_sets.jsonl'),
+                        '--results-dir', str(out), '--dry-run']
+                with patch('sys.argv', argv):
+                    main()
+                metadata = json.loads((out / 'metadata.json').read_text())
+                self.assertEqual(metadata['formulation'], mode)
+                self.assertEqual(metadata['config']['formulation'], mode)
 
 
 class PlotTests(unittest.TestCase):
-    def test_axes_include_all_item_counts_without_status_check(self):
-        from matplotlib.figure import Figure
+    def test_candidate_set_results_render(self):
         from tokenomics.plot_score_benchmark import plot_score_benchmark
-        from tokenomics.score_benchmark import METRICS
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            metadata = {"status": "complete", "arguments": {"model": "test", "mode": "mis", "num_runs": 2}}
-            (root / "metadata.json").write_text(json.dumps(metadata))
-            rows = [{"query_tokens": 10, "items": n, "concurrency": 1,
-                     **{metric: {"mean": value, "std": 0} for metric in METRICS}}
-                    for n, value in [(1, 1), (16, 100)]]
-            (root / "summary.json").write_text(json.dumps(rows))
-
-            def inspect(figure, *args, **kwargs):
-                self.assertEqual(len(figure.axes), 3)
-                for ax in figure.axes:
-                    self.assertEqual(len(ax.lines), 2)
-                    self.assertGreaterEqual(ax.get_ylim()[1], 100)
-
-            with patch.object(Figure, "savefig", autospec=True, side_effect=inspect):
-                plot_score_benchmark(root, root / "plot.png")
-            metadata["status"] = "failed"
-            (root / "metadata.json").write_text(json.dumps(metadata))
-            with patch.object(Figure, "savefig", autospec=True, side_effect=inspect):
-                plot_score_benchmark(root, root / "plot.png")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / 'metadata.json').write_text(json.dumps({
+                'model': 'test', 'formulation': 'setwise'}))
+            (path / '1.json').write_text(json.dumps({
+                'batch_size': 1, 'decisions_per_second': 2,
+                'input_tokens_per_second': 100, 'latency_ms_mean': 500,
+                'failed_candidate_sets': 0}))
+            (path / '2.json').write_text(json.dumps({
+                'batch_size': 2, 'decisions_per_second': 0,
+                'input_tokens_per_second': 0, 'latency_ms_mean': None,
+                'failed_candidate_sets': 2}))
+            output = path / 'plot.png'
+            plot_score_benchmark(path, output)
+            self.assertTrue(output.read_bytes().startswith(b'\x89PNG'))
 
 
-if __name__ == "__main__":
+class HTTPTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.posts = []
+        self.mis = False
+        self.info_status = 200
+        self.malformed = False
+
+        async def info(request):
+            return web.json_response({'enable_mis': self.mis}, status=self.info_status)
+
+        async def score(request):
+            body = await request.json()
+            self.posts.append(body)
+            if self.malformed:
+                return web.json_response({'scores': []})
+            n = len(body['label_token_ids'])
+            return web.json_response({'scores': [[1 / n] * n for _ in body['items']],
+                                      'usage': {'prompt_tokens': 100}})
+
+        app = web.Application()
+        app.router.add_get('/get_server_info', info)
+        app.router.add_post('/v1/score', score)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        self.addAsyncCleanup(runner.cleanup)
+        site = web.TCPSite(runner, '127.0.0.1', 0)
+        await site.start()
+        self.base = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/v1'
+
+    def args(self, name, **overrides):
+        values = dict(formulation=name, config=str(EXAMPLES / f'{name}.json'),
+                      dataset=str(EXAMPLES / 'candidate_sets.jsonl'), model='test-model',
+                      results_dir=str(Path(self.tmp.name) / name), num_prompts=None,
+                      batch_sizes=[1, 2], num_runs=2, warmup_runs=1, seed=42,
+                      api_base=self.base, api_key=None, timeout=5, dry_run=False)
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    async def run_quietly(self, args):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return await benchmark(args)
+
+    async def test_all_presets_replay_same_records(self):
+        digests = []
+        request_hashes = {}
+        for name, self.mis in (('pointwise', False), ('pointwise', True), ('setwise', False), ('setwise', True)):
+            self.posts.clear()
+            args = self.args(name, results_dir=str(Path(self.tmp.name) / f'{name}_{self.mis}'))
+            self.assertTrue(await self.run_quietly(args))
+            out = Path(args.results_dir)
+            metadata = json.loads((out / 'metadata.json').read_text())
+            self.assertEqual(metadata['formulation'], name)
+            digests.append(metadata['dataset_sha256'])
+            self.assertEqual(metadata['server']['enable_mis'], self.mis)
+            if name in request_hashes:
+                self.assertEqual(request_hashes[name], metadata['request_sha256'])
+            request_hashes[name] = metadata['request_sha256']
+            self.assertEqual(len(self.posts), 18)  # (warmup + two runs) * three sets * two concurrency levels
+            self.assertTrue(all(len(b['items']) == (1 if name.startswith('setwise') else 3) for b in self.posts))
+            for batch in (1, 2):
+                result = json.loads((out / f'{batch}.json').read_text())
+                self.assertEqual(result['formulation'], name)
+                self.assertEqual(result['completed_candidate_sets'], 6)
+                self.assertEqual(result['completed_candidates'], 18)
+                self.assertGreater(result['latency_ms_mean'], 0)
+            self.assertEqual(len((out / 'bursts.jsonl').read_text().splitlines()), 10)
+        self.assertEqual(len(set(digests)), 1)
+
+    async def test_server_metadata_is_optional(self):
+        self.info_status = 404
+        args = self.args('pointwise')
+        self.assertTrue(await self.run_quietly(args))
+        metadata = json.loads((Path(args.results_dir) / 'metadata.json').read_text())
+        self.assertIn('server_info_error', metadata)
+        self.assertTrue(self.posts)
+
+    async def test_measured_failures_are_preserved(self):
+        self.malformed = True
+        args = self.args('pointwise', warmup_runs=0)
+        self.assertFalse(await self.run_quietly(args))
+        result = json.loads((Path(args.results_dir) / '1.json').read_text())
+        self.assertEqual(result['failed_candidate_sets'], 6)
+        self.assertEqual(result['decisions_per_second'], 0)
+        self.assertIsNone(result['latency_ms_mean'])
+
+    async def test_warmup_failure_aborts(self):
+        self.malformed = True
+        args = self.args('setwise')
+        with self.assertRaises(RuntimeError):
+            await self.run_quietly(args)
+        self.assertTrue((Path(args.results_dir) / 'warmup_failure.json').exists())
+        self.assertFalse((Path(args.results_dir) / '1.json').exists())
+
+    async def test_dry_run_and_overwrite_guard(self):
+        args = self.args('setwise', dry_run=True, api_base='http://invalid.invalid')
+        self.assertTrue(await self.run_quietly(args))
+        self.assertEqual(self.posts, [])
+        self.assertEqual(len((Path(args.results_dir) / 'requests.jsonl').read_text().splitlines()), 3)
+        with self.assertRaises(FileExistsError):
+            await self.run_quietly(args)
+
+
+if __name__ == '__main__':
     unittest.main()

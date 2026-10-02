@@ -19,6 +19,13 @@ uv venv --python 3.12 --seed && source .venv/bin/activate
 uv pip install -e .
 ```
 
+## Scoring Benchmark
+
+`tokenomics score` benchmarks SGLang `/v1/score` with a required
+`--formulation pointwise|setwise` argument and no default. The selected formulation
+is saved in metadata and each result JSON. SIS/MIS is configured on the server.
+See [usage, configs and results](examples/scoring/README.md).
+
 ## Completion Benchmark
 
 Sends chat completion requests to any OpenAI-compatible server and records per-request and system-wide metrics. Requests are non-streaming by default (max throughput); `--stream` adds TTFT and per-token metrics.
@@ -212,17 +219,3 @@ tokenomics plot-embedding embedding_results/ embedding_plot.png
 ```
 
 ![Embedding performance](assets/embeddings_speed.png)
-
-## Scoring Benchmark
-
-Benchmark SGLang's `/v1/score` with explicit label token IDs, using SIS or shared-query MIS. Sweeps query length, items per request and concurrent requests; reports decisions/s, processed input tokens/s, and burst latency.
-
-```bash
-tokenomics score --model your-model --mode mis --workload workload.json \
-  --query-lengths 260,1040,5200 --items 1,2 \
-  --batch-sizes 1,2,4,8,16,32 --results-dir score_results/
-
-tokenomics plot-score score_results/ score.png
-```
-
-Start the server with radix caching disabled and the matching SIS/MIS configuration. See [scoring benchmarks](docs/scoring.md) for workload preparation, server requirements and metric definitions.

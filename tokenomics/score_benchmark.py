@@ -1,256 +1,282 @@
-"""Synchronized burst benchmarks for SGLang's next-token scoring API."""
-
+"""Replay candidate sets through SGLang /v1/score with explicit prompt semantics."""
 import argparse
 import asyncio
-import csv
 import hashlib
-import itertools
 import json
 import math
 import os
 import random
 import statistics
-import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
 
-from . import __version__
-from .io import atomic_write_json
-
-METRICS = ("decisions_per_second", "input_tokens_per_second",
-           "burst_latency_ms")
+from tokenomics.io import atomic_write_json
 
 
-def positive_ints(value):
-    values = [int(x) for x in value.split(",")]
-    if not values or min(values) < 1 or len(set(values)) != len(values):
-        raise argparse.ArgumentTypeError("expected distinct positive integers, separated by commas")
-    return values
+def encode(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
 
 
-def load_workload(path):
-    workload = json.loads(Path(path).read_text())
-    if not isinstance(workload, dict):
-        raise ValueError("workload must be a JSON object")
-    for key in ("query_prefix", "query_suffix", "filler_token_ids", "label_token_ids"):
-        validate_ids(workload[key], key, allow_empty=key.startswith("query_"))
-    if not isinstance(workload["items"], list) or not workload["items"]:
-        raise ValueError("items must be a nonempty list of token-ID lists")
-    for item in workload["items"]:
-        validate_ids(item, "item")
-    if len(set(workload["label_token_ids"])) != len(workload["label_token_ids"]):
-        raise ValueError("label_token_ids must be unique")
-    return workload
+def validate_config(config):
+    if not isinstance(config, dict):
+        raise ValueError("Config must be an object")
+    mode = config.get("formulation")
+    if mode not in ("pointwise", "setwise"):
+        raise ValueError("formulation must be pointwise/setwise")
+    for key in ("query_template", "item_template"):
+        if not isinstance(config.get(key), str):
+            raise ValueError(f"{key} must be a string")
+    # Explicit fields prevent accidentally exposing siblings in pointwise requests.
+    import string
+    allowed = {"query_template": {"state"}, "item_template": {"candidate"} if mode == "pointwise" else {"options", "labels"}}
+    for key, fields in allowed.items():
+        for _, field, spec, conversion in string.Formatter().parse(config[key]):
+            if field is not None and (field not in fields or spec or conversion):
+                raise ValueError(f"Unsupported placeholder in {key}: {field}")
+    required = "{candidate}" if mode == "pointwise" else "{options}"
+    if "{state}" not in config["query_template"] or required not in config["item_template"]:
+        raise ValueError("Templates must include state and candidate/options placeholders")
+    labels = config.get("labels")
+    if not isinstance(labels, list) or len(labels) < 2:
+        raise ValueError("At least two labels are required")
+    ids, texts = [], []
+    for label in labels:
+        if not isinstance(label, dict) or not isinstance(label.get("text"), str) or not label["text"]:
+            raise ValueError("Each label needs nonempty text and a token_id")
+        token_id = label.get("token_id")
+        if type(token_id) is not int or token_id < 0:
+            raise ValueError("Label token IDs must be nonnegative integers")
+        ids.append(token_id)
+        texts.append(label["text"])
+    if len(set(ids)) != len(ids) or len(set(texts)) != len(texts):
+        raise ValueError("Label texts and token IDs must be unique")
+    positive = config.get("positive_label_index", 0)
+    if type(positive) is not int or not 0 <= positive < len(labels):
+        raise ValueError("positive_label_index is outside the labels")
 
 
-def validate_ids(values, name, allow_empty=False):
-    if (not isinstance(values, list) or (not values and not allow_empty)
-            or any(type(x) is not int or x < 0 for x in values)):
-        raise ValueError(f"{name} must contain nonnegative integer token IDs")
+def load_records(path):
+    records = []
+    for line in Path(path).read_text().splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise ValueError("Each record must be an object")
+        candidates = record.get("candidates")
+        if not isinstance(record.get("state"), str) or not isinstance(candidates, list) or len(candidates) < 2:
+            raise ValueError("Each record needs state and at least two candidates")
+        if not all(isinstance(x, str) and x for x in candidates):
+            raise ValueError("Candidates must be nonempty strings")
+        expected = record.get("expected_index")
+        if expected is not None and (type(expected) is not int or not 0 <= expected < len(candidates)):
+            raise ValueError("expected_index must identify a candidate")
+        records.append(record)
+    if not records:
+        raise ValueError("Dataset is empty")
+    return records
 
 
-def payloads(workload, model, config, run, seed):
-    length, items, concurrency = config
-    count = length - len(workload["query_prefix"]) - len(workload["query_suffix"])
-    # The first C states match across concurrency and item-count sweeps.
-    rng = random.Random(f"{seed}:{length}:{run}")
-    bodies = []
-    for _ in range(concurrency):
-        query = (workload["query_prefix"] + rng.choices(workload["filler_token_ids"], k=count)
-                 + workload["query_suffix"])
-        body = {"model": model, "query": query, "items": workload["items"][:items],
-                "label_token_ids": workload["label_token_ids"], "apply_softmax": True}
-        bodies.append(json.dumps(body, separators=(",", ":")).encode())
-    return bodies
+def build_request(record, config, model):
+    validate_config(config)
+    labels = config["labels"]
+    query = config["query_template"].format(state=record["state"])
+    if config["formulation"] == "pointwise":
+        items = [config["item_template"].format(candidate=c) for c in record["candidates"]]
+    elif config["formulation"] == "setwise":
+        if len(record["candidates"]) > len(labels):
+            raise ValueError("Setwise needs one configured label token per candidate")
+        labels = labels[:len(record["candidates"])]
+        options = "\n".join(f"{label['text']}) {candidate}" for label, candidate in zip(labels, record["candidates"]))
+        items = [config["item_template"].format(options=options, labels=", ".join(x["text"] for x in labels))]
+    return {"model": model, "query": query, "items": items,
+            "label_token_ids": [x["token_id"] for x in labels], "apply_softmax": True}
 
 
-def input_token_count(workload, config, mode):
-    length, items, concurrency = config
-    suffixes = sum(map(len, workload["items"][:items]))
-    if mode == "mis":
-        return concurrency * (length + suffixes + items + 1)
-    return concurrency * (items * length + suffixes)
-
-
-def validate_response(response, items, labels, expected_tokens):
+def parse_response(response, body, config, candidate_count):
+    if not isinstance(response, dict):
+        raise ValueError("Score response must be an object")
     scores = response.get("scores")
-    if not isinstance(scores, list) or len(scores) != items:
-        raise ValueError("incorrect number of score rows")
+    if not isinstance(scores, list) or len(scores) != len(body["items"]):
+        raise ValueError("Unexpected score row count")
     for row in scores:
-        if (not isinstance(row, list) or len(row) != labels
-                or any(type(x) not in (int, float) or not math.isfinite(x) or x < 0 for x in row)
-                or abs(sum(row) - 1) > 1e-4):
-            raise ValueError("invalid normalized label scores")
-    tokens = response.get("usage", {}).get("prompt_tokens")
-    if type(tokens) is not int or tokens != expected_tokens:
-        raise ValueError(f"prompt token count: expected {expected_tokens}, received {tokens}")
+        if not isinstance(row, list) or len(row) != len(body["label_token_ids"]):
+            raise ValueError("Unexpected label score count")
+        if not all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 1 for v in row):
+            raise ValueError("Scores must be finite probabilities")
+        if abs(sum(row) - 1) > 1e-4:
+            raise ValueError("Scores are not normalized over labels")
+    if config["formulation"] == "pointwise":
+        if len(scores) != candidate_count:
+            raise ValueError("Missing pointwise candidate scores")
+        values = [row[config.get("positive_label_index", 0)] for row in scores]
+    elif config["formulation"] == "setwise":
+        values = scores[0]
+        if len(values) != candidate_count:
+            raise ValueError("Missing setwise choice scores")
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        raise ValueError("Response must include usage")
+    tokens = usage.get("prompt_tokens")
+    if type(tokens) is not int or tokens < 0:
+        raise ValueError("Response must report nonnegative usage.prompt_tokens")
+    return max(range(len(values)), key=values.__getitem__), tokens
 
 
-async def burst(session, url, bodies, config, run, workload, mode):
-    length, items, concurrency = config
-    processed = input_token_count(workload, config, mode)
-    gate = asyncio.Event()
-
-    async def request(body):
-        digest = hashlib.sha256(body).hexdigest()
-        await gate.wait()
-        dispatched = time.perf_counter()
-        result = {"sha256": digest}
-        try:
-            async with session.post(url, data=body) as response:
-                response.raise_for_status()
-                data = await response.json()
-                completed = time.perf_counter()
-            validate_response(data, items, len(workload["label_token_ids"]), processed // concurrency)
-        except Exception as exc:
-            completed = time.perf_counter()
-            result["error"] = str(exc)
-        result.update(latency_ms=1000 * (completed - dispatched),
-                      dispatch_delay_ms=1000 * (dispatched - started),
-                      completion_ms=1000 * (completed - started))
-        return result
-
-    tasks = [asyncio.create_task(request(body)) for body in bodies]
-    await asyncio.sleep(0)
-    started_unix = time.time()
-    started = time.perf_counter()
-    gate.set()
-    try:
-        requests = await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-    # Stop at the last decoded response, before client validation/aggregation.
-    elapsed = max(r["completion_ms"] for r in requests) / 1000
-    result = {"query_tokens": length, "items": items, "concurrency": concurrency,
-              "run": run, "started_unix": started_unix, "requests": requests,
-              "errors": sum("error" in r for r in requests)}
-    if not result["errors"]:
-        result.update(input_tokens=processed,
-                      decisions_per_second=items * concurrency / elapsed,
-                      input_tokens_per_second=processed / elapsed,
-                      burst_latency_ms=elapsed * 1000)
-    return result
+def percentile(values, fraction):
+    values = sorted(values)
+    position = (len(values) - 1) * fraction
+    lo = int(position)
+    hi = min(lo + 1, len(values) - 1)
+    return values[lo] + (values[hi] - values[lo]) * (position - lo)
 
 
-def summarize(rows, configs):
-    summary = []
-    for length, items, concurrency in configs:
-        matching = [r for r in rows if (r["query_tokens"], r["items"], r["concurrency"])
-                    == (length, items, concurrency)]
-        entry = dict(query_tokens=length, items=items, concurrency=concurrency, runs=len(matching))
-        for metric in METRICS:
-            values = [r[metric] for r in matching]
-            entry[metric] = {"mean": statistics.mean(values),
-                             "std": statistics.stdev(values) if len(values) > 1 else 0.0}
-        summary.append(entry)
-    return summary
+def summarize(bursts):
+    requests = [r for b in bursts for r in b["requests"]]
+    successful = [r for r in requests if r["success"]]
+    elapsed = sum(b["wall_seconds"] for b in bursts)
+    labelled = [r for r in successful if r["correct"] is not None]
+    latencies = [r["latency_ms"] for r in successful]
+    return {"attempted_candidate_sets": len(requests), "completed_candidate_sets": len(successful),
+            "failed_candidate_sets": len(requests) - len(successful),
+            "completed_candidates": sum(r["candidate_count"] for r in successful),
+            "decisions_per_second": len(successful) / elapsed,
+            "decision_unit": "one complete candidate set (one HTTP request)",
+            "input_tokens_per_second": sum(r["prompt_tokens"] for r in successful) / elapsed,
+            "latency_ms_mean": statistics.mean(latencies) if latencies else None,
+            "latency_ms_p95": percentile(latencies, .95) if latencies else None,
+            "labelled_successful_sets": len(labelled),
+            "accuracy_on_successful_labelled_sets": sum(r["correct"] for r in labelled) / len(labelled) if labelled else None,
+            "timing": "sum of measured burst completion times; successful-set request latency excludes failures"}
 
 
 async def benchmark(args):
-    workload = load_workload(args.workload)
-    fixed = len(workload["query_prefix"]) + len(workload["query_suffix"])
-    if min(args.query_lengths) <= fixed:
-        raise ValueError("query lengths must leave at least one filler token")
-    if max(args.items) > len(workload["items"]):
-        raise ValueError("item count exceeds the workload's question suffixes")
-    configs = list(itertools.product(args.query_lengths, args.items, args.batch_sizes))
+    config = json.loads(Path(args.config).read_text())
+    if not isinstance(config, dict):
+        raise ValueError("Config must be an object")
+    if "formulation" in config and config["formulation"] != args.formulation:
+        raise ValueError("Config formulation conflicts with --formulation")
+    config["formulation"] = args.formulation
+    validate_config(config)
+    records = load_records(args.dataset)
+    if args.num_prompts is not None:
+        records = records[:args.num_prompts]
+    bodies = [build_request(r, config, args.model) for r in records]
+    encoded = [encode(body) for body in bodies]
     out = Path(args.results_dir)
     out.mkdir(parents=True, exist_ok=False)
+    metadata = {"formulation": args.formulation, "config": config, "model": args.model, "api_base": args.api_base,
+                "dataset_sha256": hashlib.sha256(encode(records)).hexdigest(),
+                "request_sha256": [hashlib.sha256(body).hexdigest() for body in encoded],
+                "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "candidate_sets": len(records), "batch_sizes": args.batch_sizes,
+                "num_runs": args.num_runs, "warmup_runs": args.warmup_runs, "seed": args.seed,
+                "quality_note": "Different formulations need separate quality evaluation; scores are not assumed equivalent.",
+                "http": "fresh connections, no retries, burst execution"}
+    atomic_write_json(str(out / "metadata.json"), metadata)
+    with (out / "requests.jsonl").open("w") as f:
+        for record, body in zip(records, bodies):
+            f.write(json.dumps({"record": record, "body": body}) + "\n")
+    if args.dry_run:
+        return True
+    root = args.api_base.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
     headers = {"Content-Type": "application/json"}
-    if os.environ.get("OPENAI_API_KEY"):
-        headers["Authorization"] = "Bearer " + os.environ["OPENAI_API_KEY"]
-    base = args.api_base.rstrip("/")
-    root = base[:-3] if base.endswith("/v1") else base
-    metadata = {"schema_version": 1, "tokenomics_version": __version__,
-                "started_utc": datetime.now(timezone.utc).isoformat(), "arguments": vars(args),
-                "workload_sha256": hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest(),
-                "implementation_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "connection_policy": "fresh connections; no retries", "status": "running"}
-    atomic_write_json(out / "metadata.json", metadata)
-    atomic_write_json(out / "workload.json", workload)
-    try:
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0, force_close=True), headers=headers,
-            timeout=aiohttp.ClientTimeout(total=args.timeout),
-        ) as session:
-            async with session.get(root + "/get_server_info") as response:
+    if args.api_key:
+        headers["Authorization"] = f"Bearer {args.api_key}"
+    timeout = aiohttp.ClientTimeout(total=args.timeout)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout,
+                                     connector=aiohttp.TCPConnector(limit=0, force_close=True)) as session:
+        # Runtime details are optional metadata, never a client mode constraint.
+        try:
+            async with session.get(root + "/get_server_info",
+                                   timeout=aiohttp.ClientTimeout(total=min(args.timeout, 5))) as response:
                 response.raise_for_status()
-                info = await response.json()
-            server = info.get("server_args", info)
-            if bool(server.get("enable_mis", False)) != (args.mode == "mis"):
-                raise ValueError("--mode does not match the server's enable_mis setting")
-            if not server.get("disable_radix_cache", False):
-                raise ValueError("cold-prefix benchmark requires server --disable-radix-cache")
-            metadata["server"] = info
-            atomic_write_json(out / "metadata.json", metadata)
-            rows = []
-            with (out / "bursts.jsonl").open("w") as raw:
-                for run in range(-args.warmup_runs, args.num_runs):
-                    order = configs.copy()
+                metadata["server"] = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            metadata["server_info_error"] = f"{type(exc).__name__}: {exc}"
+        atomic_write_json(str(out / "metadata.json"), metadata)
+
+        async def request(index):
+            started = time.perf_counter()
+            result = {"record_index": index, "candidate_count": len(records[index]["candidates"]),
+                      "request_sha256": metadata["request_sha256"][index], "success": False}
+            try:
+                async with session.post(root + "/v1/score", data=encoded[index]) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                selected, tokens = parse_response(data, bodies[index], config, result["candidate_count"])
+                expected = records[index].get("expected_index")
+                result.update(success=True, selected_index=selected, prompt_tokens=tokens,
+                              correct=None if expected is None else selected == expected, scores=data["scores"])
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError) as exc:
+                result["error"] = f"{type(exc).__name__}: {exc}"
+            result["latency_ms"] = (time.perf_counter() - started) * 1000
+            return result
+
+        all_ok = True
+        with (out / "bursts.jsonl").open("w") as raw:
+            for batch_size in args.batch_sizes:
+                for _ in range(args.warmup_runs):
+                    for start in range(0, len(records), batch_size):
+                        warm = await asyncio.gather(*(request(i) for i in range(start, min(start + batch_size, len(records)))))
+                        if not all(r["success"] for r in warm):
+                            atomic_write_json(str(out / "warmup_failure.json"), warm)
+                            raise RuntimeError("Scoring warmup failed; see warmup_failure.json")
+                bursts = []
+                for run in range(args.num_runs):
+                    order = list(range(len(records)))
                     random.Random(args.seed + run).shuffle(order)
-                    for config in order:
-                        bodies = payloads(workload, args.model, config, run, args.seed)
-                        row = await burst(session, root + "/v1/score", bodies, config, run, workload, args.mode)
-                        row["warmup"] = run < 0
-                        raw.write(json.dumps(row) + "\n")
+                    for start in range(0, len(order), batch_size):
+                        started = time.perf_counter()
+                        responses = await asyncio.gather(*(request(i) for i in order[start:start + batch_size]))
+                        burst = {"batch_size": batch_size, "run": run, "requests": responses,
+                                 "wall_seconds": time.perf_counter() - started}
+                        bursts.append(burst)
+                        raw.write(json.dumps(burst) + "\n")
                         raw.flush()
-                        if row["errors"]:
-                            print(f"WARNING: {row['errors']}/{config[2]} requests failed "
-                                  f"(run={run}, query={config[0]}, items={config[1]}, "
-                                  f"concurrency={config[2]}). Stopping benchmark; "
-                                  f"details: {out / 'bursts.jsonl'}", file=sys.stderr, flush=True)
-                            raise RuntimeError(f"{row['errors']} requests failed; see {out / 'bursts.jsonl'}")
-                        if run >= 0:
-                            rows.append(row)
-                        print(f"run={run} query={config[0]} items={config[1]} concurrency={config[2]} "
-                              f"{row['decisions_per_second']:.1f} decisions/s, "
-                              f"{row['burst_latency_ms']:.1f} ms", flush=True)
-        summary = summarize(rows, configs)
-        atomic_write_json(out / "summary.json", summary)
-        fields = ["query_tokens", "items", "concurrency", "runs"]
-        fields += [f"{metric}_{stat}" for metric in METRICS for stat in ("mean", "std")]
-        with (out / "summary.csv").open("w") as file:
-            writer = csv.DictWriter(file, fieldnames=fields)
-            writer.writeheader()
-            for row in summary:
-                writer.writerow({**{k: row[k] for k in fields[:4]},
-                                 **{f"{metric}_{stat}": row[metric][stat]
-                                    for metric in METRICS for stat in ("mean", "std")}})
-        metadata["status"] = "complete"
-    except BaseException as exc:
-        metadata.update(status="failed", error=str(exc) or type(exc).__name__)
-        raise
-    finally:
-        atomic_write_json(out / "metadata.json", metadata)
+                result = summarize(bursts)
+                result.update(batch_size=batch_size, formulation=config["formulation"])
+                atomic_write_json(str(out / f"{batch_size}.json"), result)
+                all_ok = all_ok and result["failed_candidate_sets"] == 0
+                print(json.dumps(result), flush=True)
+        return all_ok
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--workload", required=True, help="JSON file containing tokenized prompt parts")
-    parser.add_argument("--mode", choices=("sis", "mis"), required=True)
-    parser.add_argument("--api-base", default="http://localhost:8000/v1")
-    parser.add_argument("--query-lengths", type=positive_ints, default=[260, 1040, 5200])
-    parser.add_argument("--items", type=positive_ints, default=[1])
-    parser.add_argument("--batch-sizes", type=positive_ints, default=[1, 2, 4, 8, 16, 32])
+    parser.add_argument("--formulation", required=True, choices=("pointwise", "setwise"),
+                        help="Required scoring formulation; no default")
+    parser.add_argument("--config", required=True, help="Scoring prompt and label JSON config")
+    parser.add_argument("--dataset", required=True, help="JSONL records: state, candidates, optional expected_index")
+    parser.add_argument("--api-base", default="http://localhost:30000/v1")
+    parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
+    parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent complete candidate sets per burst")
+    parser.add_argument("--num-prompts", type=int, help="Maximum dataset records (no automatic repetition)")
     parser.add_argument("--num-runs", type=int, default=5)
     parser.add_argument("--warmup-runs", type=int, default=2)
-    parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--results-dir", required=True, help="New directory; existing results are never overwritten")
+    parser.add_argument("--timeout", type=float, default=300)
+    parser.add_argument("--results-dir", required=True, help="New output directory; existing results are never overwritten")
+    parser.add_argument("--dry-run", action="store_true", help="Write requests/metadata without contacting a server")
     args = parser.parse_args()
-    if args.num_runs < 1 or args.warmup_runs < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("num-runs and timeout must be positive; warmup-runs must be nonnegative")
     try:
-        asyncio.run(benchmark(args))
-    except (ValueError, KeyError, OSError, RuntimeError, aiohttp.ClientError) as exc:
+        args.batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
+        if not args.batch_sizes or any(x < 1 for x in args.batch_sizes) or len(set(args.batch_sizes)) != len(args.batch_sizes):
+            raise ValueError("batch sizes must be unique positive integers")
+        if args.num_runs < 1 or args.warmup_runs < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError("num-runs/timeout must be positive and warmup-runs nonnegative")
+        if args.num_prompts is not None and args.num_prompts < 1:
+            raise ValueError("num-prompts must be positive")
+        ok = asyncio.run(benchmark(args))
+    except (ValueError, RuntimeError, OSError, asyncio.TimeoutError, aiohttp.ClientError) as exc:
         parser.exit(1, f"error: {exc}\n")
+    if not ok:
+        parser.exit(1, "error: measured scoring requests failed; inspect bursts.jsonl\n")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+{
+  "query_template": "Customer state:\n{state}\n",
+  "item_template": "Choose the best action:\n{options}\nAnswer with one of {labels}:\n",
+  "labels": [
+    {
+      "text": "A",
+      "token_id": 32
+    },
+    {
+      "text": "B",
+      "token_id": 33
+    },
+    {
+      "text": "C",
+      "token_id": 34
+    }
+  ]
+}
