@@ -14,16 +14,16 @@ from tokenomics.score_benchmark import (
     validate_config,
 )
 
-EXAMPLES = Path(__file__).resolve().parents[1] / 'examples' / 'scoring'
+EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
 
 
 def config(name='pointwise'):
-    return dict(json.loads((EXAMPLES / f'{name}.json').read_text()), formulation=name)
+    return dict(json.loads((EXAMPLES / f'score_{name}.json').read_text()), formulation=name)
 
 
 class RequestTests(unittest.TestCase):
     def setUp(self):
-        self.record = load_records(EXAMPLES / 'candidate_sets.jsonl')[0]
+        self.record = load_records(EXAMPLES / 'data' / 'score_candidate_sets.jsonl')[0]
 
     def test_pointwise_isolation(self):
         original = build_request(self.record, config(), 'model')
@@ -135,8 +135,8 @@ class CLITests(unittest.TestCase):
             for mode in ('pointwise', 'setwise'):
                 out = Path(tmp) / mode
                 argv = ['score', '--model', 'test', '--formulation', mode,
-                        '--config', str(EXAMPLES / f'{mode}.json'),
-                        '--dataset', str(EXAMPLES / 'candidate_sets.jsonl'),
+                        '--config', str(EXAMPLES / f'score_{mode}.json'),
+                        '--dataset', str(EXAMPLES / 'data' / 'score_candidate_sets.jsonl'),
                         '--results-dir', str(out), '--dry-run']
                 with patch('sys.argv', argv):
                     main()
@@ -203,8 +203,8 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.base = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}/v1'
 
     def args(self, name, **overrides):
-        values = dict(formulation=name, config=str(EXAMPLES / f'{name}.json'),
-                      dataset=str(EXAMPLES / 'candidate_sets.jsonl'), model='test-model',
+        values = dict(formulation=name, config=str(EXAMPLES / f'score_{name}.json'),
+                      dataset=str(EXAMPLES / 'data' / 'score_candidate_sets.jsonl'), model='test-model',
                       results_dir=str(Path(self.tmp.name) / name), num_prompts=None,
                       batch_sizes=[1, 2], num_runs=2, warmup_runs=1, seed=42,
                       api_base=self.base, api_key=None, timeout=5, dry_run=False)

@@ -247,7 +247,7 @@ async def benchmark(args):
                 schema = await response.json()
             properties = schema.get("components", {}).get("schemas", {}).get("ScoringRequest", {}).get("properties", {})
             if "image_data" not in properties:
-                raise RuntimeError("Server does not advertise image_data for ScoringRequest; install the vision scoring server patch")
+                raise RuntimeError("Server does not advertise image_data for ScoringRequest; image-aware scoring support is required")
             if metadata.get("server", {}).get("enable_mis"):
                 raise RuntimeError("Vision scoring currently requires SIS (disable MIS)")
 

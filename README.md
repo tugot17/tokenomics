@@ -21,11 +21,42 @@ uv pip install -e .
 
 ## Scoring Benchmark
 
-`tokenomics score` benchmarks SGLang `/v1/score` with a required
-`--formulation pointwise|setwise` argument and no default. The selected formulation
-is saved in metadata and each result JSON. SIS/MIS is configured on the server. Optional dataset `images` enable vision
-scoring on image-aware SIS servers (see the companion SGLang patch below).
-See [usage, configs and results](examples/scoring/README.md).
+`tokenomics score` replays candidate sets through SGLang `/v1/score`.
+Choose `--formulation pointwise` (one item per candidate) or `setwise`
+(all candidates in one item). SIS/MIS is configured on the server.
+
+```bash
+tokenomics score --model your-model --api-base http://localhost:30000/v1 \
+  --formulation setwise --config examples/score_setwise.json \
+  --dataset examples/data/score_candidate_sets.jsonl \
+  --batch-sizes 1,8,32,128 --num-runs 1 --warmup-runs 1 \
+  --results-dir results/scoring
+```
+
+For pointwise, use `examples/score_pointwise.json`. Adapt the prompt templates and
+label token IDs to your model; the examples are smoke-test inputs. Dataset JSONL
+rows contain `state`, at least two `candidates`, and optional zero-based
+`expected_index`. Use enough rows to fill the requested concurrency. Config
+templates use `{state}` for the query, `{candidate}` for pointwise items, or
+`{options}` and optional `{labels}` for setwise items.
+
+For vision, add `"images": ["image.png"]` to a row (paths relative to the dataset,
+or base64 image data URIs). Include the model's image markers in the prompt.
+Images are shared across that row's candidates. This requires an image-aware SIS
+server advertising `ScoringRequest.image_data` in `/openapi.json`; the benchmark
+does not add server-side image support. Image upload and server processing are timed;
+local loading/encoding is not. Warmup and replays reuse images: disable server
+image/prefix caches to measure uncached vision throughput.
+
+Each concurrency result reports complete candidate sets/s, server-reported input
+tokens/s, latency, failures, and accuracy on successful labelled sets. Image-token
+accounting depends on the server; submitted images/s does not count encoder calls.
+Requests, responses, hashes, and settings are saved alongside results. Failures
+produce a nonzero exit code. Use a new output directory for each run; `--dry-run`
+saves requests without contacting the server.
+
+Plot results with `tokenomics plot-score results/scoring scoring.png`.
+Run tests with `python -m unittest discover -s tests -v`.
 
 ## Completion Benchmark
 
