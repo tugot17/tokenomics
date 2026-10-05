@@ -1,5 +1,7 @@
 """Replay candidate sets through SGLang /v1/score with explicit prompt semantics."""
 import argparse
+import base64
+import io
 import asyncio
 import hashlib
 import json
@@ -57,6 +59,36 @@ def validate_config(config):
         raise ValueError("positive_label_index is outside the labels")
 
 
+def load_images(values, directory):
+    """Load shared query images before timing; never silently drop an image."""
+    if not isinstance(values, list):
+        raise ValueError("images must be a list of local paths or base64 image data URIs")
+    from PIL import Image
+    images = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise ValueError("Each image must be a nonempty path or data URI")
+        if value.startswith("data:"):
+            header, separator, payload = value.partition(",")
+            if not separator or not header.startswith("data:image/") or not header.endswith(";base64"):
+                raise ValueError("Images require base64 image data URIs")
+            try:
+                data = base64.b64decode(payload, validate=True)
+            except ValueError as exc:
+                raise ValueError("Invalid base64 image") from exc
+        else:
+            if "://" in value:
+                raise ValueError("Use local images or data URIs, not remote URLs")
+            data = (directory / value).read_bytes()
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+            mime = Image.MIME.get(image.format)
+        if not mime:
+            raise ValueError("Unknown image format")
+        images.append(f"data:{mime};base64," + base64.b64encode(data).decode("ascii"))
+    return images
+
+
 def load_records(path):
     records = []
     for line in Path(path).read_text().splitlines():
@@ -73,6 +105,8 @@ def load_records(path):
         expected = record.get("expected_index")
         if expected is not None and (type(expected) is not int or not 0 <= expected < len(candidates)):
             raise ValueError("expected_index must identify a candidate")
+        if "images" in record:
+            record["images"] = load_images(record["images"], Path(path).resolve().parent)
         records.append(record)
     if not records:
         raise ValueError("Dataset is empty")
@@ -91,8 +125,11 @@ def build_request(record, config, model):
         labels = labels[:len(record["candidates"])]
         options = "\n".join(f"{label['text']}) {candidate}" for label, candidate in zip(labels, record["candidates"]))
         items = [config["item_template"].format(options=options, labels=", ".join(x["text"] for x in labels))]
-    return {"model": model, "query": query, "items": items,
+    body = {"model": model, "query": query, "items": items,
             "label_token_ids": [x["token_id"] for x in labels], "apply_softmax": True}
+    if record.get("images"):
+        body["image_data"] = record["images"]
+    return body
 
 
 def parse_response(response, body, config, candidate_count):
@@ -144,6 +181,7 @@ def summarize(bursts):
             "completed_candidates": sum(r["candidate_count"] for r in successful),
             "decisions_per_second": len(successful) / elapsed,
             "decision_unit": "one complete candidate set (one HTTP request)",
+            "submitted_images_per_second": sum(r.get("image_count", 0) for r in successful) / elapsed,
             "input_tokens_per_second": sum(r["prompt_tokens"] for r in successful) / elapsed,
             "latency_ms_mean": statistics.mean(latencies) if latencies else None,
             "latency_ms_p95": percentile(latencies, .95) if latencies else None,
@@ -174,7 +212,9 @@ async def benchmark(args):
                 "candidate_sets": len(records), "batch_sizes": args.batch_sizes,
                 "num_runs": args.num_runs, "warmup_runs": args.warmup_runs, "seed": args.seed,
                 "quality_note": "Different formulations need separate quality evaluation; scores are not assumed equivalent.",
-                "http": "fresh connections, no retries, burst execution"}
+                "http": "fresh connections, no retries, burst execution",
+                "images_per_record": [len(r.get("images", [])) for r in records],
+                "vision_note": "Images are shared query inputs. Loading/encoding is excluded; upload and server processing are timed. Replays reuse images: disable server image/prefix caches to measure uncached vision throughput."}
     atomic_write_json(str(out / "metadata.json"), metadata)
     with (out / "requests.jsonl").open("w") as f:
         for record, body in zip(records, bodies):
@@ -200,10 +240,22 @@ async def benchmark(args):
             metadata["server_info_error"] = f"{type(exc).__name__}: {exc}"
         atomic_write_json(str(out / "metadata.json"), metadata)
 
+        if any(record.get("images") for record in records):
+            # Old Pydantic servers may silently ignore unknown request fields.
+            async with session.get(root + "/openapi.json") as response:
+                response.raise_for_status()
+                schema = await response.json()
+            properties = schema.get("components", {}).get("schemas", {}).get("ScoringRequest", {}).get("properties", {})
+            if "image_data" not in properties:
+                raise RuntimeError("Server does not advertise image_data for ScoringRequest; install the vision scoring server patch")
+            if metadata.get("server", {}).get("enable_mis"):
+                raise RuntimeError("Vision scoring currently requires SIS (disable MIS)")
+
         async def request(index):
             started = time.perf_counter()
             result = {"record_index": index, "candidate_count": len(records[index]["candidates"]),
-                      "request_sha256": metadata["request_sha256"][index], "success": False}
+                      "request_sha256": metadata["request_sha256"][index], "success": False,
+                      "image_count": len(records[index].get("images", []))}
             try:
                 async with session.post(root + "/v1/score", data=encoded[index]) as response:
                     response.raise_for_status()
@@ -252,7 +304,7 @@ def main():
     parser.add_argument("--formulation", required=True, choices=("pointwise", "setwise"),
                         help="Required scoring formulation; no default")
     parser.add_argument("--config", required=True, help="Scoring prompt and label JSON config")
-    parser.add_argument("--dataset", required=True, help="JSONL records: state, candidates, optional expected_index")
+    parser.add_argument("--dataset", required=True, help="JSONL records: state, candidates, optional expected_index and images")
     parser.add_argument("--api-base", default="http://localhost:30000/v1")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent complete candidate sets per burst")

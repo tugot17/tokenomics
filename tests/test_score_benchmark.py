@@ -93,6 +93,30 @@ class RequestTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_records(path)
 
+    def test_images_are_strict_and_content_hashed(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            Image.new('RGB', (8, 8), 'red').save(root / 'a.png')
+            dataset = root / 'rows.jsonl'
+            row = dict(self.record, images=['a.png'])
+            dataset.write_text(json.dumps(row))
+            record = load_records(dataset)[0]
+            uri = record['images'][0]
+            for mode in ('pointwise', 'setwise'):
+                body = build_request(record, config(mode), 'model')
+                self.assertEqual(body['image_data'], [uri])
+            dataset.write_text(json.dumps(dict(row, images=[uri])))
+            self.assertEqual(load_records(dataset)[0], record)
+            Image.new('RGB', (8, 8), 'blue').save(root / 'a.png')
+            dataset.write_text(json.dumps(row))
+            self.assertNotEqual(load_records(dataset)[0]['images'], record['images'])
+            for images in ('a.png', [None], ['https://example.com/a.png'], ['data:image/png;base64,!!!'], ['missing.png']):
+                dataset.write_text(json.dumps(dict(row, images=images)))
+                with self.subTest(images=images), self.assertRaises((ValueError, OSError)):
+                    load_records(dataset)
+
+
 
 class CLITests(unittest.TestCase):
     def test_formulation_is_required_and_validated(self):
@@ -149,6 +173,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.mis = False
         self.info_status = 200
         self.malformed = False
+        self.vision_supported = True
 
         async def info(request):
             return web.json_response({'enable_mis': self.mis}, status=self.info_status)
@@ -162,7 +187,12 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             return web.json_response({'scores': [[1 / n] * n for _ in body['items']],
                                       'usage': {'prompt_tokens': 100}})
 
+        async def schema(request):
+            properties = {'image_data': {}} if self.vision_supported else {}
+            return web.json_response({'components': {'schemas': {'ScoringRequest': {'properties': properties}}}})
+
         app = web.Application()
+        app.router.add_get('/openapi.json', schema)
         app.router.add_get('/get_server_info', info)
         app.router.add_post('/v1/score', score)
         runner = web.AppRunner(app)
@@ -210,6 +240,26 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreater(result['latency_ms_mean'], 0)
             self.assertEqual(len((out / 'bursts.jsonl').read_text().splitlines()), 10)
         self.assertEqual(len(set(digests)), 1)
+
+    async def test_vision_http_and_old_server_rejection(self):
+        from PIL import Image
+        image = Path(self.tmp.name) / 'image.png'
+        Image.new('RGB', (8, 8), 'red').save(image)
+        dataset = Path(self.tmp.name) / 'vision.jsonl'
+        dataset.write_text(json.dumps({'state': '<image> Choose.', 'candidates': ['a', 'b'], 'images': ['image.png']}))
+        for mode in ('pointwise', 'setwise'):
+            args = self.args(mode, dataset=str(dataset), num_runs=1, warmup_runs=0)
+            self.assertTrue(await self.run_quietly(args))
+            self.assertEqual(len(self.posts[-1]['image_data']), 1)
+            self.assertTrue(self.posts[-1]['image_data'][0].startswith('data:image/png;base64,'))
+            result = json.loads((Path(args.results_dir) / '1.json').read_text())
+            self.assertEqual(result['submitted_images_per_second'], result['decisions_per_second'])
+        self.posts.clear()
+        self.vision_supported = False
+        args = self.args('setwise', dataset=str(dataset), results_dir=str(Path(self.tmp.name) / 'unsupported'))
+        with self.assertRaisesRegex(RuntimeError, 'does not advertise'):
+            await self.run_quietly(args)
+        self.assertEqual(self.posts, [])
 
     async def test_server_metadata_is_optional(self):
         self.info_status = 404

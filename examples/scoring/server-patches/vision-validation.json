@@ -1,0 +1,27 @@
+{
+  "model": "LiquidAI/d1-3B-RC",
+  "model_revision": "1ff39dff28083ba209b46ec28bd7e0cafb5a1c48",
+  "sglang_revision": "488869c2d0f3321299488bcf221934df40b06454",
+  "hardware": "one NVIDIA B300",
+  "precision": "BF16",
+  "mode": "SIS, eager",
+  "image_size": [
+    128,
+    128
+  ],
+  "image_count": 1,
+  "generate_image_tokens": 64,
+  "score_prompt_tokens": 85,
+  "score_vs_generate_max_abs_probability_error": 0.0,
+  "checks": [
+    "single-sequence image score",
+    "two-sequence shared-image scoring",
+    "malformed image rejected",
+    "Tokenomics setwise image benchmark completed without failures"
+  ],
+  "cpu_tests": {
+    "tokenomics": 16,
+    "server_image_routing": 2
+  },
+  "scope": "Functional smoke test, not a throughput comparison or vision quality evaluation."
+}

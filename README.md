@@ -23,7 +23,8 @@ uv pip install -e .
 
 `tokenomics score` benchmarks SGLang `/v1/score` with a required
 `--formulation pointwise|setwise` argument and no default. The selected formulation
-is saved in metadata and each result JSON. SIS/MIS is configured on the server.
+is saved in metadata and each result JSON. SIS/MIS is configured on the server. Optional dataset `images` enable vision
+scoring on image-aware SIS servers (see the companion SGLang patch below).
 See [usage, configs and results](examples/scoring/README.md).
 
 ## Completion Benchmark

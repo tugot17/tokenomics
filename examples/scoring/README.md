@@ -73,3 +73,70 @@ save `warmup_failure.json`. Report failure counts alongside accuracy.
 Plot a completed run with `tokenomics plot-score results/pointwise pointwise.png`.
 
 Run tests with `python -m unittest discover -s tests -v`.
+
+## Vision scoring (SIS)
+
+Add an optional `images` list to each dataset row. Images belong to the shared
+query: pointwise sends them for every candidate sequence; setwise sends them with
+the single joint-choice sequence. Both formulations retain the same decision unit.
+
+```json
+{"state":"<image> What is shown?","candidates":["A cat","A dog"],"images":["images/example.png"],"expected_index":0}
+```
+
+Paths are resolved relative to the dataset JSONL file. Base64 `data:image/...`
+URIs and multiple images are also supported. Images are decoded/validated and
+embedded before timing; missing or malformed images fail instead of becoming
+text-only examples. Remote URLs are deliberately unsupported, making replay
+independent of remote downloads. Request hashes include the actual image bytes.
+Image markers and chat delimiters remain model-specific: provide the exact prompt
+format expected by the model's processor. The `<image>` above illustrates LFM2-VL;
+it is not a universal template.
+
+Run the same scoring command as above with the vision dataset and `--num-runs 1`.
+Use SIS on a multimodal generation server. The client checks that `/openapi.json`
+advertises `ScoringRequest.image_data` before sending image requests, because older
+servers may silently ignore unknown fields. It refuses servers without that
+contract. Text-only benchmarking does not require this schema check.
+
+The SGLang revision used for this PR does not expose images in `/v1/score` yet.
+A companion patch is provided at
+[`server-patches/sglang-score-images.patch`](server-patches/sglang-score-images.patch),
+against SGLang `488869c2d0f3321299488bcf221934df40b06454`:
+
+```bash
+# In a checkout of the pinned SGLang revision:
+git apply /path/to/tokenomics/examples/scoring/server-patches/sglang-score-images.patch
+```
+
+It routes shared images through the existing multimodal generation processor,
+using one image list per SIS sequence. It supports last-token label scoring for
+both benchmark formulations. MIS, extraction-token readouts, embedding overrides,
+and non-generation models are rejected for image requests. No CUDA graph support
+for vision is implied by this patch.
+
+Latency includes image upload, server image processing, vision encoding and
+language-model scoring; local image loading/encoding is excluded. Existing input
+throughput uses the server's `usage.prompt_tokens`, whose image-token accounting
+is model/server dependent. `submitted_images_per_second` counts successful
+request-level images, **not** crops, patches, or vision-encoder executions.
+Pointwise may process each shared image once per candidate; caches may reduce that
+work. Metadata records `images_per_record`, and raw requests preserve the images.
+
+Warmup and repeated passes reuse dataset images. Disable prefix and multimodal
+embedding caches on the server when measuring uncached vision throughput, and
+record that configuration. A one-pass run alone does not prevent warmup cache hits.
+
+Client validation: `python -m unittest discover -s tests -v`.
+The companion server routing tests can run without a GPU:
+
+```bash
+PYTHONPATH=/path/to/sglang/python python examples/scoring/server-patches/test_score_images.py
+```
+
+The companion patch was smoke-tested on one B300 with `LiquidAI/d1-3B-RC` in
+BF16 SIS eager mode: a 128×128 image produced 64 image tokens; `/v1/score`
+probabilities matched `/generate` label-logprob normalization exactly. Shared-image
+batching, malformed-image rejection, and a Tokenomics setwise image request also
+passed. See `server-patches/vision-validation.json`. This is functional validation,
+not a vision throughput comparison or model-quality evaluation.
