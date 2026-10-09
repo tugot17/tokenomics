@@ -1,0 +1,4 @@
+{
+  "endpoint": "systemone",
+  "instructions": "Does this candidate match the state: {candidate}?"
+}

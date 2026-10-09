@@ -40,8 +40,20 @@ rows contain `state`, at least two `candidates`, and optional zero-based
 templates use `{state}` for the query, `{candidate}` for pointwise items, or
 `{options}` and optional `{labels}` for setwise items.
 
+For `/v1/systemone`, use `examples/systemone_setwise.json` or
+`examples/systemone_pointwise.json`. The server handles prompt formatting and label
+tokens: setwise sends one choice question; pointwise sends one yes/no question per
+candidate in the same request. This endpoint requires SIS. Its prompt format may
+differ from a model's native format; evaluate accuracy separately.
+
+For vision, use a System One config and add `"images": ["image.png"]` to a row
+(paths relative to the dataset, or base64 image data URIs). Do not add image markers;
+the server inserts them. Upload and server processing are timed; local image loading
+is not. Disable server image/prefix caches to measure uncached vision throughput.
+
 Each concurrency result reports complete candidate sets/s, server-reported input
-tokens/s, latency, failures, and accuracy on successful labelled sets.
+tokens/s, latency, failures, and accuracy on successful labelled sets. Image-token
+accounting depends on the server; submitted images/s does not count encoder calls.
 Requests, responses, hashes, and settings are saved alongside results. Failures
 produce a nonzero exit code. Use a new output directory for each run; `--dry-run`
 saves requests without contacting the server.
