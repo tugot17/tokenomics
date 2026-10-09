@@ -49,6 +49,39 @@ saves requests without contacting the server.
 Plot results with `tokenomics plot-score results/scoring scoring.png`.
 Run tests with `python -m unittest discover -s tests -v`.
 
+### Independent questions about one state
+
+Use `--workload questions` when each question needs its own answer, rather than
+ranking candidates to select one winner. Do not pass `--formulation`:
+
+```bash
+tokenomics score --model LiquidAI/d1-3B-RC --api-base http://localhost:30000/v1 \
+  --workload questions --config examples/score_questions_d1.json \
+  --dataset examples/data/score_questions.jsonl \
+  --batch-sizes 1,8,32,128 --num-runs 1 --warmup-runs 1 \
+  --results-dir results/questions
+```
+
+Each JSONL row contains `state` and a nonempty `questions` list. Each question has
+`prompt`, `labels` (`text` and alias `token_ids`), and optional zero-based
+`expected_index`. Templates wrap `{state}` and `{question}`. The D1 preset uses
+the supplied refund/routing prompts and aliases; verify token IDs for your model.
+
+One HTTP request contains all questions for a state. The client requests the
+union of alias IDs with `apply_softmax: false`, max-pools aliases, then normalizes
+over each question's own labels. Saved answers include probabilities and
+predictions. Results and plots distinguish requests/s from questions/s, alongside
+input tokens/s, request latency, failures, and per-question accuracy. A malformed
+response fails the whole request; failed requests remain in the timing denominator.
+Accuracy includes labelled questions in successful requests only.
+
+SIS/MIS remains a server setting; replay identical data and configs for both.
+Enable SIS prefix caching for a prefix-sharing comparison and record the settings.
+Prepare datasets with 1, 8, or 32 questions per state independently of concurrency.
+Use enough states to fill the requested concurrency; this one-state example is
+only a smoke test. Warmup replays the dataset, so caching makes this a warm-cache
+benchmark. `--num-runs 1` measures one dataset pass per concurrency.
+
 ## Completion Benchmark
 
 Sends chat completion requests to any OpenAI-compatible server and records per-request and system-wide metrics. Requests are non-streaming by default (max throughput); `--stream` adds TTFT and per-token metrics.
