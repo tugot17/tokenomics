@@ -1,0 +1,3 @@
+{"state": "I was charged twice. Please refund the duplicate.", "candidates": ["Issue a refund.", "Troubleshoot a software crash.", "Cancel the subscription."], "expected_index": 0}
+{"state": "The app crashes every time I open it.", "candidates": ["Issue a refund.", "Troubleshoot a software crash.", "Cancel the subscription."], "expected_index": 1}
+{"state": "Please cancel my subscription.", "candidates": ["Issue a refund.", "Troubleshoot a software crash.", "Cancel the subscription."], "expected_index": 2}

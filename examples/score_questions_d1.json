@@ -1,0 +1,4 @@
+{
+  "query_template": "<|startoftext|><|im_start|>user\n{state}\n\n\nQUESTION:\n",
+  "item_template": "{question}<|im_end|>\n<|im_start|>assistant\n"
+}

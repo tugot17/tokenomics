@@ -1,0 +1,15 @@
+{
+  "query_template": "Customer state:\n{state}\n",
+  "item_template": "Proposed action: {candidate}\nIs this action appropriate? Answer Yes or No:\n",
+  "labels": [
+    {
+      "text": "Yes",
+      "token_id": 9175
+    },
+    {
+      "text": "No",
+      "token_id": 2665
+    }
+  ],
+  "positive_label_index": 0
+}
