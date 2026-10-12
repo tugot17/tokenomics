@@ -35,6 +35,28 @@ tokenomics completion --model your-model \
   --results-dir results/
 ```
 
+### Warmup
+
+The default warmup uses the measured scenario (or replay/filler source), generation
+limits, streaming mode and completions per request. Sustained mode warms one wave
+at the selected concurrency, capped by the point's available requests; burst mode
+warms the full batch. LoRA assignments and images follow the measured request path.
+
+This matters at kernel/compilation boundaries: a single short request does not
+warm a full prefill chunk or a large decode batch. A newly encountered full prefill chunk can pay first-use costs inside the
+measured interval, even after several short single-request warmups.
+
+Warmup time and tokens are excluded from measured throughput. Each point's JSON
+contains a separate `warmup` audit (counts, wall time, token totals and seed), and
+metadata records `warmup_mode`. Failed workload warmups stop the point before
+measurement. Measured sampling seeds are unchanged. Synthetic warmup images use
+ids disjoint from measured images; warmups can still warm server caches, so control
+prefix caching on the server when comparing uncached throughput.
+
+Use `--warmup-mode short` to reproduce the previous short single-request warmups,
+or `--warmup-runs 0` when deliberately measuring a cold server. Full workload
+warmups increase preparation time, especially at high concurrency.
+
 ### Building requests
 
 Three ways to produce request content, all swept over concurrency the same way:
@@ -146,7 +168,9 @@ A JSON file with a `source` and (usually) a `prompt_column`. File paths are reso
 | `--max-concurrency` | Sustained mode sweep points |
 | `--batch-sizes` | Burst mode sweep points |
 | `--num-prompts` | Prompts per sweep point in sustained mode |
-| `--num-runs` | Runs per sweep point (default: 3) |
+| `--num-runs` | Measured runs per sweep point (default: 3) |
+| `--warmup-runs` | Unmeasured warmup runs per point (default: 3; 0 disables) |
+| `--warmup-mode` | `workload` (default): actual request shape and concurrency; `short`: legacy single-request warmup |
 | `--max-tokens` | Max output tokens (default: 4096; 32 for image runs) |
 | `--temperature` | Sampling temperature (default: 0.7) |
 | `--ignore-eos` | Generate exactly `--max-tokens`, ignoring EOS (SGLang/vLLM) — fixes output length for clean comparisons |

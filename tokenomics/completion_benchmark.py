@@ -792,6 +792,68 @@ def calculate_stats(runs_data: List[Dict], steady_state_threshold: float = 0.8,
     }
 
 
+def build_user_requests(sampled_requests, max_tokens, *, lora_assignments=None,
+                        ignore_eos=False, num_images=0, image_size="512", start_image_id=0):
+    """Build the same request payloads for warmup and measurement."""
+    requests = []
+    image_id = start_image_id
+    for idx, request in enumerate(sampled_requests):
+        data = {
+            "prompt": request.prompt,
+            "max_tokens": max(1, min(max_tokens, int(request.target_output_tokens))),
+            "target_input_tokens": request.target_input_tokens,
+            "target_output_tokens": request.target_output_tokens,
+        }
+        if lora_assignments:
+            data["lora_name"] = lora_assignments[idx]
+        if ignore_eos:
+            data["ignore_eos"] = True
+        if request.images:
+            data["images"] = request.images
+        elif num_images > 0:
+            data["prompt"] = f"{image_id} {data['prompt']}" if data["prompt"] else str(image_id)
+            data["images"] = build_synthetic_image_uris(
+                image_size, num_images, start_id=image_id * num_images)
+            image_id += 1
+        requests.append(data)
+    return requests, image_id
+
+
+def warmup_workload(api_base, model, temperature, timeout, text_sampler, scenario,
+                    num_requests, *, num_warmup_runs=3, max_concurrency=None,
+                    api_key="dummy-key", max_tokens=4096, n=1, stream=False,
+                    token_counter=None, lora_config=None, ignore_eos=False,
+                    num_images=0, image_size="512"):
+    """Warm the actual workload outside the measured runs and retain its audit."""
+    print(f"Performing {num_warmup_runs} workload warmups "
+          f"({num_requests} requests per run)...", end="", flush=True)
+    report = {"mode": "workload", "runs": [],
+              "requests_per_run": num_requests if num_warmup_runs else 0,
+              "max_concurrency": max_concurrency, "stream": stream}
+    image_id = 2**31  # Disjoint from measured synthetic-image ids.
+    for _ in range(num_warmup_runs):
+        sampled = text_sampler.sample_batch(scenario, num_requests)
+        loras = lora_config.assign_lora(len(sampled)) if lora_config else None
+        requests, image_id = build_user_requests(
+            sampled, max_tokens, lora_assignments=loras, ignore_eos=ignore_eos,
+            num_images=num_images, image_size=image_size, start_image_id=image_id)
+        batch = asyncio.run(run_batch_async(
+            requests, api_base, model, temperature, timeout,
+            max_concurrency=max_concurrency, api_key=api_key, n=n, stream=stream,
+            token_counter=token_counter))
+        failures = batch["failures"]
+        audit = {"wall_seconds": batch["batch_total_seconds"],
+                 "total_requests": failures["total_requests"],
+                 "successful": failures["successful"], "failed": failures["failed"],
+                 "input_tokens": sum(batch["tokens"]["input_per_request"]),
+                 "output_tokens": sum(batch["tokens"]["output_per_request"])}
+        report["runs"].append(audit)
+        if failures["failed"] or failures["successful"] != num_requests:
+            raise RuntimeError(f"Workload warmup failed; point was not measured: {audit}")
+    print(" done")
+    return report
+
+
 def warmup_server(api_base: str, model: str, temperature: float, timeout: int,
                   text_sampler, num_warmup_runs: int = 3, api_key: str = "dummy-key",
                   image_uris: Optional[List[str]] = None):
@@ -886,7 +948,9 @@ def main():
     parser.add_argument("--num-prompts", type=int, default=None,
                         help="Total prompts per sweep point in sustained mode (default: max(64, 8*concurrency))")
     parser.add_argument("--num-runs", type=int, default=3, help="Number of runs per sweep point")
-    parser.add_argument("--warmup-runs", type=int, default=3, help="Number of warmup runs before each sweep point")
+    parser.add_argument("--warmup-runs", type=int, default=3, help="Number of unmeasured warmup runs before each sweep point; 0 disables warmup")
+    parser.add_argument("--warmup-mode", choices=("workload", "short"), default="workload",
+                        help="Warm the actual request shape/concurrency (default), or use legacy short single-request warmups")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (default: 0.7)")
     parser.add_argument("--max-tokens", type=int, default=None, help="Upper bound on max_tokens per request (default: 4096, or 32 for image runs)")
     parser.add_argument("--ignore-eos", action="store_true", help="Ignore EOS and generate exactly max_tokens per request (SGLang/vLLM; a no-op on servers that don't support it). Fixes output length for clean throughput comparison.")
@@ -913,6 +977,8 @@ def main():
                         help="Fraction of peak active requests required for a bucket to count as steady-state (0.0-1.0, default: 0.8)")
 
     args = parser.parse_args()
+    if args.warmup_runs < 0:
+        parser.error("--warmup-runs must be nonnegative")
 
     # Determine execution mode and sweep values
     if args.batch_sizes is not None and args.max_concurrency is not None:
@@ -996,6 +1062,7 @@ def main():
         "execution_mode": execution_mode,
         "num_runs": args.num_runs,
         "warmup_runs": args.warmup_runs,
+        "warmup_mode": args.warmup_mode,
         "temperature": args.temperature,
         "num_completions": args.num_completions,
         "stream": args.stream,
@@ -1040,14 +1107,27 @@ def main():
             max_concurrency = None
             print(f"\n🔄 Testing batch size: {sweep_value}")
 
-        # Warmup images use a disjoint id range so they don't cache-collide with
-        # the measured requests (whose ids start at 0).
-        warmup_images = build_synthetic_image_uris(args.image_size, args.num_images, start_id=2**31) if args.num_images > 0 else None
         warmup_seed = derive_seed(args.seed, sweep_value, -1)
         with use_seed(warmup_seed):
-            warmup_server(args.api_base, args.model, args.temperature, args.timeout,
-                         text_sampler, args.warmup_runs, api_key=args.api_key,
-                         image_uris=warmup_images)
+            if args.warmup_mode == "workload":
+                warmup_report = warmup_workload(
+                    args.api_base, args.model, args.temperature, args.timeout,
+                    text_sampler, scenario, min(num_prompts, max_concurrency or num_prompts),
+                    num_warmup_runs=args.warmup_runs, max_concurrency=max_concurrency,
+                    api_key=args.api_key, max_tokens=args.max_tokens,
+                    n=args.num_completions, stream=args.stream,
+                    token_counter=count_output_tokens, lora_config=lora_config,
+                    ignore_eos=args.ignore_eos, num_images=args.num_images,
+                    image_size=args.image_size)
+            else:
+                warmup_images = build_synthetic_image_uris(
+                    args.image_size, args.num_images, start_id=2**31) if args.num_images > 0 else None
+                warmup_server(args.api_base, args.model, args.temperature, args.timeout,
+                              text_sampler, args.warmup_runs, api_key=args.api_key,
+                              image_uris=warmup_images)
+                warmup_report = {"mode": "short", "runs": args.warmup_runs,
+                                 "requests_per_run": 1 if args.warmup_runs else 0}
+        warmup_report["seed"] = warmup_seed
 
         runs_data = []
         for run_idx in range(args.num_runs):
@@ -1063,32 +1143,10 @@ def main():
             if lora_config:
                 lora_assignments = lora_config.assign_lora(num_prompts)
 
-            user_requests = []
-            for idx, request in enumerate(sampled_requests):
-                request_dict = {
-                    "prompt": request.prompt,
-                    "max_tokens": max(1, min(args.max_tokens, int(request.target_output_tokens))),
-                    "target_input_tokens": request.target_input_tokens,
-                    "target_output_tokens": request.target_output_tokens,
-                }
-                if lora_assignments:
-                    request_dict["lora_name"] = lora_assignments[idx]
-                if args.ignore_eos:
-                    request_dict["ignore_eos"] = True
-                if request.images:
-                    # Real images from a vision replay dataset (already unique).
-                    request_dict["images"] = request.images
-                elif args.num_images > 0:
-                    uid = req_uid
-                    req_uid += 1
-                    # Unique text prefix + unique images so each request is a
-                    # cache miss (prefix + multimodal caches), while staying
-                    # deterministic (uid is derived from fixed iteration order).
-                    base = request_dict["prompt"]
-                    request_dict["prompt"] = f"{uid} {base}" if base else str(uid)
-                    request_dict["images"] = build_synthetic_image_uris(
-                        args.image_size, args.num_images, start_id=uid * args.num_images)
-                user_requests.append(request_dict)
+            user_requests, req_uid = build_user_requests(
+                sampled_requests, args.max_tokens, lora_assignments=lora_assignments,
+                ignore_eos=args.ignore_eos, num_images=args.num_images,
+                image_size=args.image_size, start_image_id=req_uid)
 
             run_data = run_benchmark_batch(
                 user_requests, args.api_base, args.model, args.temperature, args.timeout,
@@ -1147,6 +1205,7 @@ def main():
         result_entry = {
             "metadata": metadata,
             "sweep_value": sweep_value,
+            "warmup": warmup_report,
             "result": batch_stats,
         }
         result_path = os.path.join(args.results_dir, f"{sweep_value}.json")
