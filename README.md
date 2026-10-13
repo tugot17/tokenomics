@@ -260,7 +260,9 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 | Argument | Meaning |
 |---|---|
 | `--tokenizer` | Tokenizer repository/directory; defaults to `--model` |
-| `--state-tokens 1024` | Shared text length; default 1024. Also accepts a list, e.g. `1024,4096` |
+| `--state-tokens 1024` | Fixed shared text length (default); also accepts a list, e.g. `1024,4096` |
+| `--state-tokens "N(1024,256)"` | Sample lengths from a normal distribution (mean, standard deviation) |
+| `--state-tokens "U(512,2048)"` | Sample lengths uniformly between min and max |
 | `--batch-sizes 1,8,32` | Concurrent HTTP requests |
 | `--num-prompts 128` | Generated requests per length (defaults to enough to fill concurrency); otherwise a dataset row limit |
 | `--num-runs 1` | One measured dataset pass per concurrency |

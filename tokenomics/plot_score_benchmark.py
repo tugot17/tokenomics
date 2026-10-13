@@ -13,7 +13,7 @@ from matplotlib.ticker import EngFormatter
 def plot_score_benchmark(results_dir, output_image):
     path = Path(results_dir)
     metadata = json.loads((path / "metadata.json").read_text())
-    folders = sorted(path.glob("state-*"), key=lambda p: int(p.name.split("-")[1])) if isinstance(metadata.get("state_tokens"), list) else [path]
+    folders = sorted(path.glob("state-*"), key=lambda p: p.name) if isinstance(metadata.get("state_tokens"), list) else [path]
     rows = [json.loads(file.read_text()) for folder in folders for file in folder.glob("*.json") if file.stem.isdigit()]
     if not rows:
         raise ValueError("No measured scoring results found")
@@ -25,7 +25,7 @@ def plot_score_benchmark(results_dir, output_image):
             row["failed_requests"] = row["failed_candidate_sets"]
     rows.sort(key=lambda row: row["batch_size"])
     x = sorted({row["batch_size"] for row in rows})
-    lengths = sorted({row.get("state_tokens") for row in rows}, key=lambda n: n or 0)
+    lengths = sorted({row.get("state_tokens") for row in rows}, key=lambda n: str(n))
     questions = metadata.get("workload") == "questions"
     metrics = [("requests_per_second", "Completed candidate sets / second"),
                ("input_tokens_per_second", "Input tokens / second"),

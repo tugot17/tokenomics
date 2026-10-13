@@ -299,19 +299,43 @@ def summarize(bursts, workload="ranking"):
     return result
 
 
+def state_scenario(length):
+    from tokenomics.sampling.scenarios import Scenario
+
+    if isinstance(length, int):
+        expression = f"D({length},1)"
+    elif length.startswith("N("):
+        expression = length + "/(1,0)"
+    elif length.startswith("U("):
+        expression = length + "/(1,1)"
+    else:
+        raise ValueError("State tokens must be a positive integer, N(mean,std), or U(min,max)")
+    scenario = Scenario.from_string(expression)
+    lower = getattr(scenario, "input_tokens", getattr(scenario, "mean_input", getattr(scenario, "min_input", 0)))
+    if lower < 1 or getattr(scenario, "max_input", lower) < lower:
+        raise ValueError("State token lengths must be positive; uniform max must be >= min")
+    return scenario
+
+
 def synthetic_records(records, tokenizer, length, count, seed):
     words = "river forest market garden bridge mountain paper orange silver window morning evening quiet bright walk read build carry find follow Yes No A B C".split()
+    from tokenomics.sampling.sampler import use_seed
+
+    scenario = state_scenario(length)
     generated = []
     for index in range(count):
+        with use_seed(seed + index):
+            target, _ = scenario.sample()
+        target = int(target)
         rng = random.Random(seed + index)
         for _ in range(16):
-            text = " ".join(rng.choices(words, k=length * 2 + 16))
-            ids = tokenizer.encode(text, add_special_tokens=False)[:length]
+            text = " ".join(rng.choices(words, k=target * 2 + 16))
+            ids = tokenizer.encode(text, add_special_tokens=False)[:target]
             state = tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-            if len(tokenizer.encode(state, add_special_tokens=False)) == length:
+            if len(tokenizer.encode(state, add_special_tokens=False)) == target:
                 break
         else:
-            raise ValueError(f"Cannot generate an exact {length}-token state with this tokenizer")
+            raise ValueError(f"Cannot generate an exact {target}-token state with this tokenizer")
         record = copy.deepcopy(records[index % len(records)])
         record["state"] = state
         record.pop("expected_index", None)
@@ -489,7 +513,7 @@ def main():
     parser.add_argument("--api-base", default="http://localhost:30000/v1")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent HTTP requests per burst")
-    parser.add_argument("--state-tokens", default="1024", help="Shared-state tokens (default: 1024); accepts a comma-separated list")
+    parser.add_argument("--state-tokens", default="1024", help="Shared-state tokens (default: 1024): integer, fixed-length list, N(mean,std), or U(min,max)")
     parser.add_argument("--num-prompts", type=int, help="Dataset row limit; with --state-tokens, generated requests per length")
     parser.add_argument("--num-runs", type=int, default=5)
     parser.add_argument("--warmup-runs", type=int, default=2)
@@ -503,9 +527,12 @@ def main():
     if args.workload == "questions" and args.formulation is not None:
         parser.error("--formulation applies only to ranking")
     try:
-        args.state_tokens = [int(x) for x in args.state_tokens.split(",")] if args.state_tokens else None
-        if args.state_tokens and (any(x < 1 for x in args.state_tokens) or len(set(args.state_tokens)) != len(args.state_tokens)):
-            raise ValueError("state token lengths must be unique positive integers")
+        spec = args.state_tokens.strip()
+        args.state_tokens = [spec] if spec.startswith(("N(", "U(")) else [int(x) for x in spec.split(",")]
+        if len(set(args.state_tokens)) != len(args.state_tokens):
+            raise ValueError("State token lengths must be unique")
+        for length in args.state_tokens:
+            state_scenario(length)
         args.batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
         if not args.batch_sizes or any(x < 1 for x in args.batch_sizes) or len(set(args.batch_sizes)) != len(args.batch_sizes):
             raise ValueError("batch sizes must be unique positive integers")

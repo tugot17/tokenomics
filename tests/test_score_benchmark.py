@@ -14,7 +14,7 @@ from transformers import PreTrainedTokenizerFast
 from tokenomics.plot_score_benchmark import plot_score_benchmark
 from tokenomics.score_benchmark import (
     main, benchmark, build_request, load_records, parse_response, summarize,
-    validate_config, validate_questions, parse_questions, resolve_label_ids, synthetic_records,
+    validate_config, validate_questions, parse_questions, resolve_label_ids, synthetic_records, state_scenario,
 )
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
@@ -96,6 +96,21 @@ class RequestTests(unittest.TestCase):
         for label in ({'text': 'Yes No'}, {'text':'notinvocabulary'}, {'text':'[UNK]'}):
             with self.assertRaises(ValueError):
                 resolve_label_ids([label], tokenizer, multiple=True)
+
+    def test_sampled_state_lengths_are_seeded_and_follow_distribution(self):
+        records = load_records(EXAMPLES / 'data/score_candidate_sets.jsonl')
+        tokenizer = test_tokenizer()
+        for spec in ('N(32,8)', 'U(16,48)'):
+            generated = synthetic_records(records, tokenizer, spec, 32, 42)
+            self.assertEqual(generated, synthetic_records(records, tokenizer, spec, 32, 42))
+            lengths = [len(tokenizer.encode(record['state'], add_special_tokens=False)) for record in generated]
+            self.assertGreater(len(set(lengths)), 1)
+            self.assertTrue(all(n > 0 for n in lengths))
+            if spec.startswith('U'):
+                self.assertTrue(all(16 <= n <= 48 for n in lengths))
+        for spec in (0, 'N(0,1)', 'U(0,1)', 'U(20,10)', 'N(-1,2)', 'invalid'):
+            with self.assertRaises(ValueError):
+                state_scenario(spec)
 
     def test_synthetic_states_are_exact_deterministic_and_speed_only(self):
         records = load_records(EXAMPLES / 'data/score_candidate_sets.jsonl')
@@ -371,7 +386,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         for workload in ('ranking', 'questions'):
             hashes = []
             for self.mis in (False, True):
-                overrides = dict(workload=workload, state_tokens=[4, 9], num_prompts=4, num_runs=1,
+                overrides = dict(workload=workload, state_tokens=[4, 9, "U(4,9)"], num_prompts=4, num_runs=1,
                                  results_dir=str(Path(self.tmp.name) / f'synthetic-{workload}-{self.mis}'))
                 if workload == 'questions':
                     overrides.update(formulation=None, config=str(EXAMPLES / 'score_questions.json'),
@@ -385,7 +400,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                     meta = json.loads((folder / 'metadata.json').read_text())
                     current.append(meta['request_sha256'])
                     saved = [json.loads(line) for line in (folder / 'requests.jsonl').read_text().splitlines()]
-                    self.assertTrue(all(row['state_tokens'] == length for row in saved))
+                    self.assertTrue(all(row['state_tokens'] == length for row in saved) if isinstance(length, int) else all(4 <= row['state_tokens'] <= 9 for row in saved))
                     self.assertTrue(all(row['prompt_tokens_per_item'] for row in saved))
                     for concurrency in args.batch_sizes:
                         result = json.loads((folder / f'{concurrency}.json').read_text())
