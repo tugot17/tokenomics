@@ -3,16 +3,13 @@
   "item_template": "Choose the best action:\n{options}\nAnswer with one of {labels}:\n",
   "labels": [
     {
-      "text": "A",
-      "token_id": 32
+      "text": "A"
     },
     {
-      "text": "B",
-      "token_id": 33
+      "text": "B"
     },
     {
-      "text": "C",
-      "token_id": 34
+      "text": "C"
     }
   ]
 }

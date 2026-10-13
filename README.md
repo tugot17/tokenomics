@@ -36,7 +36,7 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 ```
 
 For pointwise, use `--formulation pointwise` and [its config](examples/score_pointwise.json).
-Ranking rows contain `state`, `candidates`, and optional `expected_index`; adapt prompt templates and label token IDs to your model.
+Ranking rows contain `state`, `candidates`, and optional `expected_index`. Label IDs resolve from `--model`; use `--tokenizer` for a serving alias or local tokenizer. Labels must encode as one token; explicit `token_id` overrides are supported.
 
 Independent questions (D1 example):
 

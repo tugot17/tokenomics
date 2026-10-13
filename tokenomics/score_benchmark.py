@@ -55,8 +55,11 @@ def validate_config(config):
     ids, texts = [], []
     for label in labels:
         if not isinstance(label, dict) or not isinstance(label.get("text"), str) or not label["text"]:
-            raise ValueError("Each label needs nonempty text and a token_id")
+            raise ValueError("Each label needs nonempty text")
         token_id = label.get("token_id")
+        if "token_id" not in label:
+            texts.append(label["text"])
+            continue
         if type(token_id) is not int or token_id < 0:
             raise ValueError("Label token IDs must be nonnegative integers")
         ids.append(token_id)
@@ -66,6 +69,27 @@ def validate_config(config):
     positive = config.get("positive_label_index", 0)
     if type(positive) is not int or not 0 <= positive < len(labels):
         raise ValueError("positive_label_index is outside the labels")
+
+
+def resolve_label_ids(config, tokenizer_path):
+    missing = [label for label in config.get("labels", []) if "token_id" not in label]
+    if not missing:
+        return
+    from tokenizers import Tokenizer
+
+    path = Path(tokenizer_path)
+    if path.is_dir():
+        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
+    elif path.is_file():
+        tokenizer = Tokenizer.from_file(str(path))
+    else:
+        tokenizer = Tokenizer.from_pretrained(tokenizer_path)
+    for label in missing:
+        ids = tokenizer.encode(label["text"], add_special_tokens=False).ids
+        if len(ids) != 1:
+            raise ValueError(f"Label {label['text']!r} maps to {len(ids)} tokens; use a single-token label or explicit token_id")
+        label["token_id"] = ids[0]
+    validate_config(config)
 
 
 def validate_questions(record):
@@ -245,6 +269,9 @@ async def benchmark(args):
     config["workload"] = workload
     config["formulation"] = args.formulation
     validate_config(config)
+    tokenizer_path = getattr(args, "tokenizer", None) or args.model
+    if workload == "ranking":
+        resolve_label_ids(config, tokenizer_path)
     records = load_records(args.dataset, workload)
     if args.num_prompts is not None:
         records = records[:args.num_prompts]
@@ -252,7 +279,7 @@ async def benchmark(args):
     encoded = [encode(body) for body in bodies]
     out = Path(args.results_dir)
     out.mkdir(parents=True, exist_ok=False)
-    metadata = {"workload": workload, "formulation": args.formulation, "config": config, "model": args.model, "api_base": args.api_base,
+    metadata = {"workload": workload, "formulation": args.formulation, "config": config, "model": args.model, "tokenizer": tokenizer_path, "api_base": args.api_base,
                 "dataset_sha256": hashlib.sha256(encode(records)).hexdigest(),
                 "request_sha256": [hashlib.sha256(body).hexdigest() for body in encoded],
                 "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -342,6 +369,7 @@ async def benchmark(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--tokenizer", help="Tokenizer repository, local directory, or tokenizer.json; defaults to --model")
     parser.add_argument("--workload", choices=("ranking", "questions"), default="ranking")
     parser.add_argument("--formulation", choices=("pointwise", "setwise"),
                         help="Required for ranking only; no default")

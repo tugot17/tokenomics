@@ -9,22 +9,46 @@ import unittest
 from pathlib import Path
 
 from aiohttp import web
+from tokenizers import Tokenizer, models, pre_tokenizers
 from tokenomics.plot_score_benchmark import plot_score_benchmark
 from tokenomics.score_benchmark import (
     main, benchmark, build_request, load_records, parse_response, summarize,
-    validate_config, validate_questions, parse_questions,
+    validate_config, validate_questions, parse_questions, resolve_label_ids,
 )
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
 
 
+def test_tokenizer():
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "Yes": 1, "No": 2, "A": 3, "B": 4, "C": 5}, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    return tokenizer
+
+
 def config(name='pointwise'):
-    return dict(json.loads((EXAMPLES / f'score_{name}.json').read_text()), formulation=name)
+    cfg = dict(json.loads((EXAMPLES / f'score_{name}.json').read_text()), formulation=name)
+    with patch('tokenizers.Tokenizer.from_pretrained', return_value=test_tokenizer()):
+        resolve_label_ids(cfg, 'test-model')
+    return cfg
 
 
 class RequestTests(unittest.TestCase):
     def setUp(self):
         self.record = load_records(EXAMPLES / 'data' / 'score_candidate_sets.jsonl')[0]
+
+    def test_label_ids_come_from_tokenizer(self):
+        cfg = dict(json.loads((EXAMPLES / 'score_pointwise.json').read_text()), formulation='pointwise')
+        with tempfile.TemporaryDirectory() as tmp:
+            test_tokenizer().save(str(Path(tmp) / 'tokenizer.json'))
+            resolve_label_ids(cfg, tmp)
+            self.assertEqual([label['token_id'] for label in cfg['labels']], [1, 2])
+            cfg['labels'][0] = {'text': 'Yes No'}
+            with self.assertRaises(ValueError):
+                resolve_label_ids(cfg, tmp)
+        cfg = config()
+        with patch('tokenizers.Tokenizer.from_pretrained') as loader:
+            resolve_label_ids(cfg, 'unused')
+            loader.assert_not_called()
 
     def test_pointwise_isolation(self):
         original = build_request(self.record, config(), 'model')
@@ -96,6 +120,11 @@ class RequestTests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def setUp(self):
+        loader = patch('tokenizers.Tokenizer.from_pretrained', return_value=test_tokenizer())
+        loader.start()
+        self.addCleanup(loader.stop)
+
     def test_formulation_is_required_and_validated(self):
         # Even an old config containing a formulation cannot replace the CLI flag.
         for extra in ([], ['--formulation', 'unknown']):
@@ -144,6 +173,9 @@ class PlotTests(unittest.TestCase):
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        loader = patch('tokenizers.Tokenizer.from_pretrained', return_value=test_tokenizer())
+        loader.start()
+        self.addCleanup(loader.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.posts = []
