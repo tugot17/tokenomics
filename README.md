@@ -224,7 +224,25 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 }
 ```
 
-These show the prompt layout. Tokenomics applies the model's chat template, splits the tokenized prompts into `query`/`items`, and resolves label IDs.
+**Independent questions — one answer per question:**
+
+```json
+{
+  "state": "I was charged twice. Please refund the duplicate.",
+  "questions": [
+    {
+      "prompt": "Is the customer requesting a refund? Answer yes or no.",
+      "labels": [{"text": "yes"}, {"text": "no"}]
+    },
+    {
+      "prompt": "Which team should handle this? A: Billing. B: Technical support. Answer A or B.",
+      "labels": [{"text": "A"}, {"text": "B"}]
+    }
+  ]
+}
+```
+
+The ranking examples show prompt layouts; the questions example is a dataset row. Tokenomics applies the model's chat template, splits the tokenized prompts into `query`/`items`, and resolves label IDs.
 
 | Mode | Arguments | Config | Dataset |
 |---|---|---|---|
