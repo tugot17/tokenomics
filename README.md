@@ -254,14 +254,16 @@ The ranking examples show prompt layouts; the questions example is a dataset row
 tokenomics score --model your-model --api-base http://localhost:30000/v1 \
   --formulation setwise --config examples/score_setwise.json \
   --dataset examples/data/score_candidate_sets.jsonl \
-  --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/scoring
+  --state-tokens 260,1040,5200 --batch-sizes 1,8,32,128 \
+  --num-runs 1 --warmup-runs 1 --results-dir results/scoring
 ```
 
 | Argument | Meaning |
 |---|---|
 | `--tokenizer` | Tokenizer repository/directory; defaults to `--model` |
-| `--batch-sizes 1,8,32` | Concurrent HTTP requests; requires enough dataset rows |
-| `--num-prompts` | Maximum dataset rows, not token length |
+| `--state-tokens 260,1040,5200` | Generate synthetic shared states at each token length; keep candidates/questions fixed |
+| `--batch-sizes 1,8,32` | Concurrent HTTP requests |
+| `--num-prompts 128` | Generated requests per length (defaults to enough to fill concurrency); otherwise a dataset row limit |
 | `--num-runs 1` | One measured dataset pass per concurrency |
 | `--warmup-runs 1` | One warmup pass; warms the server cache |
 | `--results-dir` | New directory for results |
@@ -269,8 +271,8 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 
 Independent questions return an answer per question; string aliases are max-pooled and normalized within each question. Explicit token IDs and `query_template`/`item_template` are optional overrides.
 
-Input length comes from the dataset: change `state` for the shared context, or `candidates`/question `prompt` for the item lengths. Scoring currently has no token-length flag; use separate datasets for a length sweep. Chat formatting adds tokens.
-Saved requests record server-reported `usage.prompt_tokens`, used for input tokens/s. This counts the request's input tokens, not just the shared state, and can differ between SIS and MIS.
+With `--state-tokens`, the JSONL rows supply candidate/question templates. Synthetic states are seeded and reused across concurrency; accuracy is skipped. Without it, rows are sent unchanged.
+Saved requests include actual state and full prompt lengths; chat formatting adds tokens. Input tokens/s uses server-reported `usage.prompt_tokens`, which can differ between SIS and MIS.
 
 SIS/MIS is a server setting. Compare identical inputs with SIS prefix caching enabled.
 Results include throughput, input tokens/s, latency, failures, and accuracy; questions report both requests/s and questions/s.

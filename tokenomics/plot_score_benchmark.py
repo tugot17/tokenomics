@@ -13,8 +13,8 @@ from matplotlib.ticker import EngFormatter
 def plot_score_benchmark(results_dir, output_image):
     path = Path(results_dir)
     metadata = json.loads((path / "metadata.json").read_text())
-    rows = [json.loads(file.read_text()) for file in path.glob("*.json")
-            if file.stem.isdigit()]
+    folders = sorted(path.glob("state-*"), key=lambda p: int(p.name.split("-")[1])) if isinstance(metadata.get("state_tokens"), list) else [path]
+    rows = [json.loads(file.read_text()) for folder in folders for file in folder.glob("*.json") if file.stem.isdigit()]
     if not rows:
         raise ValueError("No measured scoring results found")
     # Accept results produced before request metrics were unified.
@@ -24,7 +24,8 @@ def plot_score_benchmark(results_dir, output_image):
         if "failed_requests" not in row:
             row["failed_requests"] = row["failed_candidate_sets"]
     rows.sort(key=lambda row: row["batch_size"])
-    x = [row["batch_size"] for row in rows]
+    x = sorted({row["batch_size"] for row in rows})
+    lengths = sorted({row.get("state_tokens") for row in rows}, key=lambda n: n or 0)
     questions = metadata.get("workload") == "questions"
     metrics = [("requests_per_second", "Completed candidate sets / second"),
                ("input_tokens_per_second", "Input tokens / second"),
@@ -34,8 +35,12 @@ def plot_score_benchmark(results_dir, output_image):
         metrics.insert(0, ("requests_per_second", "Completed requests / second"))
     fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4))
     for ax, (metric, label) in zip(axes, metrics):
-        y = [row[metric] if row[metric] is not None else float("nan") for row in rows]
-        ax.plot(x, y, "o-")
+        for length in lengths:
+            points = [row for row in rows if row.get("state_tokens") == length]
+            y = [row[metric] if row[metric] is not None else float("nan") for row in points]
+            ax.plot([row["batch_size"] for row in points], y, "o-", label=f"{length} state tokens" if length else None)
+        if lengths != [None]:
+            ax.legend(frameon=False)
         ax.set_xscale("log", base=2)
         ax.set_xticks(x, labels=x)
         ax.set_xlabel("Concurrent HTTP requests")

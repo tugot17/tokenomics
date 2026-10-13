@@ -14,7 +14,7 @@ from transformers import PreTrainedTokenizerFast
 from tokenomics.plot_score_benchmark import plot_score_benchmark
 from tokenomics.score_benchmark import (
     main, benchmark, build_request, load_records, parse_response, summarize,
-    validate_config, validate_questions, parse_questions, resolve_label_ids,
+    validate_config, validate_questions, parse_questions, resolve_label_ids, synthetic_records,
 )
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
@@ -96,6 +96,24 @@ class RequestTests(unittest.TestCase):
         for label in ({'text': 'Yes No'}, {'text':'notinvocabulary'}, {'text':'[UNK]'}):
             with self.assertRaises(ValueError):
                 resolve_label_ids([label], tokenizer, multiple=True)
+
+    def test_synthetic_states_are_exact_deterministic_and_speed_only(self):
+        records = load_records(EXAMPLES / 'data/score_candidate_sets.jsonl')
+        original = copy.deepcopy(records)
+        tokenizer = test_tokenizer()
+        for length in (1, 8, 128):
+            generated = synthetic_records(records, tokenizer, length, 4, 42)
+            self.assertEqual(generated, synthetic_records(records, tokenizer, length, 4, 42))
+            self.assertEqual(len(generated), 4)
+            for i, record in enumerate(generated):
+                self.assertEqual(len(tokenizer.encode(record['state'], add_special_tokens=False)), length)
+                self.assertEqual(record['candidates'], records[i % len(records)]['candidates'])
+                self.assertNotIn('expected_index', record)
+        self.assertEqual(records, original)
+        questions = [question_record()]
+        generated = synthetic_records(questions, tokenizer, 16, 3, 42)
+        self.assertTrue(all('expected_index' not in q for r in generated for q in r['questions']))
+        self.assertIn('expected_index', questions[0]['questions'][0])
 
     def test_pointwise_isolation(self):
         original = build_request(self.record, config(), 'model')
@@ -323,6 +341,38 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len((Path(args.results_dir) / 'requests.jsonl').read_text().splitlines()), 3)
         with self.assertRaises(FileExistsError):
             await self.run_quietly(args)
+
+    async def test_synthetic_length_sweep_keeps_payloads_and_skips_accuracy(self):
+        for workload in ('ranking', 'questions'):
+            hashes = []
+            for self.mis in (False, True):
+                overrides = dict(workload=workload, state_tokens=[4, 9], num_prompts=4, num_runs=1,
+                                 results_dir=str(Path(self.tmp.name) / f'synthetic-{workload}-{self.mis}'))
+                if workload == 'questions':
+                    overrides.update(formulation=None, config=str(EXAMPLES / 'score_questions.json'),
+                                     dataset=str(EXAMPLES / 'data/score_questions.jsonl'))
+                args = self.args('pointwise', **overrides)
+                self.assertTrue(await self.run_quietly(args))
+                out = Path(args.results_dir)
+                current = []
+                for length in args.state_tokens:
+                    folder = out / f'state-{length}'
+                    meta = json.loads((folder / 'metadata.json').read_text())
+                    current.append(meta['request_sha256'])
+                    saved = [json.loads(line) for line in (folder / 'requests.jsonl').read_text().splitlines()]
+                    self.assertTrue(all(row['state_tokens'] == length for row in saved))
+                    self.assertTrue(all(row['prompt_tokens_per_item'] for row in saved))
+                    for concurrency in args.batch_sizes:
+                        result = json.loads((folder / f'{concurrency}.json').read_text())
+                        self.assertEqual(result['state_tokens'], length)
+                        self.assertEqual(result['completed_requests'], 4)
+                        key = 'accuracy_on_successful_labelled_questions' if workload == 'questions' else 'accuracy_on_successful_labelled_sets'
+                        self.assertIsNone(result[key])
+                    plot_score_benchmark(folder, folder / 'plot.png')
+                hashes.append(current)
+                plot_score_benchmark(out, out / 'plot.png')
+                self.assertTrue((out / 'plot.png').is_file())
+            self.assertEqual(hashes[0], hashes[1])
 
     async def test_chat_questions_use_token_ids_and_require_template(self):
         args = self.args('pointwise', workload='questions', formulation=None,

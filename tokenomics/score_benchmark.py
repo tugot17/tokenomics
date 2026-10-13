@@ -1,5 +1,6 @@
 """Benchmark candidate ranking or independent questions through SGLang /v1/score."""
 import argparse
+import copy
 import asyncio
 import hashlib
 import json
@@ -297,7 +298,53 @@ def summarize(bursts, workload="ranking"):
     return result
 
 
-async def benchmark(args):
+def synthetic_records(records, tokenizer, length, count, seed):
+    words = "river forest market garden bridge mountain paper orange silver window morning evening quiet bright walk read build carry find follow Yes No A B C".split()
+    generated = []
+    for index in range(count):
+        rng = random.Random(seed + index)
+        for _ in range(16):
+            text = " ".join(rng.choices(words, k=length * 2 + 16))
+            ids = tokenizer.encode(text, add_special_tokens=False)[:length]
+            state = tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            if len(tokenizer.encode(state, add_special_tokens=False)) == length:
+                break
+        else:
+            raise ValueError(f"Cannot generate an exact {length}-token state with this tokenizer")
+        record = copy.deepcopy(records[index % len(records)])
+        record["state"] = state
+        record.pop("expected_index", None)
+        for question in record.get("questions", []):
+            question.pop("expected_index", None)
+        generated.append(record)
+    return generated
+
+
+async def benchmark(args, records=None, tokenizer=None):
+    lengths = getattr(args, "state_tokens", None)
+    if lengths:
+        from transformers import AutoTokenizer
+        tokenizer_path = getattr(args, "tokenizer", None) or args.model
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        workload = getattr(args, "workload", "ranking")
+        templates = load_records(args.dataset, workload)
+        count = args.num_prompts or max(len(templates), max(args.batch_sizes))
+        out = Path(args.results_dir)
+        out.mkdir(parents=True, exist_ok=False)
+        atomic_write_json(str(out / "metadata.json"), {
+            "model": args.model, "workload": workload, "formulation": args.formulation,
+            "state_tokens": lengths, "seed": args.seed, "requests_per_length": count,
+        })
+        all_ok = True
+        for length in lengths:
+            child = copy.copy(args)
+            child.state_tokens = None
+            child.state_token_length = length
+            child.results_dir = str(out / f"state-{length}")
+            generated = synthetic_records(templates, tokenizer, length, count, args.seed)
+            all_ok = await benchmark(child, generated, tokenizer) and all_ok
+        return all_ok
+
     config = json.loads(Path(args.config).read_text())
     if not isinstance(config, dict):
         raise ValueError("Config must be an object")
@@ -310,15 +357,15 @@ async def benchmark(args):
     config["formulation"] = args.formulation
     validate_config(config)
     tokenizer_path = getattr(args, "tokenizer", None) or args.model
-    records = load_records(args.dataset, workload)
+    if records is None:
+        records = load_records(args.dataset, workload)
     if args.num_prompts is not None:
         records = records[:args.num_prompts]
     dataset_sha256 = hashlib.sha256(encode(records)).hexdigest()
     groups = [config["labels"]] if workload == "ranking" else [q["labels"] for record in records for q in record["questions"]]
     field = "token_id" if workload == "ranking" else "token_ids"
     chat = "question_template" in config or "prompt_template" in config
-    tokenizer = None
-    if chat or any(field not in label for group in groups for label in group):
+    if tokenizer is None and (chat or any(field not in label for group in groups for label in group)):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     for labels in groups:
@@ -335,13 +382,22 @@ async def benchmark(args):
                 "request_sha256": [hashlib.sha256(body).hexdigest() for body in encoded],
                 "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "requests": len(records), "batch_sizes": args.batch_sizes,
+                "state_tokens": getattr(args, "state_token_length", None),
                 "num_runs": args.num_runs, "warmup_runs": args.warmup_runs, "seed": args.seed,
                 "quality_note": "Different formulations need separate quality evaluation; scores are not assumed equivalent.",
                 "http": "fresh connections, no retries, burst execution"}
     atomic_write_json(str(out / "metadata.json"), metadata)
     with (out / "requests.jsonl").open("w") as f:
         for record, body in zip(records, bodies):
-            f.write(json.dumps({"record": record, "body": body}) + "\n")
+            lengths = {}
+            if tokenizer is not None:
+                lengths["state_tokens"] = len(tokenizer.encode(record["state"], add_special_tokens=False))
+                lengths["prompt_tokens_per_item"] = [
+                    len(body["query"]) + len(item) if isinstance(body["query"], list)
+                    else len(tokenizer.encode(body["query"] + item, add_special_tokens=False))
+                    for item in body["items"]
+                ]
+            f.write(json.dumps({"record": record, "body": body, **lengths}) + "\n")
     if args.dry_run:
         return True
     root = args.api_base.rstrip("/")
@@ -410,7 +466,8 @@ async def benchmark(args):
                         raw.write(json.dumps(burst) + "\n")
                         raw.flush()
                 result = summarize(bursts, workload)
-                result.update(batch_size=batch_size, workload=workload, formulation=config["formulation"])
+                result.update(batch_size=batch_size, workload=workload, formulation=config["formulation"],
+                              state_tokens=getattr(args, "state_token_length", None))
                 atomic_write_json(str(out / f"{batch_size}.json"), result)
                 all_ok = all_ok and result["failed_requests"] == 0
                 print(json.dumps(result), flush=True)
@@ -429,7 +486,8 @@ def main():
     parser.add_argument("--api-base", default="http://localhost:30000/v1")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent HTTP requests per burst")
-    parser.add_argument("--num-prompts", type=int, help="Maximum dataset records (no automatic repetition)")
+    parser.add_argument("--state-tokens", help="Synthetic shared-state token lengths, e.g. 260,1040,5200")
+    parser.add_argument("--num-prompts", type=int, help="Dataset row limit; with --state-tokens, generated requests per length")
     parser.add_argument("--num-runs", type=int, default=5)
     parser.add_argument("--warmup-runs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
@@ -442,6 +500,9 @@ def main():
     if args.workload == "questions" and args.formulation is not None:
         parser.error("--formulation applies only to ranking")
     try:
+        args.state_tokens = [int(x) for x in args.state_tokens.split(",")] if args.state_tokens else None
+        if args.state_tokens and (any(x < 1 for x in args.state_tokens) or len(set(args.state_tokens)) != len(args.state_tokens)):
+            raise ValueError("state token lengths must be unique positive integers")
         args.batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
         if not args.batch_sizes or any(x < 1 for x in args.batch_sizes) or len(set(args.batch_sizes)) != len(args.batch_sizes):
             raise ValueError("batch sizes must be unique positive integers")
