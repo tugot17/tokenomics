@@ -261,12 +261,16 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 |---|---|
 | `--tokenizer` | Tokenizer repository/directory; defaults to `--model` |
 | `--batch-sizes 1,8,32` | Concurrent HTTP requests; requires enough dataset rows |
+| `--num-prompts` | Maximum dataset rows, not token length |
 | `--num-runs 1` | One measured dataset pass per concurrency |
 | `--warmup-runs 1` | One warmup pass; warms the server cache |
 | `--results-dir` | New directory for results |
 | `--dry-run` | Save payloads without sending requests |
 
 Independent questions return an answer per question; string aliases are max-pooled and normalized within each question. Explicit token IDs and `query_template`/`item_template` are optional overrides.
+
+Input length comes from the dataset: change `state` for the shared context, or `candidates`/question `prompt` for the item lengths. Scoring currently has no token-length flag; use separate datasets for a length sweep. Chat formatting adds tokens.
+Saved requests record server-reported `usage.prompt_tokens`, used for input tokens/s. This counts the request's input tokens, not just the shared state, and can differ between SIS and MIS.
 
 SIS/MIS is a server setting. Compare identical inputs with SIS prefix caching enabled.
 Results include throughput, input tokens/s, latency, failures, and accuracy; questions report both requests/s and questions/s.
