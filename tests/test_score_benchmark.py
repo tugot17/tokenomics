@@ -201,6 +201,13 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(exited.exception.code, 2)
                 self.assertIn('--formulation', err.getvalue())
 
+    def test_default_state_length_is_1024(self):
+        argv = ['score', '--model', 'test', '--formulation', 'setwise',
+                '--config', 'unused.json', '--dataset', 'unused.jsonl', '--results-dir', 'unused']
+        with patch('sys.argv', argv), patch('tokenomics.score_benchmark.benchmark', return_value=True) as run:
+            main()
+        self.assertEqual(run.call_args.args[0].state_tokens, [1024])
+
     def test_explicit_formulations_are_saved_by_cli(self):
         with tempfile.TemporaryDirectory() as tmp:
             for mode in ('pointwise', 'setwise'):

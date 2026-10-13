@@ -253,14 +253,14 @@ Shared text comes from `--state-tokens`; input JSON contains only candidates or 
 tokenomics score --model your-model --api-base http://localhost:30000/v1 \
   --formulation setwise --config examples/score_setwise.json \
   --dataset examples/data/score_candidate_sets.jsonl \
-  --state-tokens 260,1040,5200 --batch-sizes 1,8,32,128 \
+  --state-tokens 1024 --batch-sizes 1,8,32,128 \
   --num-runs 1 --warmup-runs 1 --results-dir results/scoring
 ```
 
 | Argument | Meaning |
 |---|---|
 | `--tokenizer` | Tokenizer repository/directory; defaults to `--model` |
-| `--state-tokens 260,1040,5200` | Generate synthetic shared states at each token length; keep candidates/questions fixed |
+| `--state-tokens 1024` | Shared text length; default 1024. Also accepts a list, e.g. `1024,4096` |
 | `--batch-sizes 1,8,32` | Concurrent HTTP requests |
 | `--num-prompts 128` | Generated requests per length (defaults to enough to fill concurrency); otherwise a dataset row limit |
 | `--num-runs 1` | One measured dataset pass per concurrency |

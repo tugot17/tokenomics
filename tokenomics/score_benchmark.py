@@ -489,7 +489,7 @@ def main():
     parser.add_argument("--api-base", default="http://localhost:30000/v1")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent HTTP requests per burst")
-    parser.add_argument("--state-tokens", help="Synthetic shared-state token lengths, e.g. 260,1040,5200")
+    parser.add_argument("--state-tokens", default="1024", help="Shared-state tokens (default: 1024); accepts a comma-separated list")
     parser.add_argument("--num-prompts", type=int, help="Dataset row limit; with --state-tokens, generated requests per length")
     parser.add_argument("--num-runs", type=int, default=5)
     parser.add_argument("--warmup-runs", type=int, default=2)
