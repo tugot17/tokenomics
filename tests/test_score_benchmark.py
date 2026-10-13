@@ -10,6 +10,7 @@ from pathlib import Path
 
 from aiohttp import web
 from tokenizers import Tokenizer, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 from tokenomics.plot_score_benchmark import plot_score_benchmark
 from tokenomics.score_benchmark import (
     main, benchmark, build_request, load_records, parse_response, summarize,
@@ -20,17 +21,19 @@ EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
 
 
 def test_tokenizer():
-    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "Yes": 1, "No": 2, "A": 3, "B": 4, "C": 5}, unk_token="[UNK]"))
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0, "Yes": 1, "No": 2, "A": 3, "B": 4, "C": 5, "yes": 6, "no": 7}, unk_token="[UNK]"))
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    return tokenizer
+    return PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="[UNK]",
+                                  chat_template="{{ messages[0]['content'] }}\nassistant")
 
 
 def config(name='pointwise'):
     cfg = dict(json.loads((EXAMPLES / f'score_{name}.json').read_text()), formulation=name)
-    with patch('tokenizers.Tokenizer.from_pretrained', return_value=test_tokenizer()):
-        resolve_label_ids(cfg, 'test-model')
+    full = cfg.pop('prompt_template')
+    cfg['query_template'] = 'Customer state:\n{state}\n'
+    cfg['item_template'] = full[len(cfg['query_template']):]
+    resolve_label_ids(cfg['labels'], test_tokenizer())
     return cfg
-
 
 class RequestTests(unittest.TestCase):
     def setUp(self):
@@ -39,16 +42,60 @@ class RequestTests(unittest.TestCase):
     def test_label_ids_come_from_tokenizer(self):
         cfg = dict(json.loads((EXAMPLES / 'score_pointwise.json').read_text()), formulation='pointwise')
         with tempfile.TemporaryDirectory() as tmp:
-            test_tokenizer().save(str(Path(tmp) / 'tokenizer.json'))
-            resolve_label_ids(cfg, tmp)
+            test_tokenizer().save_pretrained(tmp)
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(tmp)
+            resolve_label_ids(cfg['labels'], tokenizer)
             self.assertEqual([label['token_id'] for label in cfg['labels']], [1, 2])
             cfg['labels'][0] = {'text': 'Yes No'}
             with self.assertRaises(ValueError):
-                resolve_label_ids(cfg, tmp)
+                resolve_label_ids(cfg['labels'], tokenizer)
         cfg = config()
-        with patch('tokenizers.Tokenizer.from_pretrained') as loader:
-            resolve_label_ids(cfg, 'unused')
-            loader.assert_not_called()
+        resolve_label_ids(cfg['labels'], None)
+
+    def test_ranking_chat_templates_preserve_full_prompts(self):
+        tokenizer = test_tokenizer()
+        for mode in ('pointwise', 'setwise'):
+            cfg = dict(json.loads((EXAMPLES / f'score_{mode}.json').read_text()), formulation=mode)
+            validate_config(cfg)
+            resolve_label_ids(cfg['labels'], tokenizer)
+            body = build_request(self.record, cfg, 'model', tokenizer)
+            self.assertIsInstance(body['query'], list)
+            if mode == 'pointwise':
+                contents = [cfg['prompt_template'].format(state=self.record['state'], candidate=c) for c in self.record['candidates']]
+            else:
+                options = '\n'.join(f"{l['text']}) {c}" for l,c in zip(cfg['labels'], self.record['candidates']))
+                contents = [cfg['prompt_template'].format(state=self.record['state'], options=options, labels='A, B, C')]
+            expected = [tokenizer.apply_chat_template([{'role':'user','content':content}], tokenize=True, add_generation_prompt=True, return_dict=False) for content in contents]
+            self.assertEqual([body['query'] + item for item in body['items']], expected)
+
+    def test_portable_examples_resolve_against_different_vocabularies(self):
+        for offset in (10, 100):
+            vocabulary = {'[UNK]': 0, **{text: offset + i for i, text in enumerate(['Yes', 'No', 'A', 'B', 'C', 'yes', 'no'])}}
+            backend = Tokenizer(models.WordLevel(vocabulary, unk_token='[UNK]'))
+            backend.pre_tokenizer = pre_tokenizers.Whitespace()
+            tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token='[UNK]')
+            for mode in ('pointwise', 'setwise'):
+                cfg = json.loads((EXAMPLES / f'score_{mode}.json').read_text())
+                self.assertTrue(all('token_id' not in label for label in cfg['labels']))
+                resolve_label_ids(cfg['labels'], tokenizer)
+                self.assertEqual(cfg['labels'][0]['token_id'], vocabulary[cfg['labels'][0]['text']])
+            record = load_records(EXAMPLES / 'data/score_questions.jsonl', 'questions')[0]
+            for question in record['questions']:
+                self.assertTrue(all('token_ids' not in label for label in question['labels']))
+                resolve_label_ids(question['labels'], tokenizer, multiple=True)
+                self.assertEqual(question['labels'][0]['token_ids'][0], vocabulary[question['labels'][0]['text']])
+            validate_questions(record)
+
+    def test_alias_text_resolution_and_rejections(self):
+        tokenizer = test_tokenizer()
+        labels = [{'text': 'yes', 'aliases': ['yes', 'Yes', 'Yes']}, {'text': 'no'}]
+        resolve_label_ids(labels, tokenizer, multiple=True)
+        self.assertEqual(labels[0]['token_ids'], [6, 1])
+        self.assertEqual(labels[1]['token_ids'], [7])
+        for label in ({'text': 'Yes No'}, {'text':'notinvocabulary'}, {'text':'[UNK]'}):
+            with self.assertRaises(ValueError):
+                resolve_label_ids([label], tokenizer, multiple=True)
 
     def test_pointwise_isolation(self):
         original = build_request(self.record, config(), 'model')
@@ -121,7 +168,7 @@ class RequestTests(unittest.TestCase):
 
 class CLITests(unittest.TestCase):
     def setUp(self):
-        loader = patch('tokenizers.Tokenizer.from_pretrained', return_value=test_tokenizer())
+        loader = patch('transformers.AutoTokenizer.from_pretrained', return_value=test_tokenizer())
         loader.start()
         self.addCleanup(loader.stop)
 
@@ -173,7 +220,7 @@ class PlotTests(unittest.TestCase):
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        loader = patch('tokenizers.Tokenizer.from_pretrained', return_value=test_tokenizer())
+        loader = patch('transformers.AutoTokenizer.from_pretrained', return_value=test_tokenizer())
         loader.start()
         self.addCleanup(loader.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -281,7 +328,8 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         args = self.args('pointwise', workload='questions', formulation=None,
                          config=str(EXAMPLES / 'score_questions.json'),
                          dataset=str(EXAMPLES / 'data/score_questions.jsonl'), num_runs=1)
-        tokenizer = Mock(chat_template='test template')
+        tokenizer = test_tokenizer()
+        tokenizer.apply_chat_template = Mock()
         tokenizer.apply_chat_template.side_effect = [[10, 20, 30], [10, 20, 40]]
         with patch('transformers.AutoTokenizer.from_pretrained', return_value=tokenizer):
             self.assertTrue(await self.run_quietly(args))
@@ -299,7 +347,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         for self.mis in (False, True):
             self.posts.clear()
             args = self.args('pointwise', workload='questions', formulation=None,
-                             config=str(EXAMPLES / 'score_questions_d1.json'),
+                             config=str(EXAMPLES / 'score_questions.json'),
                              dataset=str(EXAMPLES / 'data/score_questions.jsonl'),
                              results_dir=str(Path(self.tmp.name) / str(self.mis)), num_runs=1)
             self.assertTrue(await self.run_quietly(args))
@@ -327,12 +375,19 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
 
 
 def question_config():
-    return dict(json.loads((EXAMPLES / 'score_questions_d1.json').read_text()), workload='questions', formulation=None)
+    return {'workload': 'questions', 'formulation': None,
+            'query_template': '<|startoftext|><|im_start|>user\n{state}\n\n\nQUESTION:\n',
+            'item_template': '{question}<|im_end|>\n<|im_start|>assistant\n'}
 
 
 def question_record():
-    return load_records(EXAMPLES / 'data/score_questions.jsonl', 'questions')[0]
-
+    # Explicit legacy IDs exercise exact-protocol overrides, not default examples.
+    record = load_records(EXAMPLES / 'data/score_questions.jsonl', 'questions')[0]
+    for question, groups in zip(record['questions'], ([[11683,12447],[2243,4547,19598]], [[41,334],[42,378]])):
+        for label, ids in zip(question['labels'], groups):
+            label.pop('aliases', None)
+            label['token_ids'] = ids
+    return record
 
 class QuestionTests(unittest.TestCase):
     def test_chat_template_prefix_preserves_complete_prompts(self):
@@ -440,10 +495,10 @@ class QuestionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / 'out'
             argv = ['score', '--model', 'd1', '--workload', 'questions',
-                    '--config', str(EXAMPLES / 'score_questions_d1.json'),
+                    '--config', str(EXAMPLES / 'score_questions.json'),
                     '--dataset', str(EXAMPLES / 'data/score_questions.jsonl'),
                     '--results-dir', str(out), '--dry-run']
-            with patch('sys.argv', argv):
+            with patch('sys.argv', argv), patch('transformers.AutoTokenizer.from_pretrained', return_value=test_tokenizer()):
                 main()
             metadata = json.loads((out / 'metadata.json').read_text())
             self.assertEqual(metadata['workload'], 'questions')

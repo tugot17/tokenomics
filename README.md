@@ -38,18 +38,18 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 For pointwise, use `--formulation pointwise` and [its config](examples/score_pointwise.json).
 Ranking rows contain `state`, `candidates`, and optional `expected_index`. Label IDs resolve from `--model`; use `--tokenizer` for a serving alias or local tokenizer. Labels must encode as one token; explicit `token_id` overrides are supported.
 
-Independent questions (D1 example):
+Independent questions:
 
 ```bash
-tokenomics score --model LiquidAI/d1-3B-RC --api-base http://localhost:30000/v1 \
+tokenomics score --model your-model --api-base http://localhost:30000/v1 \
   --workload questions --config examples/score_questions.json \
   --dataset examples/data/score_questions.jsonl \
   --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/questions
 ```
 
-[Question rows](examples/data/score_questions.jsonl) contain `state` and `questions`, each with `prompt`, `labels` (`text`, alias `token_ids`), and optional `expected_index`.
-The tokenizer's chat template formats each question; tokenized prompts share a common `query` prefix. The client max-pools aliases and normalizes within each question. Verify alias IDs for your checkpoint; this workload does not use `--formulation`.
-For exact D1 prompt reproduction, use [the explicit preset](examples/score_questions_d1.json). Tokenizers without a chat template require explicit `query_template` and `item_template`.
+[Question rows](examples/data/score_questions.jsonl) contain `state` and `questions`, each with `prompt`, `labels` (`text`, optional string `aliases`), and optional `expected_index`.
+Both workloads use the tokenizer's chat template and split complete prompts into a shared `query` prefix and item suffixes. For exact prompt reproduction, supply `query_template` and `item_template` instead; these are required when the tokenizer has no chat template.
+Aliases resolve through the tokenizer, then are max-pooled and normalized within each question. Explicit `token_ids` are an optional model-specific override; questions do not use `--formulation`.
 
 Results report throughput, input tokens/s, request latency, failures, and accuracy on successful labelled decisions; question results distinguish requests/s from questions/s.
 Plot with `tokenomics plot-score results/scoring scoring.png`. Each run needs a new output directory.

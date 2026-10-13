@@ -33,14 +33,20 @@ def validate_config(config):
     if not questions and mode not in ("pointwise", "setwise"):
         raise ValueError("formulation must be pointwise/setwise")
     # Explicit templates override the tokenizer's chat formatting.
-    chat = questions and not any(key in config for key in ("query_template", "item_template"))
+    chat = not any(key in config for key in ("query_template", "item_template"))
     if chat:
-        config.setdefault("question_template", "{state}\n\nQUESTION:\n{question}")
-        allowed = {"question_template": {"state", "question"}}
-        required = {"question_template": {"state", "question"}}
+        if questions:
+            config.setdefault("question_template", "{state}\n\nQUESTION:\n{question}")
+            fields = {"state", "question"}
+            key = "question_template"
+        else:
+            key = "prompt_template"
+            fields = {"state", "candidate"} if mode == "pointwise" else {"state", "options", "labels"}
+        allowed = {key: fields}
+        required = {key: fields - {"labels"}}
     else:
-        if "question_template" in config:
-            raise ValueError("Use question_template or query_template/item_template, not both")
+        if "question_template" in config or "prompt_template" in config:
+            raise ValueError("Use a full prompt template or query_template/item_template, not both")
         style = "questions" if questions else mode
         item_fields = {"questions": {"question"}, "pointwise": {"candidate"},
                        "setwise": {"options", "labels"}}[style]
@@ -81,25 +87,23 @@ def validate_config(config):
         raise ValueError("positive_label_index is outside the labels")
 
 
-def resolve_label_ids(config, tokenizer_path):
-    missing = [label for label in config.get("labels", []) if "token_id" not in label]
-    if not missing:
-        return
-    from tokenizers import Tokenizer
-
-    path = Path(tokenizer_path)
-    if path.is_dir():
-        tokenizer = Tokenizer.from_file(str(path / "tokenizer.json"))
-    elif path.is_file():
-        tokenizer = Tokenizer.from_file(str(path))
-    else:
-        tokenizer = Tokenizer.from_pretrained(tokenizer_path)
-    for label in missing:
-        ids = tokenizer.encode(label["text"], add_special_tokens=False).ids
-        if len(ids) != 1:
-            raise ValueError(f"Label {label['text']!r} maps to {len(ids)} tokens; use a single-token label or explicit token_id")
-        label["token_id"] = ids[0]
-    validate_config(config)
+def resolve_label_ids(labels, tokenizer, multiple=False):
+    field = "token_ids" if multiple else "token_id"
+    for label in labels:
+        if field in label:
+            ids = label[field] if multiple else [label[field]]
+            if tokenizer is not None and any(tokenizer.convert_ids_to_tokens(t) is None for t in ids):
+                raise ValueError(f"Label {label['text']!r} contains IDs outside the tokenizer vocabulary")
+            continue
+        spellings = label.get("aliases", [label["text"]])
+        ids = []
+        for spelling in spellings:
+            encoded = tokenizer.encode(spelling, add_special_tokens=False)
+            if len(encoded) != 1 or encoded[0] in tokenizer.all_special_ids:
+                raise ValueError(f"Label alias {spelling!r} must encode as one non-special token")
+            ids.extend(encoded)
+        ids = list(dict.fromkeys(ids))
+        label[field] = ids if multiple else ids[0]
 
 
 def validate_questions(record):
@@ -116,10 +120,15 @@ def validate_questions(record):
         for label in labels:
             if not isinstance(label, dict) or not isinstance(label.get("text"), str) or not label["text"]:
                 raise ValueError("Each label needs nonempty text")
-            aliases = label.get("token_ids")
-            if not isinstance(aliases, list) or not aliases or any(type(t) is not int or t < 0 for t in aliases):
-                raise ValueError("Each label needs nonempty nonnegative token_ids")
-            ids.extend(aliases)
+            if "token_ids" in label:
+                aliases = label["token_ids"]
+                if not isinstance(aliases, list) or not aliases or any(type(t) is not int or t < 0 for t in aliases):
+                    raise ValueError("Each label needs nonempty nonnegative token_ids")
+                ids.extend(aliases)
+            if "aliases" in label:
+                aliases = label["aliases"]
+                if not isinstance(aliases, list) or not aliases or any(not isinstance(t, str) or not t for t in aliases):
+                    raise ValueError("aliases must be a nonempty list of strings")
             texts.append(label["text"])
         if len(set(ids)) != len(ids) or len(set(texts)) != len(texts):
             raise ValueError("Label texts and aliases must be unique within each question")
@@ -154,44 +163,48 @@ def load_records(path, workload="ranking"):
     return records
 
 
-def chat_question_inputs(record, config, tokenizer):
-    if tokenizer is None:
-        raise ValueError("Chat-formatted questions require a tokenizer")
+def chat_inputs(contents, tokenizer):
+    if tokenizer is None or not tokenizer.chat_template:
+        raise ValueError("Tokenizer has no chat template; supply explicit query_template and item_template")
     prompts = [tokenizer.apply_chat_template(
-        [{"role": "user", "content": config["question_template"].format(state=record["state"], question=q["prompt"])}],
+        [{"role": "user", "content": content}],
         tokenize=True, add_generation_prompt=True, return_dict=False,
-    ) for q in record["questions"]]
+    ) for content in contents]
     if any(not prompt for prompt in prompts):
         raise ValueError("Chat template produced an empty prompt")
-    # Leave at least one token in every item, including identical or single prompts.
+    # Preserve every full prompt and leave each item nonempty.
     prefix_len = min(len(os.path.commonprefix(prompts)), min(map(len, prompts)) - 1)
     return prompts[0][:prefix_len], [prompt[prefix_len:] for prompt in prompts]
 
 
 def build_request(record, config, model, tokenizer=None):
-    # Config and records are validated before request construction.
     if config.get("workload") == "questions":
         if "question_template" in config:
-            query, items = chat_question_inputs(record, config, tokenizer)
+            contents = [config["question_template"].format(state=record["state"], question=q["prompt"])
+                        for q in record["questions"]]
+            query, items = chat_inputs(contents, tokenizer)
         else:
             query = config["query_template"].format(state=record["state"])
             items = [config["item_template"].format(question=q["prompt"]) for q in record["questions"]]
-        return {"model": model, "query": query, "items": items,
-                "label_token_ids": list(dict.fromkeys(t for q in record["questions"]
-                                                     for label in q["labels"] for t in label["token_ids"])),
-                "apply_softmax": False}
+        ids = list(dict.fromkeys(t for q in record["questions"] for label in q["labels"] for t in label["token_ids"]))
+        return {"model": model, "query": query, "items": items, "label_token_ids": ids, "apply_softmax": False}
     labels = config["labels"]
-    query = config["query_template"].format(state=record["state"])
+    values = {"state": record["state"]}
     if config["formulation"] == "pointwise":
-        items = [config["item_template"].format(candidate=c) for c in record["candidates"]]
-    elif config["formulation"] == "setwise":
+        fields = [dict(values, candidate=c) for c in record["candidates"]]
+    else:
         if len(record["candidates"]) > len(labels):
             raise ValueError("Setwise needs one configured label token per candidate")
         labels = labels[:len(record["candidates"])]
         options = "\n".join(f"{label['text']}) {candidate}" for label, candidate in zip(labels, record["candidates"]))
-        items = [config["item_template"].format(options=options, labels=", ".join(x["text"] for x in labels))]
+        fields = [dict(values, options=options, labels=", ".join(label["text"] for label in labels))]
+    if "prompt_template" in config:
+        query, items = chat_inputs([config["prompt_template"].format(**field) for field in fields], tokenizer)
+    else:
+        query = config["query_template"].format(**values)
+        items = [config["item_template"].format(**field) for field in fields]
     return {"model": model, "query": query, "items": items,
-            "label_token_ids": [x["token_id"] for x in labels], "apply_softmax": True}
+            "label_token_ids": [label["token_id"] for label in labels], "apply_softmax": True}
 
 
 def response_scores(response, body):
@@ -297,23 +310,28 @@ async def benchmark(args):
     config["formulation"] = args.formulation
     validate_config(config)
     tokenizer_path = getattr(args, "tokenizer", None) or args.model
-    if workload == "ranking":
-        resolve_label_ids(config, tokenizer_path)
-    tokenizer = None
-    if workload == "questions" and "question_template" in config:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        if not tokenizer.chat_template:
-            raise ValueError("Tokenizer has no chat template; supply explicit query_template and item_template")
     records = load_records(args.dataset, workload)
     if args.num_prompts is not None:
         records = records[:args.num_prompts]
+    dataset_sha256 = hashlib.sha256(encode(records)).hexdigest()
+    groups = [config["labels"]] if workload == "ranking" else [q["labels"] for record in records for q in record["questions"]]
+    field = "token_id" if workload == "ranking" else "token_ids"
+    chat = "question_template" in config or "prompt_template" in config
+    tokenizer = None
+    if chat or any(field not in label for group in groups for label in group):
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    for labels in groups:
+        resolve_label_ids(labels, tokenizer, multiple=workload == "questions")
+        resolved = [t for label in labels for t in (label[field] if workload == "questions" else [label[field]])]
+        if len(set(resolved)) != len(resolved):
+            raise ValueError("Different labels must not share token IDs")
     bodies = [build_request(r, config, args.model, tokenizer) for r in records]
     encoded = [encode(body) for body in bodies]
     out = Path(args.results_dir)
     out.mkdir(parents=True, exist_ok=False)
     metadata = {"workload": workload, "formulation": args.formulation, "config": config, "model": args.model, "tokenizer": tokenizer_path, "api_base": args.api_base,
-                "dataset_sha256": hashlib.sha256(encode(records)).hexdigest(),
+                "dataset_sha256": dataset_sha256,
                 "request_sha256": [hashlib.sha256(body).hexdigest() for body in encoded],
                 "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "requests": len(records), "batch_sizes": args.batch_sizes,
@@ -402,7 +420,7 @@ async def benchmark(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--tokenizer", help="Tokenizer repository, local directory, or tokenizer.json; defaults to --model")
+    parser.add_argument("--tokenizer", help="Tokenizer repository or local directory; defaults to --model")
     parser.add_argument("--workload", choices=("ranking", "questions"), default="ranking")
     parser.add_argument("--formulation", choices=("pointwise", "setwise"),
                         help="Required for ranking only; no default")
