@@ -208,10 +208,10 @@ class CLITests(unittest.TestCase):
                 argv = ['score', '--model', 'test', '--formulation', mode,
                         '--config', str(EXAMPLES / f'score_{mode}.json'),
                         '--dataset', str(EXAMPLES / 'data' / 'score_candidate_sets.jsonl'),
-                        '--results-dir', str(out), '--dry-run']
+                        '--results-dir', str(out), '--state-tokens', '4', '--dry-run']
                 with patch('sys.argv', argv):
                     main()
-                metadata = json.loads((out / 'metadata.json').read_text())
+                metadata = json.loads((out / 'state-4' / 'metadata.json').read_text())
                 self.assertEqual(metadata['formulation'], mode)
                 self.assertEqual(metadata['config']['formulation'], mode)
 
@@ -277,6 +277,17 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                       batch_sizes=[1, 2], num_runs=2, warmup_runs=1, seed=42,
                       api_base=self.base, api_key=None, timeout=5, dry_run=False)
         values.update(overrides)
+        source = Path(values['dataset'])
+        rows = [json.loads(line) for line in source.read_text().splitlines()]
+        for record in rows:
+            record['state'] = 'I was charged twice this month, please refund one of them.'
+            if 'questions' in record:
+                for question in record['questions']: question['expected_index'] = 0
+            else:
+                record['expected_index'] = 0
+        dataset = Path(self.tmp.name) / ('questions.jsonl' if 'questions' in rows[0] else 'ranking.jsonl')
+        dataset.write_text(''.join(json.dumps(record) + '\n' for record in rows))
+        values['dataset'] = str(dataset)
         return argparse.Namespace(**values)
 
     async def run_quietly(self, args):
@@ -341,6 +352,13 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len((Path(args.results_dir) / 'requests.jsonl').read_text().splitlines()), 3)
         with self.assertRaises(FileExistsError):
             await self.run_quietly(args)
+
+    async def test_templates_need_generated_shared_text(self):
+        args = self.args('pointwise')
+        args.dataset = str(EXAMPLES / 'data/score_candidate_sets.jsonl')
+        with self.assertRaisesRegex(ValueError, '--state-tokens'):
+            await self.run_quietly(args)
+        self.assertEqual(self.posts, [])
 
     async def test_synthetic_length_sweep_keeps_payloads_and_skips_accuracy(self):
         for workload in ('ranking', 'questions'):
@@ -433,6 +451,8 @@ def question_config():
 def question_record():
     # Explicit legacy IDs exercise exact-protocol overrides, not default examples.
     record = load_records(EXAMPLES / 'data/score_questions.jsonl', 'questions')[0]
+    record['state'] = 'I was charged twice this month, please refund one of them.'
+    for question in record['questions']: question['expected_index'] = 0
     for question, groups in zip(record['questions'], ([[11683,12447],[2243,4547,19598]], [[41,334],[42,378]])):
         for label, ids in zip(question['labels'], groups):
             label.pop('aliases', None)
@@ -547,7 +567,7 @@ class QuestionTests(unittest.TestCase):
             argv = ['score', '--model', 'd1', '--workload', 'questions',
                     '--config', str(EXAMPLES / 'score_questions.json'),
                     '--dataset', str(EXAMPLES / 'data/score_questions.jsonl'),
-                    '--results-dir', str(out), '--dry-run']
+                    '--results-dir', str(out), '--state-tokens', '4', '--dry-run']
             with patch('sys.argv', argv), patch('transformers.AutoTokenizer.from_pretrained', return_value=test_tokenizer()):
                 main()
             metadata = json.loads((out / 'metadata.json').read_text())

@@ -146,6 +146,7 @@ def load_records(path, workload="ranking"):
         record = json.loads(line)
         if not isinstance(record, dict):
             raise ValueError("Each record must be an object")
+        record.setdefault("state", "")
         if workload == "questions":
             validate_questions(record)
             records.append(record)
@@ -361,6 +362,8 @@ async def benchmark(args, records=None, tokenizer=None):
         records = load_records(args.dataset, workload)
     if args.num_prompts is not None:
         records = records[:args.num_prompts]
+    if getattr(args, "state_token_length", None) is None and any(not record["state"] for record in records):
+        raise ValueError("Candidate/question templates require --state-tokens to generate shared text")
     dataset_sha256 = hashlib.sha256(encode(records)).hexdigest()
     groups = [config["labels"]] if workload == "ranking" else [q["labels"] for record in records for q in record["questions"]]
     field = "token_id" if workload == "ranking" else "token_ids"
@@ -482,7 +485,7 @@ def main():
     parser.add_argument("--formulation", choices=("pointwise", "setwise"),
                         help="Required for ranking only; no default")
     parser.add_argument("--config", required=True, help="Scoring prompt and label JSON config")
-    parser.add_argument("--dataset", required=True, help="JSONL records: state with candidates (ranking) or questions")
+    parser.add_argument("--dataset", required=True, help="JSONL candidate/question templates; --state-tokens generates shared text")
     parser.add_argument("--api-base", default="http://localhost:30000/v1")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent HTTP requests per burst")

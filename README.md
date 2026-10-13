@@ -204,7 +204,7 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 
 ```json
 {
-  "query": "I was charged twice. Please refund the duplicate.\n",
+  "query": "<generated shared text>\n",
   "items": [
     "Action: Issue a refund.\nAnswer Yes or No:",
     "Action: Troubleshoot a software crash.\nAnswer Yes or No:",
@@ -217,7 +217,7 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 
 ```json
 {
-  "query": "I was charged twice. Please refund the duplicate.\n",
+  "query": "<generated shared text>\n",
   "items": [
     "Choose an action:\nA) Issue a refund.\nB) Troubleshoot a software crash.\nC) Cancel the subscription.\nAnswer A, B, or C:"
   ]
@@ -228,7 +228,6 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 
 ```json
 {
-  "state": "I was charged twice. Please refund the duplicate.",
   "questions": [
     {
       "prompt": "Is the customer requesting a refund? Answer yes or no.",
@@ -242,7 +241,7 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 }
 ```
 
-The ranking examples show prompt layouts; the questions example is a dataset row. Tokenomics applies the model's chat template, splits the tokenized prompts into `query`/`items`, and resolves label IDs.
+Shared text comes from `--state-tokens`; input JSON contains only candidates or questions. Tokenomics applies the model's chat template, splits the tokenized prompts into `query`/`items`, and resolves label IDs.
 
 | Mode | Arguments | Config | Dataset |
 |---|---|---|---|
@@ -271,7 +270,7 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 
 Independent questions return an answer per question; string aliases are max-pooled and normalized within each question. Explicit token IDs and `query_template`/`item_template` are optional overrides.
 
-With `--state-tokens`, the JSONL rows supply candidate/question templates. Synthetic states are seeded and reused across concurrency; accuracy is skipped. Without it, rows are sent unchanged.
+JSONL rows supply fixed candidate/question templates. `--state-tokens` generates seeded shared text, reused across concurrency; accuracy is skipped.
 Saved requests include actual state and full prompt lengths; chat formatting adds tokens. Input tokens/s uses server-reported `usage.prompt_tokens`, which can differ between SIS and MIS.
 
 SIS/MIS is a server setting. Compare identical inputs with SIS prefix caching enabled.
