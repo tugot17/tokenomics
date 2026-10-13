@@ -21,66 +21,40 @@ uv pip install -e .
 
 ## Scoring Benchmark
 
-`tokenomics score` replays candidate sets through SGLang `/v1/score`.
-Choose `--formulation pointwise` (one item per candidate) or `setwise`
-(all candidates in one item). SIS/MIS is configured on the server.
+`tokenomics score` benchmarks SGLang `/v1/score` with two workloads:
+
+- **Candidate ranking:** select one winner per state. Pointwise scores each candidate separately; setwise presents all candidates together.
+- **Independent questions:** answer each question about a shared state, using its own labels and token aliases.
+
+Candidate ranking:
 
 ```bash
 tokenomics score --model your-model --api-base http://localhost:30000/v1 \
   --formulation setwise --config examples/score_setwise.json \
   --dataset examples/data/score_candidate_sets.jsonl \
-  --batch-sizes 1,8,32,128 --num-runs 1 --warmup-runs 1 \
-  --results-dir results/scoring
+  --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/scoring
 ```
 
-For pointwise, use `examples/score_pointwise.json`. Adapt the prompt templates and
-label token IDs to your model; the examples are smoke-test inputs. Dataset JSONL
-rows contain `state`, at least two `candidates`, and optional zero-based
-`expected_index`. Use enough rows to fill the requested concurrency. Config
-templates use `{state}` for the query, `{candidate}` for pointwise items, or
-`{options}` and optional `{labels}` for setwise items.
+For pointwise, use `--formulation pointwise` and [its config](examples/score_pointwise.json).
+Ranking rows contain `state`, `candidates`, and optional `expected_index`; adapt prompt templates and label token IDs to your model.
 
-Each concurrency result reports complete candidate sets/s, server-reported input
-tokens/s, latency, failures, and accuracy on successful labelled sets.
-Requests, responses, hashes, and settings are saved alongside results. Failures
-produce a nonzero exit code. Use a new output directory for each run; `--dry-run`
-saves requests without contacting the server.
-
-Plot results with `tokenomics plot-score results/scoring scoring.png`.
-Run tests with `python -m unittest discover -s tests -v`.
-
-### Independent questions about one state
-
-Use `--workload questions` when each question needs its own answer, rather than
-ranking candidates to select one winner. Do not pass `--formulation`:
+Independent questions (D1 example):
 
 ```bash
 tokenomics score --model LiquidAI/d1-3B-RC --api-base http://localhost:30000/v1 \
   --workload questions --config examples/score_questions_d1.json \
   --dataset examples/data/score_questions.jsonl \
-  --batch-sizes 1,8,32,128 --num-runs 1 --warmup-runs 1 \
-  --results-dir results/questions
+  --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/questions
 ```
 
-Each JSONL row contains `state` and a nonempty `questions` list. Each question has
-`prompt`, `labels` (`text` and alias `token_ids`), and optional zero-based
-`expected_index`. Templates wrap `{state}` and `{question}`. The D1 preset uses
-the supplied refund/routing prompts and aliases; verify token IDs for your model.
+[Question rows](examples/data/score_questions.jsonl) contain `state` and `questions`, each with `prompt`, `labels` (`text`, alias `token_ids`), and optional `expected_index`.
+The client max-pools aliases and normalizes within each question. Verify token IDs for your checkpoint; this workload does not use `--formulation`.
 
-One HTTP request contains all questions for a state. The client requests the
-union of alias IDs with `apply_softmax: false`, max-pools aliases, then normalizes
-over each question's own labels. Saved answers include probabilities and
-predictions. Results and plots distinguish requests/s from questions/s, alongside
-input tokens/s, request latency, failures, and per-question accuracy. A malformed
-response fails the whole request; failed requests remain in the timing denominator.
-Accuracy includes labelled questions in successful requests only.
+Results report throughput, input tokens/s, request latency, failures, and accuracy on successful labelled decisions; question results distinguish requests/s from questions/s.
+Plot with `tokenomics plot-score results/scoring scoring.png`. Each run needs a new output directory.
 
-SIS/MIS remains a server setting; replay identical data and configs for both.
-Enable SIS prefix caching for a prefix-sharing comparison and record the settings.
-Prepare datasets with 1, 8, or 32 questions per state independently of concurrency.
-Use enough states to fill the requested concurrency; this one-state example is
-only a smoke test. Warmup replays the dataset, so caching makes this a warm-cache
-benchmark. `--num-runs 1` measures one dataset pass per concurrency.
+`--batch-sizes` controls concurrent HTTP requests; larger sweeps require enough dataset rows. `--num-runs 1` measures one dataset pass per concurrency.
+SIS/MIS is a server setting: compare identical data and configs, with SIS prefix caching enabled. Warmup replays the dataset, so caching measures a warm-cache workload.
 
 ## Completion Benchmark
 
