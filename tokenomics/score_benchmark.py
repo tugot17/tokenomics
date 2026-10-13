@@ -7,6 +7,7 @@ import math
 import os
 import random
 import statistics
+import string
 import time
 from pathlib import Path
 
@@ -34,15 +35,16 @@ def validate_config(config):
     for key in ("query_template", "item_template"):
         if not isinstance(config.get(key), str):
             raise ValueError(f"{key} must be a string")
-    # Explicit fields prevent accidentally exposing siblings in pointwise requests.
-    import string
-    item_fields = {"question"} if questions else {"candidate"} if mode == "pointwise" else {"options", "labels"}
+    # Limit templates to the fields available to each scoring style.
+    style = "questions" if questions else mode
+    item_fields = {"questions": {"question"}, "pointwise": {"candidate"},
+                   "setwise": {"options", "labels"}}[style]
     allowed = {"query_template": {"state"}, "item_template": item_fields}
     for key, fields in allowed.items():
         for _, field, spec, conversion in string.Formatter().parse(config[key]):
             if field is not None and (field not in fields or spec or conversion):
                 raise ValueError(f"Unsupported placeholder in {key}: {field}")
-    required = "{question}" if questions else "{candidate}" if mode == "pointwise" else "{options}"
+    required = {"questions": "{question}", "pointwise": "{candidate}", "setwise": "{options}"}[style]
     if "{state}" not in config["query_template"] or required not in config["item_template"]:
         raise ValueError(f"Templates must include {{state}} and {required} placeholders")
     if questions:
@@ -119,9 +121,8 @@ def load_records(path, workload="ranking"):
 
 
 def build_request(record, config, model):
-    validate_config(config)
+    # Config and records are validated before request construction.
     if config.get("workload") == "questions":
-        validate_questions(record)
         return {"model": model,
                 "query": config["query_template"].format(state=record["state"]),
                 "items": [config["item_template"].format(question=q["prompt"]) for q in record["questions"]],
@@ -214,7 +215,6 @@ def summarize(bursts, workload="ranking"):
     result = {"attempted_requests": len(requests), "completed_requests": len(successful),
               "failed_requests": len(requests) - len(successful),
               "requests_per_second": len(successful) / elapsed,
-              "decisions_per_second": len(decisions) / elapsed,
               "input_tokens_per_second": sum(r["prompt_tokens"] for r in successful) / elapsed,
               "latency_ms_mean": statistics.mean(latencies) if latencies else None,
               "latency_ms_p95": percentile(latencies, .95) if latencies else None,
@@ -227,9 +227,7 @@ def summarize(bursts, workload="ranking"):
                       accuracy_on_successful_labelled_questions=accuracy,
                       decision_unit="one independently answered question")
     else:
-        result.update(attempted_candidate_sets=len(requests), completed_candidate_sets=len(successful),
-                      failed_candidate_sets=len(requests) - len(successful),
-                      completed_candidates=sum(r["candidate_count"] for r in successful),
+        result.update(completed_candidates=sum(r["candidate_count"] for r in successful),
                       labelled_successful_sets=len(labelled), accuracy_on_successful_labelled_sets=accuracy,
                       decision_unit="one complete candidate set (one HTTP request)")
     return result
@@ -262,8 +260,6 @@ async def benchmark(args):
                 "num_runs": args.num_runs, "warmup_runs": args.warmup_runs, "seed": args.seed,
                 "quality_note": "Different formulations need separate quality evaluation; scores are not assumed equivalent.",
                 "http": "fresh connections, no retries, burst execution"}
-    if workload == "ranking":
-        metadata["candidate_sets"] = len(records)
     atomic_write_json(str(out / "metadata.json"), metadata)
     with (out / "requests.jsonl").open("w") as f:
         for record, body in zip(records, bodies):
@@ -296,7 +292,7 @@ async def benchmark(args):
             started = time.perf_counter()
             result = {"record_index": index,
                       count_field: len(records[index][record_field]),
-                      "request_sha256": metadata["request_sha256"][index], "success": False}
+                      "success": False}
             try:
                 async with session.post(root + "/v1/score", data=encoded[index]) as response:
                     response.raise_for_status()

@@ -17,10 +17,16 @@ def plot_score_benchmark(results_dir, output_image):
             if file.stem.isdigit()]
     if not rows:
         raise ValueError("No measured scoring results found")
+    # Accept results produced before request metrics were unified.
+    for row in rows:
+        if "requests_per_second" not in row:
+            row["requests_per_second"] = row["decisions_per_second"]
+        if "failed_requests" not in row:
+            row["failed_requests"] = row["failed_candidate_sets"]
     rows.sort(key=lambda row: row["batch_size"])
     x = [row["batch_size"] for row in rows]
     questions = metadata.get("workload") == "questions"
-    metrics = [("decisions_per_second", "Completed candidate sets / second"),
+    metrics = [("requests_per_second", "Completed candidate sets / second"),
                ("input_tokens_per_second", "Input tokens / second"),
                ("latency_ms_mean", "Mean successful request latency (ms)")]
     if questions:
@@ -37,7 +43,7 @@ def plot_score_benchmark(results_dir, output_image):
         ax.set_ylim(bottom=0)
         ax.yaxis.set_major_formatter(EngFormatter(sep=""))
         ax.grid(alpha=.2)
-    failed = sum(row["failed_requests"] if questions else row["failed_candidate_sets"] for row in rows)
+    failed = sum(row["failed_requests"] for row in rows)
     label = "independent questions" if questions else metadata["formulation"]
     fig.suptitle(f"{metadata['model']} · {label} · {failed} failed requests")
     fig.tight_layout()
