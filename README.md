@@ -42,13 +42,14 @@ Independent questions (D1 example):
 
 ```bash
 tokenomics score --model LiquidAI/d1-3B-RC --api-base http://localhost:30000/v1 \
-  --workload questions --config examples/score_questions_d1.json \
+  --workload questions --config examples/score_questions.json \
   --dataset examples/data/score_questions.jsonl \
   --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/questions
 ```
 
 [Question rows](examples/data/score_questions.jsonl) contain `state` and `questions`, each with `prompt`, `labels` (`text`, alias `token_ids`), and optional `expected_index`.
-The client max-pools aliases and normalizes within each question. Verify token IDs for your checkpoint; this workload does not use `--formulation`.
+The tokenizer's chat template formats each question; tokenized prompts share a common `query` prefix. The client max-pools aliases and normalizes within each question. Verify alias IDs for your checkpoint; this workload does not use `--formulation`.
+For exact D1 prompt reproduction, use [the explicit preset](examples/score_questions_d1.json). Tokenizers without a chat template require explicit `query_template` and `item_template`.
 
 Results report throughput, input tokens/s, request latency, failures, and accuracy on successful labelled decisions; question results distinguish requests/s from questions/s.
 Plot with `tokenomics plot-score results/scoring scoring.png`. Each run needs a new output directory.

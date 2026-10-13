@@ -32,21 +32,31 @@ def validate_config(config):
         raise ValueError("Independent questions do not use a ranking formulation")
     if not questions and mode not in ("pointwise", "setwise"):
         raise ValueError("formulation must be pointwise/setwise")
-    for key in ("query_template", "item_template"):
+    # Explicit templates override the tokenizer's chat formatting.
+    chat = questions and not any(key in config for key in ("query_template", "item_template"))
+    if chat:
+        config.setdefault("question_template", "{state}\n\nQUESTION:\n{question}")
+        allowed = {"question_template": {"state", "question"}}
+        required = {"question_template": {"state", "question"}}
+    else:
+        if "question_template" in config:
+            raise ValueError("Use question_template or query_template/item_template, not both")
+        style = "questions" if questions else mode
+        item_fields = {"questions": {"question"}, "pointwise": {"candidate"},
+                       "setwise": {"options", "labels"}}[style]
+        allowed = {"query_template": {"state"}, "item_template": item_fields}
+        required = {"query_template": {"state"}, "item_template": item_fields - {"labels"}}
+    for key, fields in allowed.items():
         if not isinstance(config.get(key), str):
             raise ValueError(f"{key} must be a string")
-    # Limit templates to the fields available to each scoring style.
-    style = "questions" if questions else mode
-    item_fields = {"questions": {"question"}, "pointwise": {"candidate"},
-                   "setwise": {"options", "labels"}}[style]
-    allowed = {"query_template": {"state"}, "item_template": item_fields}
-    for key, fields in allowed.items():
+        found = set()
         for _, field, spec, conversion in string.Formatter().parse(config[key]):
-            if field is not None and (field not in fields or spec or conversion):
-                raise ValueError(f"Unsupported placeholder in {key}: {field}")
-    required = {"questions": "{question}", "pointwise": "{candidate}", "setwise": "{options}"}[style]
-    if "{state}" not in config["query_template"] or required not in config["item_template"]:
-        raise ValueError(f"Templates must include {{state}} and {required} placeholders")
+            if field is not None:
+                if field not in fields or spec or conversion:
+                    raise ValueError(f"Unsupported placeholder in {key}: {field}")
+                found.add(field)
+        if not required[key] <= found:
+            raise ValueError(f"{key} must include {sorted(required[key])}")
     if questions:
         return
     labels = config.get("labels")
@@ -144,12 +154,29 @@ def load_records(path, workload="ranking"):
     return records
 
 
-def build_request(record, config, model):
+def chat_question_inputs(record, config, tokenizer):
+    if tokenizer is None:
+        raise ValueError("Chat-formatted questions require a tokenizer")
+    prompts = [tokenizer.apply_chat_template(
+        [{"role": "user", "content": config["question_template"].format(state=record["state"], question=q["prompt"])}],
+        tokenize=True, add_generation_prompt=True, return_dict=False,
+    ) for q in record["questions"]]
+    if any(not prompt for prompt in prompts):
+        raise ValueError("Chat template produced an empty prompt")
+    # Leave at least one token in every item, including identical or single prompts.
+    prefix_len = min(len(os.path.commonprefix(prompts)), min(map(len, prompts)) - 1)
+    return prompts[0][:prefix_len], [prompt[prefix_len:] for prompt in prompts]
+
+
+def build_request(record, config, model, tokenizer=None):
     # Config and records are validated before request construction.
     if config.get("workload") == "questions":
-        return {"model": model,
-                "query": config["query_template"].format(state=record["state"]),
-                "items": [config["item_template"].format(question=q["prompt"]) for q in record["questions"]],
+        if "question_template" in config:
+            query, items = chat_question_inputs(record, config, tokenizer)
+        else:
+            query = config["query_template"].format(state=record["state"])
+            items = [config["item_template"].format(question=q["prompt"]) for q in record["questions"]]
+        return {"model": model, "query": query, "items": items,
                 "label_token_ids": list(dict.fromkeys(t for q in record["questions"]
                                                      for label in q["labels"] for t in label["token_ids"])),
                 "apply_softmax": False}
@@ -272,10 +299,16 @@ async def benchmark(args):
     tokenizer_path = getattr(args, "tokenizer", None) or args.model
     if workload == "ranking":
         resolve_label_ids(config, tokenizer_path)
+    tokenizer = None
+    if workload == "questions" and "question_template" in config:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        if not tokenizer.chat_template:
+            raise ValueError("Tokenizer has no chat template; supply explicit query_template and item_template")
     records = load_records(args.dataset, workload)
     if args.num_prompts is not None:
         records = records[:args.num_prompts]
-    bodies = [build_request(r, config, args.model) for r in records]
+    bodies = [build_request(r, config, args.model, tokenizer) for r in records]
     encoded = [encode(body) for body in bodies]
     out = Path(args.results_dir)
     out.mkdir(parents=True, exist_ok=False)

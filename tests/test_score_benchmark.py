@@ -4,7 +4,7 @@ import copy
 import io
 import json
 import tempfile
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import unittest
 from pathlib import Path
 
@@ -277,6 +277,23 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(FileExistsError):
             await self.run_quietly(args)
 
+    async def test_chat_questions_use_token_ids_and_require_template(self):
+        args = self.args('pointwise', workload='questions', formulation=None,
+                         config=str(EXAMPLES / 'score_questions.json'),
+                         dataset=str(EXAMPLES / 'data/score_questions.jsonl'), num_runs=1)
+        tokenizer = Mock(chat_template='test template')
+        tokenizer.apply_chat_template.side_effect = [[10, 20, 30], [10, 20, 40]]
+        with patch('transformers.AutoTokenizer.from_pretrained', return_value=tokenizer):
+            self.assertTrue(await self.run_quietly(args))
+        self.assertTrue(all(body['query'] == [10, 20] and body['items'] == [[30], [40]] for body in self.posts))
+        self.posts.clear()
+        args.results_dir += '-missing-template'
+        tokenizer.chat_template = None
+        with patch('transformers.AutoTokenizer.from_pretrained', return_value=tokenizer):
+            with self.assertRaisesRegex(ValueError, 'no chat template'):
+                await self.run_quietly(args)
+        self.assertEqual(self.posts, [])
+
     async def test_questions_sis_mis_replay_and_plot(self):
         hashes = []
         for self.mis in (False, True):
@@ -318,6 +335,31 @@ def question_record():
 
 
 class QuestionTests(unittest.TestCase):
+    def test_chat_template_prefix_preserves_complete_prompts(self):
+        record = question_record()
+        cfg = {'workload': 'questions', 'formulation': None}
+        validate_config(cfg)
+        for prompts in ([[10, 20, 30, 41], [10, 20, 50, 42]],
+                        [[10, 20, 30], [10, 20, 30]], [[1, 2], [3, 4]]):
+            tokenizer = Mock()
+            tokenizer.apply_chat_template.side_effect = prompts
+            body = build_request(record, cfg, 'd1', tokenizer)
+            self.assertEqual([body['query'] + item for item in body['items']], prompts)
+            self.assertTrue(all(body['items']))
+            self.assertEqual(len(tokenizer.apply_chat_template.call_args_list), 2)
+            for question, call in zip(record['questions'], tokenizer.apply_chat_template.call_args_list):
+                self.assertEqual(call.args[0], [{'role': 'user', 'content': record['state'] + '\n\nQUESTION:\n' + question['prompt']}])
+                self.assertEqual(call.kwargs, {'tokenize': True, 'add_generation_prompt': True, 'return_dict': False})
+        record['questions'] = record['questions'][:1]
+        tokenizer.apply_chat_template.side_effect = [[10, 20, 30]]
+        body = build_request(record, cfg, 'd1', tokenizer)
+        self.assertEqual(body['query'], [10, 20])
+        self.assertEqual(body['items'], [[30]])
+        with self.assertRaises(ValueError):
+            validate_config(dict(cfg, query_template='{state}'))
+        with self.assertRaises(ValueError):
+            validate_config(dict(question_config(), question_template='{state}{question}'))
+
     def test_exact_prompt_union_and_isolation(self):
         record = question_record()
         body = build_request(record, question_config(), 'd1')
