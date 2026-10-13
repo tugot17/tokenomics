@@ -198,12 +198,39 @@ tokenomics plot-completion output.png results_dir1/ results_dir2/
 
 ## Scoring Benchmark
 
-`tokenomics score` benchmarks SGLang `/v1/score` with two workloads:
+`tokenomics score` benchmarks SGLang `/v1/score`.
 
-- **Candidate ranking:** select one winner per state. Pointwise scores each candidate separately; setwise presents all candidates together.
-- **Independent questions:** answer each question about a shared state, using its own labels and token aliases.
+**Pointwise — one Yes/No score per candidate:**
 
-Candidate ranking:
+```json
+{
+  "query": "I was charged twice. Please refund the duplicate.\n",
+  "items": [
+    "Action: Issue a refund.\nAnswer Yes or No:",
+    "Action: Troubleshoot a software crash.\nAnswer Yes or No:",
+    "Action: Cancel the subscription.\nAnswer Yes or No:"
+  ]
+}
+```
+
+**Setwise — one A/B/C choice:**
+
+```json
+{
+  "query": "I was charged twice. Please refund the duplicate.\n",
+  "items": [
+    "Choose an action:\nA) Issue a refund.\nB) Troubleshoot a software crash.\nC) Cancel the subscription.\nAnswer A, B, or C:"
+  ]
+}
+```
+
+These show the prompt layout. Tokenomics applies the model's chat template, splits the tokenized prompts into `query`/`items`, and resolves label IDs.
+
+| Mode | Arguments | Config | Dataset |
+|---|---|---|---|
+| Pointwise ranking | `--formulation pointwise` | [score_pointwise.json](examples/score_pointwise.json) | [candidate sets](examples/data/score_candidate_sets.jsonl) |
+| Setwise ranking | `--formulation setwise` | [score_setwise.json](examples/score_setwise.json) | [candidate sets](examples/data/score_candidate_sets.jsonl) |
+| Independent questions | `--workload questions` | [score_questions.json](examples/score_questions.json) | [questions](examples/data/score_questions.jsonl) |
 
 ```bash
 tokenomics score --model your-model --api-base http://localhost:30000/v1 \
@@ -212,54 +239,23 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
   --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/scoring
 ```
 
-For pointwise, use `--formulation pointwise` and [its config](examples/score_pointwise.json).
-The example ranks three actions (refund, troubleshoot, cancel) in one setwise item.
-To inspect and send one request, add `--dry-run` to the command above, then:
+| Argument | Meaning |
+|---|---|
+| `--tokenizer` | Tokenizer repository/directory; defaults to `--model` |
+| `--batch-sizes 1,8,32` | Concurrent HTTP requests; requires enough dataset rows |
+| `--num-runs 1` | One measured dataset pass per concurrency |
+| `--warmup-runs 1` | One warmup pass; warms the server cache |
+| `--results-dir` | New directory for results |
+| `--dry-run` | Save payloads without sending requests |
+
+Independent questions return an answer per question; string aliases are max-pooled and normalized within each question. Explicit token IDs and `query_template`/`item_template` are optional overrides.
+
+SIS/MIS is a server setting. Compare identical inputs with SIS prefix caching enabled.
+Results include throughput, input tokens/s, latency, failures, and accuracy; questions report both requests/s and questions/s.
 
 ```bash
-jq -s '.[0].body' results/scoring/requests.jsonl > ranking-request.json
-cat ranking-request.json
-curl -s http://localhost:30000/v1/score \
-  -H 'Content-Type: application/json' --data-binary @ranking-request.json
+tokenomics plot-score results/scoring scoring.png
 ```
-
-The response contains one score row over A/B/C; the highest score selects the action.
-For pointwise, the payload instead has three items and a Yes/No score row per action.
-
-Ranking rows contain `state`, `candidates`, and optional `expected_index`. Label IDs resolve from `--model`; use `--tokenizer` for a serving alias or local tokenizer. Labels must encode as one token; explicit `token_id` overrides are supported.
-
-Independent questions:
-
-```bash
-tokenomics score --model your-model --api-base http://localhost:30000/v1 \
-  --workload questions --config examples/score_questions.json \
-  --dataset examples/data/score_questions.jsonl \
-  --batch-sizes 1 --num-runs 1 --warmup-runs 1 --results-dir results/questions
-```
-
-The example asks two independent questions: whether a refund is requested and
-whether team A or B should handle it. Add `--dry-run` above to inspect and send one request:
-
-```bash
-jq -s '.[0].body' results/questions/requests.jsonl > questions-request.json
-cat questions-request.json
-curl -s http://localhost:30000/v1/score \
-  -H 'Content-Type: application/json' --data-binary @questions-request.json
-```
-
-This payload has two items and the union of their label IDs, with `apply_softmax: false`.
-Each response row is max-pooled over that question's aliases and normalized over its own answers by Tokenomics.
-The saved payloads use your tokenizer's actual IDs and chat formatting.
-
-[Question rows](examples/data/score_questions.jsonl) contain `state` and `questions`, each with `prompt`, `labels` (`text`, optional string `aliases`), and optional `expected_index`.
-Both workloads use the tokenizer's chat template and split complete prompts into a shared `query` prefix and item suffixes. For exact prompt reproduction, supply `query_template` and `item_template` instead; these are required when the tokenizer has no chat template.
-Aliases resolve through the tokenizer, then are max-pooled and normalized within each question. Explicit `token_ids` are an optional model-specific override; questions do not use `--formulation`.
-
-Results report throughput, input tokens/s, request latency, failures, and accuracy on successful labelled decisions; question results distinguish requests/s from questions/s.
-Plot with `tokenomics plot-score results/scoring scoring.png`. Each run needs a new output directory.
-
-`--batch-sizes` controls concurrent HTTP requests; larger sweeps require enough dataset rows. `--num-runs 1` measures one dataset pass per concurrency.
-SIS/MIS is a server setting: compare identical data and configs, with SIS prefix caching enabled. Warmup replays the dataset, so caching measures a warm-cache workload.
 
 ## Embedding Benchmark
 
