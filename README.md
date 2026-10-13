@@ -268,13 +268,7 @@ tokenomics score --model your-model --api-base http://localhost:30000/v1 \
 | `--results-dir` | New directory for results |
 | `--dry-run` | Save payloads without sending requests |
 
-Independent questions return an answer per question; string aliases are max-pooled and normalized within each question. Explicit token IDs and `query_template`/`item_template` are optional overrides.
-
-JSONL rows supply fixed candidate/question templates. `--state-tokens` generates seeded shared text, reused across concurrency; accuracy is skipped.
-Saved requests include actual state and full prompt lengths; chat formatting adds tokens. Input tokens/s uses server-reported `usage.prompt_tokens`, which can differ between SIS and MIS.
-
-SIS/MIS is a server setting. Compare identical inputs with SIS prefix caching enabled.
-Results include throughput, input tokens/s, latency, failures, and accuracy; questions report both requests/s and questions/s.
+The JSONL file defines the candidates or questions. `--state-tokens` generates shared text at each requested length; results measure throughput and latency.
 
 ```bash
 tokenomics plot-score results/scoring scoring.png
