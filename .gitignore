@@ -1,6 +1,7 @@
 # Benchmark output JSON (but keep example configs)
 *.json
 !examples/dataset_configs/*.json
+!examples/score_*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

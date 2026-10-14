@@ -1,19 +1,40 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
+      contents: write
       id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import ast, os
+          from pathlib import Path
+          source = ast.parse(Path("tokenomics/__init__.py").read_text())
+          version = next(ast.literal_eval(node.value) for node in source.body
+                         if isinstance(node, ast.Assign)
+                         and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets))
+          assert os.environ["RELEASE_TAG"] == f"v{version}", "Tag and package version differ"
+          PY
       - run: pip install build
       - run: python -m build
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
       - uses: pypa/gh-action-pypi-publish@release/v1
