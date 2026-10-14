@@ -1,0 +1,14 @@
+{
+  "labels": [
+    {
+      "text": "A"
+    },
+    {
+      "text": "B"
+    },
+    {
+      "text": "C"
+    }
+  ],
+  "prompt_template": "Customer state:\n{state}\nChoose the best action:\n{options}\nAnswer with one of {labels}:\n"
+}

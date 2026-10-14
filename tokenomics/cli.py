@@ -5,6 +5,8 @@ import sys
 
 SUBCOMMANDS = {
     "completion": ("tokenomics.completion_benchmark", "main"),
+    "score": ("tokenomics.score_benchmark", "main"),
+    "plot-score": ("tokenomics.plot_score_benchmark", "main"),
     "embedding": ("tokenomics.embedding_benchmark", "main"),
     "plot-completion": ("tokenomics.plot_completion_benchmark", "main"),
     "plot-embedding": ("tokenomics.plot_embedding_benchmark", "main"),
