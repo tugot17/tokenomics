@@ -12,9 +12,11 @@ from aiohttp import web
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from tokenomics.plot_score_benchmark import plot_score_benchmark
+from tokenomics.scoring import (build_request, load_records, parse_response,
+                               validate_config, validate_questions, parse_questions, resolve_label_ids)
 from tokenomics.score_benchmark import (
-    main, benchmark, build_request, load_records, parse_response, summarize,
-    validate_config, validate_questions, parse_questions, resolve_label_ids, synthetic_records, state_scenario,
+    main, benchmark, summarize,
+    synthetic_records, state_scenario,
 )
 
 EXAMPLES = Path(__file__).resolve().parents[1] / 'examples'
@@ -240,7 +242,6 @@ class CLITests(unittest.TestCase):
 
 class PlotTests(unittest.TestCase):
     def test_candidate_set_results_render(self):
-        from tokenomics.plot_score_benchmark import plot_score_benchmark
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             (path / 'metadata.json').write_text(json.dumps({
