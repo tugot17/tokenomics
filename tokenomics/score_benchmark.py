@@ -37,7 +37,6 @@ def summarize(bursts, workload="ranking"):
     successful = [r for r in requests if r["success"]]
     elapsed = sum(b["wall_seconds"] for b in bursts)
     decisions = [a for r in successful for a in r["answers"]] if workload == "questions" else successful
-    labelled = [r for r in decisions if r["correct"] is not None]
     latencies = [r["latency_ms"] for r in successful]
     result = {"attempted_requests": len(requests), "completed_requests": len(successful),
               "failed_requests": len(requests) - len(successful),
@@ -46,16 +45,12 @@ def summarize(bursts, workload="ranking"):
               "latency_ms_mean": statistics.mean(latencies) if latencies else None,
               "latency_ms_p95": percentile(latencies, .95) if latencies else None,
               "timing": "sum of measured burst completion times; successful-request latency excludes failures"}
-    accuracy = sum(r["correct"] for r in labelled) / len(labelled) if labelled else None
     if workload == "questions":
         result.update(completed_questions=len(decisions), questions_per_second=len(decisions) / elapsed,
                       attempted_questions=sum(r["question_count"] for r in requests),
-                      labelled_successful_questions=len(labelled),
-                      accuracy_on_successful_labelled_questions=accuracy,
                       decision_unit="one independently answered question")
     else:
         result.update(completed_candidates=sum(r["candidate_count"] for r in successful),
-                      labelled_successful_sets=len(labelled), accuracy_on_successful_labelled_sets=accuracy,
                       decision_unit="one complete candidate set (one HTTP request)")
     return result
 
@@ -99,9 +94,6 @@ def synthetic_records(records, tokenizer, length, count, seed):
             raise ValueError(f"Cannot generate an exact {target}-token state with this tokenizer")
         record = copy.deepcopy(records[index % len(records)])
         record["state"] = state
-        record.pop("expected_index", None)
-        for question in record.get("questions", []):
-            question.pop("expected_index", None)
         generated.append(record)
     return generated
 
@@ -118,23 +110,14 @@ async def benchmark(args):
     config.update(workload=workload, formulation=args.formulation)
     validate_config(config)
     records = load_records(args.dataset, workload)
-    lengths = getattr(args, "state_tokens", None)
-    if not lengths:
-        if args.num_prompts is not None:
-            records = records[:args.num_prompts]
-        if any(not record["state"] for record in records):
-            raise ValueError("Candidate/question templates require --state-tokens to generate shared text")
+    lengths = args.state_tokens
     if workload == "ranking":
         groups = [config["labels"]]
     else:
         groups = [question["labels"] for record in records for question in record["questions"]]
     field = "token_id" if workload == "ranking" else "token_ids"
-    tokenizer = None
-    chat = "question_template" in config or "prompt_template" in config
-    missing_ids = any(field not in label for group in groups for label in group)
-    if lengths or chat or missing_ids:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(getattr(args, "tokenizer", None) or args.model)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(getattr(args, "tokenizer", None) or args.model)
     for labels in groups:
         resolve_label_ids(labels, tokenizer, multiple=workload == "questions")
         ids = [t for label in labels for t in (label[field] if workload == "questions" else [label[field]])]
@@ -142,8 +125,6 @@ async def benchmark(args):
             raise ValueError("Different labels must not share token IDs")
     out = Path(args.results_dir)
     out.mkdir(parents=True, exist_ok=False)
-    if not lengths:
-        return await benchmark_setting(args, config, records, tokenizer, out)
     count = args.num_prompts or max(len(records), max(args.batch_sizes))
     atomic_write_json(str(out / "metadata.json"), {
         "model": args.model, "workload": workload, "formulation": args.formulation,
@@ -158,7 +139,7 @@ async def benchmark(args):
     return all_ok
 
 
-async def benchmark_setting(args, config, records, tokenizer, out, state_tokens=None):
+async def benchmark_setting(args, config, records, tokenizer, out, state_tokens):
     workload = config["workload"]
     tokenizer_path = getattr(args, "tokenizer", None) or args.model
     bodies = [build_request(r, config, args.model, tokenizer) for r in records]
@@ -170,8 +151,7 @@ async def benchmark_setting(args, config, records, tokenizer, out, state_tokens=
                 "requests": len(records), "batch_sizes": args.batch_sizes,
                 "state_tokens": state_tokens,
                 "num_runs": args.num_runs, "warmup_runs": args.warmup_runs, "seed": args.seed,
-                "quality_note": "Different formulations need separate quality evaluation; scores are not assumed equivalent.",
-                "http": "fresh connections, no retries, burst execution"}
+                "http": "pooled connections, no retries, burst execution"}
     atomic_write_json(str(out / "metadata.json"), metadata)
     with (out / "requests.jsonl").open("w") as f:
         for record, body in zip(records, bodies):
@@ -199,7 +179,7 @@ async def measure(args, config, records, bodies, encoded, out, metadata):
         headers["Authorization"] = f"Bearer {args.api_key}"
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     async with aiohttp.ClientSession(headers=headers, timeout=timeout,
-                                     connector=aiohttp.TCPConnector(limit=0, force_close=True)) as session:
+                                     connector=aiohttp.TCPConnector(limit=max(args.batch_sizes))) as session:
         # Runtime details are optional metadata, never a client mode constraint.
         try:
             async with session.get(root + "/get_server_info",
@@ -227,8 +207,7 @@ async def measure(args, config, records, bodies, encoded, out, metadata):
                     result.update(answers=answers)
                 else:
                     selected, tokens = parse_response(data, bodies[index], config, result["candidate_count"])
-                    expected = records[index].get("expected_index")
-                    result.update(selected_index=selected, correct=None if expected is None else selected == expected)
+                    result.update(selected_index=selected)
                 result.update(success=True, prompt_tokens=tokens, scores=data["scores"])
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, KeyError) as exc:
                 result["error"] = f"{type(exc).__name__}: {exc}"
@@ -278,7 +257,7 @@ def main():
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--batch-sizes", default="1,2,4,8,16", help="Concurrent HTTP requests per burst")
     parser.add_argument("--state-tokens", default="1024", help="Shared-state tokens (default: 1024): integer, fixed-length list, N(mean,std), or U(min,max)")
-    parser.add_argument("--num-prompts", type=int, help="Dataset row limit; with --state-tokens, generated requests per length")
+    parser.add_argument("--num-prompts", type=int, help="Generated requests per length (default: enough to fill concurrency)")
     parser.add_argument("--num-runs", type=int, default=5)
     parser.add_argument("--warmup-runs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)

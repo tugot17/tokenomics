@@ -39,7 +39,7 @@ def config(name='pointwise'):
 
 class RequestTests(unittest.TestCase):
     def setUp(self):
-        self.record = load_records(EXAMPLES / 'data' / 'score_candidate_sets.jsonl')[0]
+        self.record = dict(load_records(EXAMPLES / 'data' / 'score_candidate_sets.jsonl')[0], state='Shared context')
 
     def test_label_ids_come_from_tokenizer(self):
         cfg = dict(json.loads((EXAMPLES / 'score_pointwise.json').read_text()), formulation='pointwise')
@@ -130,7 +130,6 @@ class RequestTests(unittest.TestCase):
         questions = [question_record()]
         generated = synthetic_records(questions, tokenizer, 16, 3, 42)
         self.assertTrue(all('expected_index' not in q for r in generated for q in r['questions']))
-        self.assertIn('expected_index', questions[0]['questions'][0])
 
     def test_pointwise_isolation(self):
         original = build_request(self.record, config(), 'model')
@@ -182,20 +181,19 @@ class RequestTests(unittest.TestCase):
                     parse_response(value, body, cfg, 3)
 
     def test_metrics_count_complete_sets_and_include_failure_time(self):
-        success = dict(success=True, candidate_count=16, prompt_tokens=100, correct=True, latency_ms=10)
+        success = dict(success=True, candidate_count=16, prompt_tokens=100, latency_ms=10)
         result = summarize([{'wall_seconds': 2, 'requests': [success]},
                             {'wall_seconds': 3, 'requests': [{'success': False}]}])
         self.assertEqual(result['requests_per_second'], .2)
         self.assertEqual(result['completed_candidates'], 16)
         self.assertEqual(result['failed_requests'], 1)
         self.assertEqual(result['input_tokens_per_second'], 20)
-        self.assertEqual(result['accuracy_on_successful_labelled_sets'], 1)
 
     def test_invalid_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'dataset.jsonl'
             for record in ([], {'state': 'x', 'candidates': ['a']},
-                           {'state': 'x', 'candidates': ['a', 'b'], 'expected_index': 2}):
+                           {'candidates': ['a', '']}):
                 path.write_text(json.dumps(record))
                 with self.assertRaises(ValueError):
                     load_records(path)
@@ -267,6 +265,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.posts = []
+        self.transports = set()
         self.mis = False
         self.info_status = 200
         self.malformed = False
@@ -277,6 +276,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         async def score(request):
             body = await request.json()
             self.posts.append(body)
+            self.transports.add(request.transport)
             if self.malformed:
                 return web.json_response({'scores': []})
             n = len(body['label_token_ids'])
@@ -297,34 +297,23 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         values = dict(formulation=name, config=str(EXAMPLES / f'score_{name}.json'),
                       dataset=str(EXAMPLES / 'data' / 'score_candidate_sets.jsonl'), model='test-model',
                       results_dir=str(Path(self.tmp.name) / name), num_prompts=None,
-                      batch_sizes=[1, 2], num_runs=2, warmup_runs=1, seed=42,
+                      state_tokens=[4], batch_sizes=[1, 2], num_runs=2, warmup_runs=1, seed=42,
                       api_base=self.base, api_key=None, timeout=5, dry_run=False)
         values.update(overrides)
-        source = Path(values['dataset'])
-        rows = [json.loads(line) for line in source.read_text().splitlines()]
-        for record in rows:
-            record['state'] = 'I was charged twice this month, please refund one of them.'
-            if 'questions' in record:
-                for question in record['questions']: question['expected_index'] = 0
-            else:
-                record['expected_index'] = 0
-        dataset = Path(self.tmp.name) / ('questions.jsonl' if 'questions' in rows[0] else 'ranking.jsonl')
-        dataset.write_text(''.join(json.dumps(record) + '\n' for record in rows))
-        values['dataset'] = str(dataset)
         return argparse.Namespace(**values)
 
     async def run_quietly(self, args):
         with contextlib.redirect_stdout(io.StringIO()):
             return await benchmark(args)
 
-    async def test_all_presets_replay_same_records(self):
+    async def test_all_presets_generate_same_records(self):
         digests = []
         request_hashes = {}
         for name, self.mis in (('pointwise', False), ('pointwise', True), ('setwise', False), ('setwise', True)):
             self.posts.clear()
             args = self.args(name, results_dir=str(Path(self.tmp.name) / f'{name}_{self.mis}'))
             self.assertTrue(await self.run_quietly(args))
-            out = Path(args.results_dir)
+            out = Path(args.results_dir) / 'state-4'
             metadata = json.loads((out / 'metadata.json').read_text())
             self.assertEqual(metadata['formulation'], name)
             digests.append(metadata['dataset_sha256'])
@@ -347,7 +336,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.info_status = 404
         args = self.args('pointwise')
         self.assertTrue(await self.run_quietly(args))
-        metadata = json.loads((Path(args.results_dir) / 'metadata.json').read_text())
+        metadata = json.loads((Path(args.results_dir) / 'state-4' / 'metadata.json').read_text())
         self.assertIn('server_info_error', metadata)
         self.assertTrue(self.posts)
 
@@ -355,7 +344,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.malformed = True
         args = self.args('pointwise', warmup_runs=0)
         self.assertFalse(await self.run_quietly(args))
-        result = json.loads((Path(args.results_dir) / '1.json').read_text())
+        result = json.loads((Path(args.results_dir) / 'state-4' / '1.json').read_text())
         self.assertEqual(result['failed_requests'], 6)
         self.assertEqual(result['requests_per_second'], 0)
         self.assertIsNone(result['latency_ms_mean'])
@@ -365,23 +354,22 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         args = self.args('setwise')
         with self.assertRaises(RuntimeError):
             await self.run_quietly(args)
-        self.assertTrue((Path(args.results_dir) / 'warmup_failure.json').exists())
-        self.assertFalse((Path(args.results_dir) / '1.json').exists())
+        self.assertTrue((Path(args.results_dir) / 'state-4' / 'warmup_failure.json').exists())
+        self.assertFalse((Path(args.results_dir) / 'state-4' / '1.json').exists())
 
     async def test_dry_run_and_overwrite_guard(self):
         args = self.args('setwise', dry_run=True, api_base='http://invalid.invalid')
         self.assertTrue(await self.run_quietly(args))
         self.assertEqual(self.posts, [])
-        self.assertEqual(len((Path(args.results_dir) / 'requests.jsonl').read_text().splitlines()), 3)
+        self.assertEqual(len((Path(args.results_dir) / 'state-4' / 'requests.jsonl').read_text().splitlines()), 3)
         with self.assertRaises(FileExistsError):
             await self.run_quietly(args)
 
-    async def test_templates_need_generated_shared_text(self):
-        args = self.args('pointwise')
-        args.dataset = str(EXAMPLES / 'data/score_candidate_sets.jsonl')
-        with self.assertRaisesRegex(ValueError, '--state-tokens'):
-            await self.run_quietly(args)
-        self.assertEqual(self.posts, [])
+    async def test_http_connections_are_reused(self):
+        args = self.args('pointwise', batch_sizes=[1], num_runs=2)
+        self.assertTrue(await self.run_quietly(args))
+        self.assertGreater(len(self.posts), 1)
+        self.assertEqual(len(self.transports), 1)
 
     async def test_synthetic_length_sweep_keeps_payloads_and_skips_accuracy(self):
         for workload in ('ranking', 'questions'):
@@ -407,8 +395,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                         result = json.loads((folder / f'{concurrency}.json').read_text())
                         self.assertEqual(result['state_tokens'], length)
                         self.assertEqual(result['completed_requests'], 4)
-                        key = 'accuracy_on_successful_labelled_questions' if workload == 'questions' else 'accuracy_on_successful_labelled_sets'
-                        self.assertIsNone(result[key])
+                        self.assertFalse(any('accuracy' in key for key in result))
                     plot_score_benchmark(folder, folder / 'plot.png')
                 hashes.append(current)
                 plot_score_benchmark(out, out / 'plot.png')
@@ -421,7 +408,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                          dataset=str(EXAMPLES / 'data/score_questions.jsonl'), num_runs=1)
         tokenizer = test_tokenizer()
         tokenizer.apply_chat_template = Mock()
-        tokenizer.apply_chat_template.side_effect = [[10, 20, 30], [10, 20, 40]]
+        tokenizer.apply_chat_template.side_effect = [[10, 20, 30], [10, 20, 40]] * 2
         with patch('transformers.AutoTokenizer.from_pretrained', return_value=tokenizer):
             self.assertTrue(await self.run_quietly(args))
         self.assertTrue(all(body['query'] == [10, 20] and body['items'] == [[30], [40]] for body in self.posts))
@@ -433,7 +420,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                 await self.run_quietly(args)
         self.assertEqual(self.posts, [])
 
-    async def test_questions_sis_mis_replay_and_plot(self):
+    async def test_questions_sis_mis_payloads_and_plot(self):
         hashes = []
         for self.mis in (False, True):
             self.posts.clear()
@@ -442,14 +429,13 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
                              dataset=str(EXAMPLES / 'data/score_questions.jsonl'),
                              results_dir=str(Path(self.tmp.name) / str(self.mis)), num_runs=1)
             self.assertTrue(await self.run_quietly(args))
-            out = Path(args.results_dir)
+            out = Path(args.results_dir) / 'state-4'
             hashes.append(json.loads((out / 'metadata.json').read_text())['request_sha256'])
             self.assertTrue(all(not b['apply_softmax'] for b in self.posts))
             result = json.loads((out / '1.json').read_text())
-            self.assertEqual(result['completed_questions'], 2)
-            self.assertEqual(result['completed_requests'], 1)
+            self.assertEqual(result['completed_questions'], 4)
+            self.assertEqual(result['completed_requests'], 2)
             self.assertEqual(result['questions_per_second'], 2 * result['requests_per_second'])
-            self.assertEqual(result['accuracy_on_successful_labelled_questions'], 1)
             plot_score_benchmark(out, out / 'plot.png')
             self.assertTrue((out / 'plot.png').is_file())
 
@@ -457,10 +443,9 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             args.results_dir += '-failed'
             args.warmup_runs = 0
             self.assertFalse(await self.run_quietly(args))
-            failed = json.loads((Path(args.results_dir) / '1.json').read_text())
+            failed = json.loads((Path(args.results_dir) / 'state-4' / '1.json').read_text())
             self.assertEqual(failed['questions_per_second'], 0)
-            self.assertEqual(failed['failed_requests'], 1)
-            self.assertIsNone(failed['accuracy_on_successful_labelled_questions'])
+            self.assertEqual(failed['failed_requests'], 2)
             self.malformed = False
         self.assertEqual(hashes[0], hashes[1])
 
@@ -475,7 +460,6 @@ def question_record():
     # Explicit legacy IDs exercise exact-protocol overrides, not default examples.
     record = load_records(EXAMPLES / 'data/score_questions.jsonl', 'questions')[0]
     record['state'] = 'I was charged twice this month, please refund one of them.'
-    for question in record['questions']: question['expected_index'] = 0
     for question, groups in zip(record['questions'], ([[11683,12447],[2243,4547,19598]], [[41,334],[42,378]])):
         for label, ids in zip(question['labels'], groups):
             label.pop('aliases', None)
@@ -532,7 +516,6 @@ class QuestionTests(unittest.TestCase):
         answers, tokens = parse_questions(response, body, record)
         self.assertEqual(tokens, 123)
         self.assertEqual([a['selected_index'] for a in answers], [0, 1])
-        self.assertEqual([a['correct'] for a in answers], [True, False])
         self.assertAlmostEqual(answers[0]['probabilities'][0], .2 / .35)
         self.assertEqual(answers[1]['probabilities'], [.25, .75])
         for bad in ([], [[0.] * 9] * 2, [[float('nan')] * 9] * 2, [[-1.] * 9] * 2, [[.1] * 8] * 2):
@@ -543,20 +526,18 @@ class QuestionTests(unittest.TestCase):
         for count in (1, 8, 32):
             record = question_record()
             question = record['questions'][0]
-            question.pop('expected_index')
             record['questions'] = [copy.deepcopy(question) for _ in range(count)]
             body = build_request(record, question_config(), 'd1')
             self.assertEqual(len(body['items']), count)
             self.assertEqual(len(body['label_token_ids']), 5)
             answers, _ = parse_questions({'scores': [[.1] * 5] * count, 'usage': {'prompt_tokens': 10}}, body, record)
             self.assertEqual(len(answers), count)
-            self.assertTrue(all(a['correct'] is None for a in answers))
+            self.assertTrue(all(set(a) == {'selected_index', 'probabilities'} for a in answers))
 
     def test_validation(self):
         for mutate in (
             lambda r: r.update(questions=[]),
             lambda r: r['questions'][0].update(prompt=None),
-            lambda r: r['questions'][0].update(expected_index=2),
             lambda r: r['questions'][0]['labels'][0].update(token_ids=[]),
             lambda r: r['questions'][0]['labels'][0].update(token_ids=[True]),
             lambda r: r['questions'][0]['labels'][0].update(token_ids=[2243]),
@@ -572,7 +553,7 @@ class QuestionTests(unittest.TestCase):
 
     def test_metrics_weight_questions_not_requests_and_include_failures(self):
         def request(answers):
-            return dict(success=True, answers=[{'correct': a} for a in answers],
+            return dict(success=True, answers=[{'selected_index': a} for a in answers],
                         question_count=len(answers), prompt_tokens=100, latency_ms=20)
         result = summarize([{'wall_seconds': 2, 'requests': [request([True]), request([True, False, None])]},
                             {'wall_seconds': 3, 'requests': [{'success': False, 'question_count': 8}]}], 'questions')
@@ -581,7 +562,6 @@ class QuestionTests(unittest.TestCase):
         self.assertEqual(result['attempted_questions'], 12)
         self.assertEqual(result['failed_requests'], 1)
         self.assertEqual(result['input_tokens_per_second'], 40)
-        self.assertEqual(result['accuracy_on_successful_labelled_questions'], 2 / 3)
         self.assertNotIn('completed_candidates', result)
 
     def test_cli_dry_run(self):

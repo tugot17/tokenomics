@@ -95,8 +95,8 @@ def resolve_label_ids(labels, tokenizer, multiple=False):
 
 def validate_questions(record):
     questions = record.get("questions")
-    if not isinstance(record.get("state"), str) or not isinstance(questions, list) or not questions:
-        raise ValueError("Each record needs state and at least one question")
+    if not isinstance(questions, list) or not questions:
+        raise ValueError("Each template needs at least one question")
     for question in questions:
         if not isinstance(question, dict) or not isinstance(question.get("prompt"), str) or not question["prompt"]:
             raise ValueError("Each question needs a nonempty prompt")
@@ -119,9 +119,6 @@ def validate_questions(record):
             texts.append(label["text"])
         if len(set(ids)) != len(ids) or len(set(texts)) != len(texts):
             raise ValueError("Label texts and aliases must be unique within each question")
-        expected = question.get("expected_index")
-        if expected is not None and (type(expected) is not int or not 0 <= expected < len(labels)):
-            raise ValueError("Question expected_index must identify a label")
 
 
 def load_records(path, workload="ranking"):
@@ -132,19 +129,15 @@ def load_records(path, workload="ranking"):
         record = json.loads(line)
         if not isinstance(record, dict):
             raise ValueError("Each record must be an object")
-        record.setdefault("state", "")
         if workload == "questions":
             validate_questions(record)
             records.append(record)
             continue
         candidates = record.get("candidates")
-        if not isinstance(record.get("state"), str) or not isinstance(candidates, list) or len(candidates) < 2:
-            raise ValueError("Each record needs state and at least two candidates")
+        if not isinstance(candidates, list) or len(candidates) < 2:
+            raise ValueError("Each template needs at least two candidates")
         if not all(isinstance(x, str) and x for x in candidates):
             raise ValueError("Candidates must be nonempty strings")
-        expected = record.get("expected_index")
-        if expected is not None and (type(expected) is not int or not 0 <= expected < len(candidates)):
-            raise ValueError("expected_index must identify a candidate")
         records.append(record)
     if not records:
         raise ValueError("Dataset is empty")
@@ -243,9 +236,7 @@ def parse_questions(response, body, record):
             raise ValueError("Question labels have zero probability mass")
         probabilities = [value / total for value in pooled]
         selected = max(range(len(pooled)), key=pooled.__getitem__)
-        expected = question.get("expected_index")
-        answers.append({"selected_index": selected, "probabilities": probabilities,
-                        "correct": None if expected is None else selected == expected})
+        answers.append({"selected_index": selected, "probabilities": probabilities})
     return answers, tokens
 
 
