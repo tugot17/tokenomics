@@ -1,4 +1,4 @@
-"""Plot a scoring sweep: decisions/s, input tokens/s and burst latency."""
+"""Plot scoring throughput and request latency across concurrency."""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import EngFormatter
 
 
-def plot_score_benchmark(results_dir, output_image):
+def load_score_results(results_dir):
     path = Path(results_dir)
     metadata = json.loads((path / "metadata.json").read_text())
     folders = sorted(path.glob("state-*"), key=lambda p: p.name) if isinstance(metadata.get("state_tokens"), list) else [path]
@@ -24,34 +24,45 @@ def plot_score_benchmark(results_dir, output_image):
         if "failed_requests" not in row:
             row["failed_requests"] = row["failed_candidate_sets"]
     rows.sort(key=lambda row: row["batch_size"])
+    lengths = sorted({row.get("state_tokens") for row in rows},
+                     key=lambda n: (not isinstance(n, int), n if isinstance(n, int) else str(n)))
+    return metadata, [(length, [row for row in rows if row.get("state_tokens") == length]) for length in lengths]
+
+
+def plot_score_benchmark(results_dir, output_image):
+    metadata, groups = load_score_results(results_dir)
+    rows = [row for _, points in groups for row in points]
     x = sorted({row["batch_size"] for row in rows})
-    lengths = sorted({row.get("state_tokens") for row in rows}, key=lambda n: str(n))
     questions = metadata.get("workload") == "questions"
-    metrics = [("requests_per_second", "Completed candidate sets / second"),
-               ("input_tokens_per_second", "Input tokens / second"),
-               ("latency_ms_mean", "Mean successful request latency (ms)")]
+    metrics = [("requests_per_second", "Requests/s", 1),
+               ("input_tokens_per_second", "Input tokens/s", 1),
+               ("latency_ms_mean", "Latency (s)", .001)]
     if questions:
-        metrics[0] = ("questions_per_second", "Answered questions / second")
-        metrics.insert(0, ("requests_per_second", "Completed requests / second"))
+        metrics.insert(1, ("questions_per_second", "Questions/s", 1))
     fig, axes = plt.subplots(1, len(metrics), figsize=(5 * len(metrics), 4))
-    for ax, (metric, label) in zip(axes, metrics):
-        for length in lengths:
-            points = [row for row in rows if row.get("state_tokens") == length]
-            y = [row[metric] if row[metric] is not None else float("nan") for row in points]
-            ax.plot([row["batch_size"] for row in points], y, "o-", label=f"{length} state tokens" if length else None)
-        if lengths != [None]:
-            ax.legend(frameon=False)
+    for ax, (metric, label, scale) in zip(axes, metrics):
+        for length, points in groups:
+            y = [row[metric] * scale if row[metric] is not None else float("nan") for row in points]
+            name = f"{length} tokens" if isinstance(length, int) else length
+            ax.plot([row["batch_size"] for row in points], y, "o-", label=name)
         ax.set_xscale("log", base=2)
         ax.set_xticks(x, labels=x)
         ax.set_xlabel("Concurrent HTTP requests")
         ax.set_ylabel(label)
         ax.set_ylim(bottom=0)
-        ax.yaxis.set_major_formatter(EngFormatter(sep=""))
+        if metric != "latency_ms_mean":
+            ax.yaxis.set_major_formatter(EngFormatter(sep=""))
         ax.grid(alpha=.2)
     failed = sum(row["failed_requests"] for row in rows)
     label = "independent questions" if questions else metadata["formulation"]
-    fig.suptitle(f"{metadata['model']} · {label} · {failed} failed requests")
-    fig.tight_layout()
+    title = f"{metadata['model']} · {label}"
+    if failed:
+        title += f" · {failed} failed requests"
+    fig.suptitle(title)
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 4), frameon=False)
+    fig.tight_layout(rect=(0, .12 if handles else 0, 1, .94))
     fig.savefig(output_image, dpi=160)
     plt.close(fig)
 
